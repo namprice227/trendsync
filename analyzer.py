@@ -4,6 +4,8 @@ import librosa
 from scenedetect import detect, ContentDetector
 import yt_dlp
 import subprocess
+import cv2
+import base64
 
 def download_video(url: str, output_dir: str = "temp") -> str:
     """
@@ -75,6 +77,30 @@ def detect_video_cuts(video_path: str):
 
     return cuts
 
+def extract_style_profile(video_path: str):
+    """
+    Extracts a frame from the video and queries the VLM (mocked) for style profile.
+    """
+    print("Extracting style profile...")
+    cap = cv2.VideoCapture(video_path)
+    # Get a frame from the middle of the video
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames // 2))
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        print("Failed to extract frame for style analysis.")
+        return {"clothing": "casual", "setting": "well-lit room", "camera_angle": "medium shot"}
+
+    # Mock VLM style extraction
+    # In a real scenario, we'd base64 encode the frame and send to vLLM server
+    return {
+        "clothing": "streetwear or casual trendy outfit",
+        "setting": "outdoor urban environment or well-lit bedroom",
+        "camera_angle": "full body shot"
+    }
+
 def analyze_trend(url: str, output_dir: str = "temp"):
     """
     End-to-end analysis:
@@ -91,13 +117,15 @@ def analyze_trend(url: str, output_dir: str = "temp"):
 
         bpm, beats = detect_audio_beats(audio_path)
         cuts = detect_video_cuts(video_path)
+        style = extract_style_profile(video_path)
 
         profile = {
             "bpm": bpm,
             "cuts": cuts,
             "beats": beats,
             "audio_path": audio_path,
-            "reference_video_path": video_path
+            "reference_video_path": video_path,
+            "style": style
         }
 
         profile_path = os.path.join(output_dir, "trend_profile.json")

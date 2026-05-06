@@ -21,6 +21,8 @@ TrendFlow AI is an end-to-end agentic pipeline that watches viral TikTok trends,
 
 This project is optimized for an AMD MI300X instance using ROCm, taking advantage of `vLLM`'s batch-level Data Parallelism mode for the vision encoder.
 
+### Option A: Cloud GPU Deployment (Recommended for full vLLM)
+
 1. **Start the ROCm Docker Container:**
 
    ```bash
@@ -39,6 +41,22 @@ This project is optimized for an AMD MI300X instance using ROCm, taking advantag
 3. **Install Python Requirements:**
 
    ```bash
+   pip install -r requirements.txt
+   ```
+
+### Option B: Local Testing (Without Cloud GPU)
+If you are developing locally and just want to test the Gradio UI without running the massive vLLM model (the application will automatically fall back to mocked responses if vLLM isn't found), you can use Conda:
+
+1. **Create and Activate Conda Environment:**
+   ```bash
+   conda create -n trendsync python=3.10 -y
+   conda activate trendsync
+   ```
+
+2. **Install System & Python Requirements:**
+   You will need `ffmpeg` for video/audio processing. Conda can install this for you:
+   ```bash
+   conda install -c conda-forge ffmpeg -y
    pip install -r requirements.txt
    ```
 

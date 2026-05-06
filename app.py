@@ -9,6 +9,7 @@ import time
 from analyzer import analyze_trend
 from director import get_vlm_feedback, encode_image_base64, capture_shot
 from renderer import render_final_video
+from evaluator import evaluate_final_video
 
 # Global state for the hackathon prototype
 app_state = {
@@ -17,7 +18,8 @@ app_state = {
     "current_shot_idx": 0,
     "recorded_clips": [],
     "is_recording": False,
-    "cuts": []
+    "cuts": [],
+    "final_video_path": None
 }
 
 def process_trend_link(url):
@@ -35,9 +37,13 @@ def process_trend_link(url):
 
         metadata_display = json.dumps(profile, indent=2)
         status = f"Analysis Complete! Found {num_shots} required shots based on cuts."
-        return metadata_display, status
+        
+        style = profile.get("style", {})
+        style_guide = f"### AI Style Guide\n* **What to wear:** {style.get('clothing', 'N/A')}\n* **Where to shoot:** {style.get('setting', 'N/A')}\n* **Camera Framing:** {style.get('camera_angle', 'N/A')}"
+        
+        return metadata_display, status, style_guide
     except Exception as e:
-        return f"Error: {str(e)}", "Failed to analyze."
+        return f"Error: {str(e)}", "Failed to analyze.", ""
 
 def studio_feedback_loop(frame):
     """
@@ -59,8 +65,18 @@ def studio_feedback_loop(frame):
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     base64_img = encode_image_base64(frame_bgr)
 
+    # Load style profile to pass to director
+    style_profile = None
+    if app_state["profile_path"]:
+        try:
+            with open(app_state["profile_path"], "r") as f:
+                profile_data = json.load(f)
+                style_profile = profile_data.get("style")
+        except:
+            pass
+
     # Get feedback (this is a blocking call, in a production app you'd run this asynchronously to not freeze the UI)
-    feedback = get_vlm_feedback(base64_img)
+    feedback = get_vlm_feedback(base64_img, style_profile=style_profile)
 
     # Check if perfect and trigger recording
     if "perfect" in feedback.lower() and app_state["profile_path"] is not None:
@@ -102,9 +118,26 @@ def render_project():
 
     try:
         output_file = render_final_video(app_state["recorded_clips"], app_state["profile_path"])
+        app_state["final_video_path"] = output_file
         return output_file, "Render complete! Ready to post."
     except Exception as e:
         return None, f"Render failed: {str(e)}"
+
+def judge_video():
+    """Handler for Evaluation"""
+    if not app_state.get("final_video_path"):
+        return "Error: No final video found. Assemble it first."
+    
+    style_profile = None
+    if app_state["profile_path"]:
+        try:
+            with open(app_state["profile_path"], "r") as f:
+                style_profile = json.load(f).get("style")
+        except:
+            pass
+            
+    feedback = evaluate_final_video(app_state["final_video_path"], style_profile)
+    return feedback
 
 # Build the Gradio UI
 with gr.Blocks(title="TrendFlow AI") as demo:
@@ -119,12 +152,13 @@ with gr.Blocks(title="TrendFlow AI") as demo:
                 analyze_btn = gr.Button("Analyze Trend")
 
             status_text_1 = gr.Textbox(label="Status", interactive=False)
+            style_guide_output = gr.Markdown("### AI Style Guide\n*(Run analysis to see advice)*")
             metadata_output = gr.Code(label="Extracted Metadata (trend_profile.json)", language="json")
 
             analyze_btn.click(
                 fn=process_trend_link,
                 inputs=url_input,
-                outputs=[metadata_output, status_text_1]
+                outputs=[metadata_output, status_text_1, style_guide_output]
             )
 
         # Tab 2: The Studio
@@ -147,16 +181,24 @@ with gr.Blocks(title="TrendFlow AI") as demo:
 
         # Tab 3: Render Output
         with gr.Tab("Step 3: Final Output"):
-            gr.Markdown("Assemble your captured shots into the final synced video.")
+            gr.Markdown("Assemble your captured shots into the final synced video and get AI evaluation.")
             render_btn = gr.Button("Assemble Final Video")
 
             status_text_3 = gr.Textbox(label="Render Status", interactive=False)
             final_video_output = gr.Video(label="Final Synced Video")
+            
+            judge_btn = gr.Button("Judge My Video")
+            judge_output = gr.Textbox(label="Director's Evaluation", interactive=False, lines=4)
 
             render_btn.click(
                 fn=render_project,
                 inputs=None,
                 outputs=[final_video_output, status_text_3]
+            )
+            judge_btn.click(
+                fn=judge_video,
+                inputs=None,
+                outputs=judge_output
             )
 
 if __name__ == "__main__":
