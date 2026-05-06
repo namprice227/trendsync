@@ -1,5 +1,5 @@
 import os
-from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
+from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 
 def render_final_video(clips_paths: list, profile_path: str, output_path: str = "final_trend.mp4"):
     """

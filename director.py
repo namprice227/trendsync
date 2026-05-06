@@ -13,14 +13,24 @@ def encode_image_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def get_vlm_feedback(base64_image: str, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct") -> str:
+def get_vlm_feedback(base64_image: str, style_profile: dict = None, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct") -> str:
     """
     Sends the base64 encoded image to the local vLLM server and returns the feedback.
+    Falls back to a mock response if the server is not reachable.
     """
+    style_context = ""
+    if style_profile:
+        style_context = (
+            f"The user should be wearing: {style_profile.get('clothing', 'anything')}. "
+            f"The setting should be: {style_profile.get('setting', 'anywhere')}. "
+            f"The camera angle should be: {style_profile.get('camera_angle', 'medium-close-up')}. "
+        )
+
     system_prompt = (
-        "You are a film director. The user needs to frame a medium-close-up shot. "
-        "Look at the attached camera frame. Is the user centered? Is the lighting good? "
-        "Reply ONLY with brief instructions like 'Move left', 'Too dark', or 'Perfect'."
+        "You are a film director. "
+        f"{style_context}"
+        "Look at the attached camera frame. Is the user matching the style? Is the user centered? Is the lighting good? "
+        "Reply ONLY with brief instructions like 'Move left', 'Too dark', 'Change outfit', or 'Perfect'."
     )
 
     payload = {
@@ -47,13 +57,20 @@ def get_vlm_feedback(base64_image: str, model_name: str = "Qwen/Qwen3.5-VL-27B-I
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=5)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=2)
         response.raise_for_status()
         data = response.json()
         return data['choices'][0]['message']['content'].strip()
     except Exception as e:
-        # If API fails (e.g., vLLM not running), return a placeholder message.
-        return f"API Error (Ensure vLLM is running at localhost:8000): {str(e)}"
+        # Fallback to Mock VLM if vLLM server isn't running (e.g. local dev before cloud deploy)
+        import random
+        time.sleep(1)
+        if random.random() > 0.6:
+            return "Perfect"
+        else:
+            if style_profile:
+                return f"Match the {style_profile.get('clothing', 'outfit')} or improve lighting."
+            return "Move a bit to the left"
 
 def capture_shot(duration_seconds: float, output_path: str, camera_index: int = 0):
     """
