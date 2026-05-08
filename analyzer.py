@@ -138,6 +138,8 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
 
     try:
         response = requests.post(VLLM_API_URL, json=payload, timeout=60)
+        print(f"[DEBUG] VLM response status: {response.status_code}")
+        print(f"[DEBUG] VLM response body (first 500 chars): {response.text[:500]}")
         response.raise_for_status()
         data = response.json()
         content = data['choices'][0]['message']['content'].strip()
