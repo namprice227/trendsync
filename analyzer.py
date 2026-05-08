@@ -133,23 +133,32 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
                 ]
             }
         ],
-        "max_tokens": 150
+        "max_tokens": 512,
+        "chat_template_kwargs": {"enable_thinking": False}
     }
 
     try:
         response = requests.post(VLLM_API_URL, json=payload, timeout=60)
         print(f"[DEBUG] VLM response status: {response.status_code}")
-        print(f"[DEBUG] VLM response body (first 500 chars): {response.text[:500]}")
         response.raise_for_status()
         data = response.json()
         content = data['choices'][0]['message']['content'].strip()
+        print(f"[DEBUG] VLM content: {content[:300]}")
         
-        # Try to parse the JSON returned by the VLM
-        # Sometimes models wrap JSON in markdown blocks
+        # Strip <think>...</think> blocks if present (Qwen3 thinking mode)
+        import re
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
+        # Try to extract JSON from the response
         if content.startswith("```json"):
             content = content.split("```json")[1].split("```")[0].strip()
         elif content.startswith("```"):
             content = content.split("```")[1].split("```")[0].strip()
+        
+        # Try to find a JSON object anywhere in the text
+        json_match = re.search(r'\{[^{}]*\}', content)
+        if json_match:
+            content = json_match.group(0)
             
         style_data = json.loads(content)
         

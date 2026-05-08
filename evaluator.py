@@ -63,7 +63,8 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
                 ]
             }
         ],
-        "max_tokens": 100
+        "max_tokens": 300,
+        "chat_template_kwargs": {"enable_thinking": False}
     }
 
     try:
@@ -71,7 +72,9 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
         response.raise_for_status()
         data = response.json()
         feedback = data['choices'][0]['message']['content'].strip()
-        # Simple extraction of score for mock purposes if needed
+        # Strip <think> blocks if present
+        import re
+        feedback = re.sub(r'<think>.*?</think>', '', feedback, flags=re.DOTALL).strip()
         return feedback
     except Exception as e:
         # Fallback Mock
