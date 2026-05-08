@@ -152,12 +152,20 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
     Sends a single 3x3 contact sheet batch to the VLM.
     Returns the raw text observation from the model.
     """
+    # Tell the model where in the video timeline this batch falls
+    position = "beginning" if batch_num <= total_batches * 0.33 else ("middle" if batch_num <= total_batches * 0.66 else "end")
+    
     system_prompt = (
-        "You are an expert cinematographer analyzing a TikTok trend video. "
-        f"This is batch {batch_num}/{total_batches} of the video. "
+        "You are an expert TikTok trend analyst studying viral video patterns. "
+        f"This is batch {batch_num}/{total_batches} (the {position}) of a TikTok video. "
         f"The image is a 3x3 grid of {num_frames} frames covering timestamps {time_range}. "
-        "Describe what you see: clothing/outfit, setting/location, camera angles, "
-        "and any actions or transitions. Be concise (2-3 sentences)."
+        "Describe what you see in detail. Focus on:\n"
+        "- What is happening (actions, transitions, costume changes, reveals)\n"
+        "- Any CHANGES between frames (outfit swap, scene change, before/after)\n"
+        "- Clothing/outfit details\n"
+        "- Setting/location\n"
+        "- Camera angles and movement\n"
+        "Be concise but capture the SEQUENCE of events (3-4 sentences)."
     )
 
     payload = {
@@ -167,7 +175,7 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe what you see in these frames."},
+                    {"type": "text", "text": "Describe the sequence of events in these frames. Note any transitions or changes."},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
@@ -175,7 +183,7 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
                 ]
             }
         ],
-        "max_tokens": 200,
+        "max_tokens": 300,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
@@ -191,16 +199,22 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
 def _merge_observations(observations: list, model_name: str) -> dict:
     """
     Sends all batch observations to the VLM to produce one final merged style profile JSON.
+    Understands narrative structure: transitions, costume changes, story arcs.
     """
-    combined = "\n".join([f"Batch {i+1}: {obs}" for i, obs in enumerate(observations)])
+    combined = "\n".join([f"Batch {i+1} (chronological): {obs}" for i, obs in enumerate(observations)])
     
     system_prompt = (
-        "You are an expert cinematographer. Below are observations from analyzing "
-        f"{len(observations)} batches of frames from a TikTok trend video. "
-        "Merge all observations into a single JSON object with exactly these three keys: "
-        "'clothing' (what the person is wearing), "
-        "'setting' (where it is filmed), and "
-        "'camera_angle' (the dominant camera angles used). "
+        "You are an expert TikTok trend analyst. Below are chronological observations from analyzing "
+        f"{len(observations)} sequential batches of frames from a TikTok trend video. "
+        "The batches are in TIME ORDER — Batch 1 is the beginning, the last batch is the end.\n\n"
+        "Your job is to understand the FULL NARRATIVE of this video and produce a JSON object with these keys:\n"
+        "- 'video_type': What kind of TikTok is this? (e.g., 'transition/reveal', 'dance', 'tutorial', 'outfit showcase', 'comedy skit', 'before-and-after', 'cosplay transformation')\n"
+        "- 'narrative': A 1-2 sentence description of what happens from start to finish\n"
+        "- 'clothing': What to wear to recreate this (if it's a transition, describe BOTH the before and after outfits)\n"
+        "- 'setting': Where it is filmed\n"
+        "- 'camera_angle': The dominant camera angles used\n"
+        "- 'key_transition': If there's a transition/reveal moment, describe it (e.g., 'hand covers camera, then reveals cosplay outfit'). Set to 'none' if no transition.\n"
+        "- 'recreation_tips': 2-3 specific tips for someone trying to recreate this exact video\n\n"
         "Reply ONLY with the raw JSON object."
     )
 
@@ -208,13 +222,13 @@ def _merge_observations(observations: list, model_name: str) -> dict:
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Here are the observations:\n\n{combined}\n\nProvide the merged JSON."}
+            {"role": "user", "content": f"Here are the chronological observations:\n\n{combined}\n\nAnalyze the full narrative and provide the merged JSON."}
         ],
-        "max_tokens": 300,
+        "max_tokens": 600,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
-    response = requests.post(VLLM_API_URL, json=payload, timeout=60)
+    response = requests.post(VLLM_API_URL, json=payload, timeout=90)
     response.raise_for_status()
     data = response.json()
     content = data['choices'][0]['message']['content'].strip()
@@ -227,7 +241,8 @@ def _merge_observations(observations: list, model_name: str) -> dict:
     elif content.startswith("```"):
         content = content.split("```")[1].split("```")[0].strip()
     
-    json_match = re.search(r'\{[^{}]*\}', content)
+    # Find JSON — may be nested, so use a greedy match
+    json_match = re.search(r'\{.*\}', content, flags=re.DOTALL)
     if json_match:
         content = json_match.group(0)
     
@@ -285,16 +300,24 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
         style_data = _merge_observations(observations, model_name)
         print(f"[DEBUG] Merged style: {style_data}")
         return {
+            "video_type": style_data.get("video_type", "unknown"),
+            "narrative": style_data.get("narrative", ""),
             "clothing": style_data.get("clothing", "casual outfit"),
             "setting": style_data.get("setting", "well-lit environment"),
-            "camera_angle": style_data.get("camera_angle", "medium shot")
+            "camera_angle": style_data.get("camera_angle", "medium shot"),
+            "key_transition": style_data.get("key_transition", "none"),
+            "recreation_tips": style_data.get("recreation_tips", "")
         }
     except Exception as e:
         print(f"Merge failed (falling back to mock): {str(e)}")
         return {
+            "video_type": "unknown",
+            "narrative": "",
             "clothing": "streetwear or casual trendy outfit",
             "setting": "outdoor urban environment or well-lit bedroom",
-            "camera_angle": "full body shot"
+            "camera_angle": "full body shot",
+            "key_transition": "none",
+            "recreation_tips": ""
         }
 
 def analyze_trend(url: str, output_dir: str = "temp"):
