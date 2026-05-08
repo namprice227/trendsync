@@ -44,7 +44,7 @@ def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.6-35B-A3B
     }
     
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=3)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         return data['choices'][0]['message']['content'].strip()

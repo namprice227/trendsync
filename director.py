@@ -49,7 +49,7 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=2)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
         return data['choices'][0]['message']['content'].strip()
