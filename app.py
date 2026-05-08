@@ -39,7 +39,22 @@ def process_trend_link(url):
         metadata_display = json.dumps(context, indent=2)
         status = f"Analysis Complete! Found {num_shots} required shots based on cuts."
         
-        style_guide = f"### AI Style Guide\n* **What to wear:** {style.get('clothing', 'N/A')}\n* **Where to shoot:** {style.get('setting', 'N/A')}\n* **Camera Framing:** {style.get('camera_angle', 'N/A')}"
+        # Format style values (VLM may return strings or lists)
+        def fmt(val):
+            if isinstance(val, list):
+                return ", ".join(val)
+            return str(val)
+        
+        clothing = fmt(style.get('clothing', 'N/A'))
+        setting = fmt(style.get('setting', 'N/A'))
+        camera = fmt(style.get('camera_angle', 'N/A'))
+        
+        style_guide = (
+            f"### 🎬 AI Style Guide\n\n"
+            f"**👗 What to wear:** {clothing}\n\n"
+            f"**📍 Where to shoot:** {setting}\n\n"
+            f"**📷 Camera Framing:** {camera}"
+        )
         
         # Generate script using Few-Shot style transfer
         generated_script = generate_script(style)
