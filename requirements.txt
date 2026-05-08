@@ -4,6 +4,6 @@ librosa
 scenedetect[opencv]
 moviepy
 requests
-opencv-python
+opencv-python-headless
 PyYAML
 fastmcp
