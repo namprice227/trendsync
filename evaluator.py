@@ -11,7 +11,7 @@ def encode_image_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def evaluate_final_video(video_path: str, style_profile: dict = None, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct"):
+def evaluate_final_video(video_path: str, style_profile: dict = None, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
     """
     Extracts a frame from the final video and asks the VLM to score it out of 10 based on style profile.
     Falls back to a mock response.
