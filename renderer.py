@@ -1,17 +1,41 @@
 import os
 from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 
-def render_final_video(clips_paths: list, profile_path: str, output_path: str = "final_trend.mp4"):
+def snap_cuts_to_beats(cuts: list, beats: list, threshold: float = 0.2) -> list:
+    """
+    Aligns raw video cuts to the nearest musical beat for perfectly synced edits.
+    Inspired by FireRed-OpenStoryline's smart beat-syncing logic.
+    """
+    if not beats:
+        return cuts
+        
+    snapped_cuts = [0.0]
+    for cut in cuts[1:]:
+        closest_beat = min(beats, key=lambda b: abs(b - cut))
+        if abs(closest_beat - cut) <= threshold:
+            snapped_cuts.append(closest_beat)
+        else:
+            snapped_cuts.append(cut)
+    return snapped_cuts
+
+def render_final_video(clips_paths: list, skill_dir: str, output_path: str = "final_trend.mp4"):
     """
     Assembles user clips, trims them to match trend cuts, and overlays original audio.
+    Applies beat-syncing to make the edits snappy.
     """
-    print("Loading trend profile for rendering...")
+    print("Loading skill context for rendering...")
     import json
-    with open(profile_path, "r") as f:
-        profile = json.load(f)
+    
+    context_path = os.path.join(skill_dir, "context.json")
+    with open(context_path, "r") as f:
+        context = json.load(f)
 
-    cuts = profile["cuts"]
-    audio_path = profile["audio_path"]
+    raw_cuts = context["cuts"]
+    beats = context.get("beats", [])
+    audio_path = context["audio_path"]
+    
+    # Apply OpenStoryline-style beat snapping
+    cuts = snap_cuts_to_beats(raw_cuts, beats)
 
     if len(clips_paths) != (len(cuts) - 1 if len(cuts) > 1 else len(cuts)):
         print("Warning: Mismatch between number of recorded clips and required shots.")
@@ -37,7 +61,7 @@ def render_final_video(clips_paths: list, profile_path: str, output_path: str = 
             v_clip = VideoFileClip(clip_path)
             # Ensure clip isn't shorter than required duration; if it is, use max length.
             trim_end = min(duration, v_clip.duration)
-            v_clip = v_clip.subclip(0, trim_end)
+            v_clip = v_clip.subclipped(0, trim_end)
             processed_clips.append(v_clip)
         except Exception as e:
             print(f"Failed to process clip {clip_path}: {str(e)}")
@@ -52,8 +76,8 @@ def render_final_video(clips_paths: list, profile_path: str, output_path: str = 
     try:
         audio_clip = AudioFileClip(audio_path)
         # Match audio duration to final video duration
-        audio_clip = audio_clip.subclip(0, min(audio_clip.duration, final_video.duration))
-        final_video = final_video.set_audio(audio_clip)
+        audio_clip = audio_clip.subclipped(0, min(audio_clip.duration, final_video.duration))
+        final_video = final_video.with_audio(audio_clip)
     except Exception as e:
         print(f"Warning: Failed to apply audio: {str(e)}")
 

@@ -77,9 +77,10 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
         # Fallback Mock
         time.sleep(2)
         score = 8.5
+        clothing_desc = style_profile.get('clothing', 'outfit') if style_profile else 'outfit'
         mock_feedback = (
             f"Score: {score}/10\n\n"
-            f"Critique: The video looks solid! You matched the '{style_profile.get('clothing', 'outfit')}' requirement perfectly. "
+            f"Critique: The video looks solid! You matched the '{clothing_desc}' requirement perfectly. "
             "Lighting is acceptable, though it could be a bit brighter. Great job on the framing!"
         )
         return mock_feedback
