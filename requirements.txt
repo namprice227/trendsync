@@ -8,3 +8,5 @@ torch
 torchvision
 openai
 opencv-python
+PyYAML
+fastmcp

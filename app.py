@@ -10,10 +10,11 @@ from analyzer import analyze_trend
 from director import get_vlm_feedback, encode_image_base64, capture_shot
 from renderer import render_final_video
 from evaluator import evaluate_final_video
+from scriptwriter import generate_script
 
 # Global state for the hackathon prototype
 app_state = {
-    "profile_path": None,
+    "skill_dir": None,
     "required_shots": 0,
     "current_shot_idx": 0,
     "recorded_clips": [],
@@ -25,25 +26,27 @@ app_state = {
 def process_trend_link(url):
     """Handler for Tab 1: Analyzer"""
     try:
-        profile_path, profile = analyze_trend(url)
-        app_state["profile_path"] = profile_path
-        app_state["cuts"] = profile["cuts"]
+        skill_dir, style, context = analyze_trend(url)
+        app_state["skill_dir"] = skill_dir
+        app_state["cuts"] = context["cuts"]
 
         # Calculate number of required shots based on cuts
-        num_shots = len(profile["cuts"]) - 1 if len(profile["cuts"]) > 1 else 1
+        num_shots = len(context["cuts"]) - 1 if len(context["cuts"]) > 1 else 1
         app_state["required_shots"] = num_shots
         app_state["current_shot_idx"] = 0
         app_state["recorded_clips"] = []
 
-        metadata_display = json.dumps(profile, indent=2)
+        metadata_display = json.dumps(context, indent=2)
         status = f"Analysis Complete! Found {num_shots} required shots based on cuts."
         
-        style = profile.get("style", {})
         style_guide = f"### AI Style Guide\n* **What to wear:** {style.get('clothing', 'N/A')}\n* **Where to shoot:** {style.get('setting', 'N/A')}\n* **Camera Framing:** {style.get('camera_angle', 'N/A')}"
         
-        return metadata_display, status, style_guide
+        # Generate script using Few-Shot style transfer
+        generated_script = generate_script(style)
+        
+        return metadata_display, status, style_guide, generated_script
     except Exception as e:
-        return f"Error: {str(e)}", "Failed to analyze.", ""
+        return f"Error: {str(e)}", "Failed to analyze.", "", ""
 
 def studio_feedback_loop(frame):
     """
@@ -65,21 +68,22 @@ def studio_feedback_loop(frame):
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     base64_img = encode_image_base64(frame_bgr)
 
-    # Load style profile to pass to director
-    style_profile = None
-    if app_state["profile_path"]:
+    # Load system prompt from skill
+    system_prompt = None
+    if app_state["skill_dir"]:
         try:
-            with open(app_state["profile_path"], "r") as f:
-                profile_data = json.load(f)
-                style_profile = profile_data.get("style")
-        except:
-            pass
+            from skill_manager import load_skill
+            trend_name = os.path.basename(app_state["skill_dir"])
+            frontmatter, markdown_body, context = load_skill(trend_name)
+            system_prompt = markdown_body
+        except Exception as e:
+            print("Failed to load skill:", e)
 
     # Get feedback (this is a blocking call, in a production app you'd run this asynchronously to not freeze the UI)
-    feedback = get_vlm_feedback(base64_img, style_profile=style_profile)
+    feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
 
     # Check if perfect and trigger recording
-    if "perfect" in feedback.lower() and app_state["profile_path"] is not None:
+    if "perfect" in feedback.lower() and app_state["skill_dir"] is not None:
         def start_recording():
             app_state["is_recording"] = True
             shot_idx = app_state["current_shot_idx"]
@@ -110,14 +114,14 @@ def studio_feedback_loop(frame):
 
 def render_project():
     """Handler for Tab 3: Render"""
-    if not app_state["profile_path"]:
+    if not app_state["skill_dir"]:
         return None, "Error: No trend profile loaded. Go back to Step 1."
 
     if not app_state["recorded_clips"]:
         return None, "Error: No clips recorded. Go to The Studio."
 
     try:
-        output_file = render_final_video(app_state["recorded_clips"], app_state["profile_path"])
+        output_file = render_final_video(app_state["recorded_clips"], app_state["skill_dir"])
         app_state["final_video_path"] = output_file
         return output_file, "Render complete! Ready to post."
     except Exception as e:
@@ -129,10 +133,12 @@ def judge_video():
         return "Error: No final video found. Assemble it first."
     
     style_profile = None
-    if app_state["profile_path"]:
+    if app_state["skill_dir"]:
         try:
-            with open(app_state["profile_path"], "r") as f:
-                style_profile = json.load(f).get("style")
+            from skill_manager import load_skill
+            trend_name = os.path.basename(app_state["skill_dir"])
+            frontmatter, _, _ = load_skill(trend_name)
+            style_profile = frontmatter
         except:
             pass
             
@@ -151,14 +157,18 @@ with gr.Blocks(title="TrendFlow AI") as demo:
                 url_input = gr.Textbox(label="TikTok/Reel URL")
                 analyze_btn = gr.Button("Analyze Trend")
 
-            status_text_1 = gr.Textbox(label="Status", interactive=False)
-            style_guide_output = gr.Markdown("### AI Style Guide\n*(Run analysis to see advice)*")
-            metadata_output = gr.Code(label="Extracted Metadata (trend_profile.json)", language="json")
+            with gr.Row():
+                with gr.Column():
+                    metadata_output = gr.Code(label="Extracted Context (context.json)", language="json")
+                with gr.Column():
+                    status_text_1 = gr.Textbox(label="Status", interactive=False)
+                    style_guide_output = gr.Markdown("### AI Style Guide\n*(Run analysis to see advice)*")
+                    script_output = gr.Textbox(label="Generated Script & Caption", interactive=False, lines=4)
 
             analyze_btn.click(
                 fn=process_trend_link,
                 inputs=url_input,
-                outputs=[metadata_output, status_text_1, style_guide_output]
+                outputs=[metadata_output, status_text_1, style_guide_output, script_output]
             )
 
         # Tab 2: The Studio
