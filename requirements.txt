@@ -3,9 +3,6 @@ yt-dlp
 librosa
 scenedetect[opencv]
 moviepy
-vllm>=0.20.1
-torch
-torchvision
 openai
 opencv-python
 PyYAML
