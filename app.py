@@ -103,6 +103,10 @@ def process_trend_link(url, progress=gr.Progress()):
         setting = fmt(style.get('setting', 'N/A'))
         camera = fmt(style.get('camera_angle', 'N/A'))
         bpm = context.get('bpm', 'N/A')
+        video_type = fmt(style.get('video_type', 'N/A'))
+        narrative = fmt(style.get('narrative', ''))
+        transition = fmt(style.get('key_transition', 'none'))
+        tips = fmt(style.get('recreation_tips', ''))
         
         # Build the results summary
         results_md = f"""### ✅ Analysis Complete!
@@ -111,7 +115,23 @@ def process_trend_link(url, progress=gr.Progress()):
 
 ---
 
-### 🎬 AI Style Guide
+### 🎯 Video Type: {video_type}
+
+**📖 Story:** {narrative}
+
+"""
+
+        # Show transition info if present
+        if transition and transition.lower() != 'none':
+            results_md += f"""### ⚡ Key Transition
+
+{transition}
+
+---
+
+"""
+
+        results_md += f"""### 🎬 AI Style Guide
 
 | | Recommendation |
 |---|---|
@@ -120,15 +140,25 @@ def process_trend_link(url, progress=gr.Progress()):
 | 📷 **Camera framing** | {camera} |
 | 🎵 **BPM** | {bpm} |
 
----
+"""
 
-### 📋 What You Need to Do
+        # Show recreation tips if present
+        if tips:
+            results_md += f"""---
 
-1. Dress according to the style guide above
-2. Set up your camera in the recommended setting
-3. **Go to Step 2: The Studio** tab
-4. The AI Director will guide you shot by shot
-5. It will auto-record when your framing is perfect
+### 💡 Recreation Tips
+
+{tips}
+
+"""
+
+        results_md += """---
+
+### 📋 Next Steps
+
+1. Prepare your outfits according to the style guide
+2. Set up your filming location  
+3. **Go to Step 2: The Studio** to upload your clips
 """
 
         # Generate script using Few-Shot style transfer
