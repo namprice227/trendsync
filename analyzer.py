@@ -82,95 +82,210 @@ import requests
 
 VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
 
-def encode_image_base64(frame):
-    """Encodes a cv2 image frame to base64 string."""
-    _, buffer = cv2.imencode('.jpg', frame)
-    return base64.b64encode(buffer).decode('utf-8')
+import numpy as np
 
-def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
+def sample_frames(video_path: str, interval: float = 0.3):
     """
-    Extracts a frame from the video and queries the VLM for style profile.
-    Falls back to a mock if the server isn't reachable.
+    Samples frames from the video at the given interval (in seconds).
+    Returns a list of (timestamp, frame) tuples.
     """
-    print("Extracting style profile...")
     cap = cv2.VideoCapture(video_path)
-    # Get a frame from the middle of the video
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames // 2))
-    ret, frame = cap.read()
+    duration = total_frames / fps
+    
+    frames = []
+    current_time = 0.0
+    while current_time < duration:
+        frame_idx = int(current_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if ret:
+            frames.append((current_time, frame))
+        current_time += interval
+    
     cap.release()
+    print(f"Sampled {len(frames)} frames at {interval}s intervals ({duration:.1f}s video)")
+    return frames
 
-    if not ret:
-        print("Failed to extract frame for style analysis.")
-        return {"clothing": "casual", "setting": "well-lit room", "camera_angle": "medium shot"}
+def create_contact_sheet(frames: list, thumb_width: int = 320, cols: int = 3):
+    """
+    Arranges sampled frames into a 3x3 grid contact sheet image.
+    Returns a single image containing all frames in a grid.
+    """
+    if not frames:
+        return None
+    
+    # Resize all frames to uniform thumbnail size
+    thumbnails = []
+    for _, frame in frames:
+        h, w = frame.shape[:2]
+        thumb_height = int(thumb_width * h / w)
+        thumb = cv2.resize(frame, (thumb_width, thumb_height))
+        thumbnails.append(thumb)
+    
+    # All thumbs should have same height (use the first one's height)
+    thumb_h = thumbnails[0].shape[0]
+    
+    # Arrange into grid
+    rows_needed = (len(thumbnails) + cols - 1) // cols
+    # Pad with black frames if needed
+    while len(thumbnails) % cols != 0:
+        thumbnails.append(np.zeros((thumb_h, thumb_width, 3), dtype=np.uint8))
+    
+    grid_rows = []
+    for r in range(rows_needed):
+        row_thumbs = thumbnails[r * cols : (r + 1) * cols]
+        grid_rows.append(np.hstack(row_thumbs))
+    
+    contact_sheet = np.vstack(grid_rows)
+    return contact_sheet
 
-    base64_image = encode_image_base64(frame)
-
+def _analyze_batch(base64_image: str, batch_num: int, total_batches: int, 
+                   num_frames: int, time_range: str, model_name: str) -> str:
+    """
+    Sends a single 3x3 contact sheet batch to the VLM.
+    Returns the raw text observation from the model.
+    """
     system_prompt = (
-        "You are an expert cinematographer analyzing a TikTok trend. "
-        "Analyze the provided frame and output a JSON object with exactly these three keys: "
-        "'clothing' (what the person is wearing), 'setting' (where it is filmed), and 'camera_angle' (e.g., full body, close up). "
+        "You are an expert cinematographer analyzing a TikTok trend video. "
+        f"This is batch {batch_num}/{total_batches} of the video. "
+        f"The image is a 3x3 grid of {num_frames} frames covering timestamps {time_range}. "
+        "Describe what you see: clothing/outfit, setting/location, camera angles, "
+        "and any actions or transitions. Be concise (2-3 sentences)."
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe what you see in these frames."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 200,
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
+    response = requests.post(VLLM_API_URL, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+    content = data['choices'][0]['message']['content'].strip()
+    
+    import re
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    return content
+
+def _merge_observations(observations: list, model_name: str) -> dict:
+    """
+    Sends all batch observations to the VLM to produce one final merged style profile JSON.
+    """
+    combined = "\n".join([f"Batch {i+1}: {obs}" for i, obs in enumerate(observations)])
+    
+    system_prompt = (
+        "You are an expert cinematographer. Below are observations from analyzing "
+        f"{len(observations)} batches of frames from a TikTok trend video. "
+        "Merge all observations into a single JSON object with exactly these three keys: "
+        "'clothing' (what the person is wearing), "
+        "'setting' (where it is filmed), and "
+        "'camera_angle' (the dominant camera angles used). "
         "Reply ONLY with the raw JSON object."
     )
 
     payload = {
         "model": model_name,
         "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Analyze this frame and provide the JSON."},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Here are the observations:\n\n{combined}\n\nProvide the merged JSON."}
         ],
-        "max_tokens": 512,
+        "max_tokens": 300,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
+    response = requests.post(VLLM_API_URL, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    content = data['choices'][0]['message']['content'].strip()
+    
+    import re
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    
+    if content.startswith("```json"):
+        content = content.split("```json")[1].split("```")[0].strip()
+    elif content.startswith("```"):
+        content = content.split("```")[1].split("```")[0].strip()
+    
+    json_match = re.search(r'\{[^{}]*\}', content)
+    if json_match:
+        content = json_match.group(0)
+    
+    return json.loads(content)
+
+def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
+    """
+    Samples frames every 0.3s, groups them into 3x3 batches (9 frames each),
+    analyzes each batch with the VLM, then merges all observations into a 
+    single style profile with one final VLM call.
+    """
+    print("Extracting style profile (batched 3x3 analysis)...")
+    
+    # Sample frames every 0.3 seconds
+    frames = sample_frames(video_path, interval=0.3)
+    
+    if not frames:
+        print("Failed to extract frames for style analysis.")
+        return {"clothing": "casual", "setting": "well-lit room", "camera_angle": "medium shot"}
+    
+    # Split into batches of 9 (3x3 grids)
+    BATCH_SIZE = 9
+    batches = [frames[i:i + BATCH_SIZE] for i in range(0, len(frames), BATCH_SIZE)]
+    total_batches = len(batches)
+    print(f"Processing {total_batches} batches of up to {BATCH_SIZE} frames each...")
+    
+    observations = []
+    for idx, batch in enumerate(batches):
+        time_start = f"{batch[0][0]:.1f}s"
+        time_end = f"{batch[-1][0]:.1f}s"
+        time_range = f"{time_start}-{time_end}"
+        
+        contact_sheet = create_contact_sheet(batch, thumb_width=320, cols=3)
+        base64_image = encode_image_base64(contact_sheet)
+        
+        try:
+            print(f"  Analyzing batch {idx+1}/{total_batches} ({time_range})...")
+            obs = _analyze_batch(base64_image, idx+1, total_batches, len(batch), time_range, model_name)
+            print(f"  [Batch {idx+1}] {obs[:150]}")
+            observations.append(obs)
+        except Exception as e:
+            print(f"  [Batch {idx+1}] Failed: {str(e)}")
+    
+    if not observations:
+        print("All batches failed, falling back to mock.")
+        return {
+            "clothing": "streetwear or casual trendy outfit",
+            "setting": "outdoor urban environment or well-lit bedroom",
+            "camera_angle": "full body shot"
+        }
+    
+    # Merge all observations into one final style profile
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=60)
-        print(f"[DEBUG] VLM response status: {response.status_code}")
-        response.raise_for_status()
-        data = response.json()
-        content = data['choices'][0]['message']['content'].strip()
-        print(f"[DEBUG] VLM content: {content[:300]}")
-        
-        # Strip <think>...</think> blocks if present (Qwen3 thinking mode)
-        import re
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        
-        # Try to extract JSON from the response
-        if content.startswith("```json"):
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif content.startswith("```"):
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        # Try to find a JSON object anywhere in the text
-        json_match = re.search(r'\{[^{}]*\}', content)
-        if json_match:
-            content = json_match.group(0)
-            
-        style_data = json.loads(content)
-        
-        # Ensure keys exist
+        print(f"Merging {len(observations)} batch observations into final style profile...")
+        style_data = _merge_observations(observations, model_name)
+        print(f"[DEBUG] Merged style: {style_data}")
         return {
             "clothing": style_data.get("clothing", "casual outfit"),
             "setting": style_data.get("setting", "well-lit environment"),
             "camera_angle": style_data.get("camera_angle", "medium shot")
         }
     except Exception as e:
-        print(f"VLM API failed (falling back to mock): {str(e)}")
-        # Mock VLM style extraction if vLLM server isn't running
+        print(f"Merge failed (falling back to mock): {str(e)}")
         return {
             "clothing": "streetwear or casual trendy outfit",
             "setting": "outdoor urban environment or well-lit bedroom",
