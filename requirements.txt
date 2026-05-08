@@ -3,7 +3,7 @@ yt-dlp
 librosa
 scenedetect[opencv]
 moviepy
-openai
+requests
 opencv-python
 PyYAML
 fastmcp
