@@ -14,6 +14,14 @@ def download_video(url: str, output_dir: str = "temp") -> str:
     Returns the path to the downloaded video.
     """
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Clean up old files to force fresh download
+    for old_file in ['reference_video.mp4', 'reference_video.webm', 'extracted_audio.mp3']:
+        old_path = os.path.join(output_dir, old_file)
+        if os.path.exists(old_path):
+            os.remove(old_path)
+            print(f"Removed old file: {old_path}")
+    
     outtmpl = os.path.join(output_dir, 'reference_video.%(ext)s')
 
     ydl_opts = {
@@ -26,8 +34,6 @@ def download_video(url: str, output_dir: str = "temp") -> str:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info_dict)
-        # yt-dlp might change the extension, let's get the actual file if possible, or just default.
-        # Sometimes 'prepare_filename' gets the final name right
 
     print(f"Downloaded video to {filename}")
     return filename
