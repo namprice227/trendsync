@@ -13,7 +13,7 @@ def encode_image_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct") -> str:
+def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: str = "Qwen/Qwen3.6-35B-A3B") -> str:
     """
     Sends the base64 encoded image to the local vLLM server and returns the feedback.
     Falls back to a mock response if the server is not reachable.

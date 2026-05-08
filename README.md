@@ -85,9 +85,9 @@ The application automatically falls back to mocked VLM responses when no vLLM se
 ### 1. Start the vLLM Engine (Cloud GPU only)
 
 ```bash
-vllm serve Qwen/Qwen3.5-VL-27B-Instruct \
+vllm serve Qwen/Qwen3.6-35B-A3B \
   --tensor-parallel-size 1 \
-  --mm-encoder-tp-mode data \
+  --gpu-memory-utilization 0.95 \
   --max-model-len 32768
 ```
 

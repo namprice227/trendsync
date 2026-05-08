@@ -3,7 +3,7 @@ import json
 
 VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
 
-def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct"):
+def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
     """
     Uses Few-Shot Style Transfer to generate a TikTok script and caption based on the visual style.
     Falls back to a mock if vLLM isn't running.

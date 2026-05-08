@@ -87,7 +87,7 @@ def encode_image_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.5-VL-27B-Instruct"):
+def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
     """
     Extracts a frame from the video and queries the VLM for style profile.
     Falls back to a mock if the server isn't reachable.
