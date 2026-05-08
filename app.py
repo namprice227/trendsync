@@ -298,45 +298,120 @@ and use vision AI to analyze the style — clothing, setting, and camera angles.
         with gr.Tab("② The Studio", id="tab2"):
             gr.Markdown("""
 <div class="step-banner">
-<strong>Step 2:</strong> Turn on your webcam below. The AI Director watches your camera feed in real-time and tells you 
-what to adjust (lighting, framing, outfit). When it says <strong>"Perfect"</strong>, it automatically records 
-the shot for the exact duration needed.
+<strong>Step 2:</strong> Upload your filmed clips below. The AI Director will review each clip against the style guide 
+and give you feedback. You can also use a webcam if available (requires HTTPS).
 </div>
 """)
 
-            # Status at the top
-            with gr.Row():
-                with gr.Column():
-                    shot_progress = gr.Textbox(
-                        label="Progress",
-                        value="Waiting to start...",
-                        interactive=False,
-                        elem_classes=["progress-text"]
-                    )
+            # Shot info
+            shot_info = gr.Markdown("⏳ Analyze a trend in Step 1 first to see shot requirements here.")
 
+            gr.Markdown("### 📤 Upload Your Clips")
+            gr.Markdown("Film your shots on your phone or camera, then upload them here. The AI will review each one.")
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    clip_upload = gr.File(
+                        label="Upload video clips (one per shot)",
+                        file_count="multiple",
+                        file_types=["video"]
+                    )
+                with gr.Column(scale=1):
+                    upload_btn = gr.Button("📥 Add Clips & Get AI Review", variant="primary", size="lg")
+            
+            upload_status = gr.Markdown("")
+            ai_review = gr.Markdown("")
+            
+            gr.Markdown("---")
+            gr.Markdown("### 📹 Or Use Webcam (requires HTTPS)")
+            gr.Markdown("If you have webcam access, the AI Director will guide you in real-time and auto-record.")
+            
             with gr.Row():
                 with gr.Column(scale=2):
                     camera_input = gr.Image(
                         sources=["webcam"],
                         streaming=True,
-                        label="📹 Live Camera Feed",
-                        height=400
+                        label="Live Camera Feed",
+                        height=350
                     )
                 with gr.Column(scale=1):
-                    director_feedback = gr.Markdown(
-                        value="""### 🎥 AI Director
+                    shot_progress = gr.Textbox(
+                        label="Progress",
+                        value="Waiting...",
+                        interactive=False
+                    )
+                    director_feedback = gr.Markdown("Webcam feedback will appear here.")
 
-Waiting for camera feed...
+            # Upload handler
+            def handle_clip_upload(files):
+                if not files:
+                    return "⚠️ No files uploaded.", ""
+                
+                if not app_state["skill_dir"]:
+                    return "⚠️ Go to **Step 1** first and analyze a trend.", ""
+                
+                os.makedirs("recorded_shots", exist_ok=True)
+                app_state["recorded_clips"] = []
+                
+                reviews = []
+                for i, f in enumerate(files):
+                    # Copy uploaded file to recorded_shots
+                    import shutil
+                    dest = os.path.join("recorded_shots", f"shot_{i}.mp4")
+                    shutil.copy(f.name, dest)
+                    app_state["recorded_clips"].append(dest)
+                    
+                    # Get AI review of the clip
+                    try:
+                        cap = cv2.VideoCapture(dest)
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames // 2))
+                        ret, frame = cap.read()
+                        cap.release()
+                        
+                        if ret:
+                            base64_img = encode_image_base64(frame)
+                            
+                            # Load style prompt
+                            system_prompt = None
+                            if app_state["skill_dir"]:
+                                try:
+                                    from skill_manager import load_skill
+                                    trend_name = os.path.basename(app_state["skill_dir"])
+                                    _, markdown_body, _ = load_skill(trend_name)
+                                    system_prompt = markdown_body
+                                except:
+                                    pass
+                            
+                            feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
+                            reviews.append(f"**Clip {i+1}** (`{os.path.basename(f.name)}`): {feedback}")
+                        else:
+                            reviews.append(f"**Clip {i+1}**: ⚠️ Could not read frame for review")
+                    except Exception as e:
+                        reviews.append(f"**Clip {i+1}**: Review failed — {str(e)}")
+                
+                app_state["current_shot_idx"] = len(files)
+                
+                total = app_state["required_shots"]
+                uploaded = len(files)
+                
+                status = f"✅ **{uploaded} clips uploaded!**"
+                if uploaded < total:
+                    status += f"\n\n⚠️ You need {total} shots but only uploaded {uploaded}. The renderer will use what's available."
+                
+                status += "\n\n**→ Go to Step 3 to assemble your final video.**"
+                
+                review_md = "### 🎥 AI Director Review\n\n" + "\n\n".join(reviews) if reviews else ""
+                
+                return status, review_md
+            
+            upload_btn.click(
+                fn=handle_clip_upload,
+                inputs=clip_upload,
+                outputs=[upload_status, ai_review]
+            )
 
----
-
-**Tips:**
-- Make sure you have good lighting
-- Center yourself in the frame  
-- Wear the outfit from the Style Guide
-- The AI will auto-record when ready
-""")
-
+            # Webcam streaming handler (still works if HTTPS available)
             camera_input.stream(
                 fn=studio_feedback_loop,
                 inputs=camera_input,
