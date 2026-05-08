@@ -40,14 +40,19 @@ def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.6-35B-A3B
                 "content": "Generate the script and caption."
             }
         ],
-        "max_tokens": 100
+        "max_tokens": 200,
+        "chat_template_kwargs": {"enable_thinking": False}
     }
     
     try:
         response = requests.post(VLLM_API_URL, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        return data['choices'][0]['message']['content'].strip()
+        content = data['choices'][0]['message']['content'].strip()
+        # Strip <think> blocks if present
+        import re
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        return content
     except Exception as e:
         print(f"Scriptwriter API failed (falling back to mock): {str(e)}")
         return (

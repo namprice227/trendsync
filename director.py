@@ -45,14 +45,19 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
                 ]
             }
         ],
-        "max_tokens": 10
+        "max_tokens": 50,
+        "chat_template_kwargs": {"enable_thinking": False}
     }
 
     try:
         response = requests.post(VLLM_API_URL, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
-        return data['choices'][0]['message']['content'].strip()
+        content = data['choices'][0]['message']['content'].strip()
+        # Strip <think> blocks if present
+        import re
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        return content
     except Exception as e:
         # Fallback to Mock VLM if vLLM server isn't running (e.g. local dev before cloud deploy)
         import random
