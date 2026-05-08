@@ -67,7 +67,7 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=5)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         feedback = data['choices'][0]['message']['content'].strip()
