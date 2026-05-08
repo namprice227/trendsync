@@ -84,6 +84,11 @@ VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
 
 import numpy as np
 
+def encode_image_base64(frame):
+    """Encodes a cv2 image frame to base64 string."""
+    _, buffer = cv2.imencode('.jpg', frame)
+    return base64.b64encode(buffer).decode('utf-8')
+
 def sample_frames(video_path: str, interval: float = 0.3):
     """
     Samples frames from the video at the given interval (in seconds).
