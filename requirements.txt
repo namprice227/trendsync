@@ -7,3 +7,6 @@ requests
 opencv-python-headless
 PyYAML
 fastmcp
+mediapipe
+dtaidistance
+numpy
