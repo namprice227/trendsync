@@ -6,7 +6,9 @@ import yt_dlp
 import subprocess
 import cv2
 import base64
+import shutil
 from skill_manager import save_skill
+from pose_utils import create_pose_estimator
 
 def download_video(url: str, output_dir: str = "temp") -> str:
     """
@@ -43,8 +45,16 @@ def extract_audio(video_path: str, output_path: str) -> str:
     Extracts audio from video using ffmpeg.
     """
     print(f"Extracting audio to {output_path}...")
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_bin = "ffmpeg"
+
     command = [
-        "ffmpeg", "-y", "-i", video_path,
+        ffmpeg_bin, "-y", "-i", video_path,
         "-vn", "-acodec", "libmp3lame", "-q:a", "2", output_path
     ]
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -205,27 +215,16 @@ def extract_reference_poses(video_path: str, sample_interval: float = 0.1):
     
     Falls back gracefully if MediaPipe is not installed.
     """
-    try:
-        import mediapipe as mp
-    except ImportError:
-        print("MediaPipe not installed — skipping pose extraction. Install with: pip install mediapipe")
-        return []
-
-    if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "pose"):
-        print(
-            "MediaPipe legacy solutions API is unavailable — skipping pose extraction. "
-            "This venv appears to have the newer MediaPipe Tasks-only package; "
-            "use Python 3.9-3.12 with legacy solutions support for pose matching."
-        )
-        return []
-    
-    print("Extracting reference poses (MediaPipe)...")
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(
+    pose = create_pose_estimator(
         static_image_mode=True,
         model_complexity=1,
-        min_detection_confidence=0.5
+        min_detection_confidence=0.5,
+        log_prefix="AnalyzerPose",
     )
+    if pose is None:
+        return []
+
+    print("Extracting reference poses (MediaPipe)...")
     
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -244,27 +243,8 @@ def extract_reference_poses(video_path: str, sample_interval: float = 0.1):
         
         # MediaPipe expects RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb_frame)
-        
-        if results.pose_landmarks:
-            landmarks = []
-            for lm in results.pose_landmarks.landmark:
-                landmarks.append([lm.x, lm.y, lm.z, lm.visibility])
-            
-            # Normalize relative to hip center (landmark 23=left hip, 24=right hip)
-            hip_x = (landmarks[23][0] + landmarks[24][0]) / 2
-            hip_y = (landmarks[23][1] + landmarks[24][1]) / 2
-            hip_z = (landmarks[23][2] + landmarks[24][2]) / 2
-            
-            normalized = []
-            for lm in landmarks:
-                normalized.append([
-                    lm[0] - hip_x,
-                    lm[1] - hip_y,
-                    lm[2] - hip_z,
-                    lm[3]  # visibility stays as-is
-                ])
-            
+        landmarks, normalized = pose.extract(rgb_frame)
+        if normalized:
             pose_timeline.append({
                 "time": round(current_time, 2),
                 "landmarks": landmarks,

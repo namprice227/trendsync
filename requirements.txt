@@ -1,12 +1,19 @@
-gradio
-yt-dlp
-librosa
-scenedetect[opencv]
-moviepy
-requests
-opencv-python-headless
-PyYAML
-fastmcp
-mediapipe
-dtaidistance
-numpy
+# Tested with Python 3.12. MediaPipe legacy `mp.solutions.pose`
+# is not available in the current Python 3.13 wheel.
+numpy==1.26.4
+protobuf>=4.25.3,<5
+jax==0.4.30
+jaxlib==0.4.30
+mediapipe==0.10.14
+opencv-contrib-python==4.10.0.84
+opencv-python==4.10.0.84
+
+gradio==6.14.0
+yt-dlp==2026.3.17
+librosa==0.11.0
+scenedetect==0.7
+moviepy==2.2.1
+requests==2.33.1
+PyYAML==6.0.3
+fastmcp>=2.0,<3.0
+dtaidistance>=2.3,<3.0

@@ -5,6 +5,7 @@ import json
 import time
 import numpy as np
 from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, DIRECTOR_VLM_INTERVAL, vlm_request_with_retry
+from pose_utils import create_pose_estimator, compute_pose_dtw_score
 
 VLLM_API_URL = DIRECTOR_VLLM_API_URL
 
@@ -32,28 +33,21 @@ class PoseTracker:
     }
     
     def __init__(self):
-        self._mp = None
-        self._pose = None
+        self._pose_estimator = None
         self._available = False
         self._pose_history = []  # Buffer of recent normalized poses
         self._max_history = 30   # ~3 seconds at 10fps
-        
-        try:
-            import mediapipe as mp
-            if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "pose"):
-                print("[PoseTracker] MediaPipe legacy solutions API unavailable — pose tracking disabled")
-                return
-            self._mp = mp
-            self._pose = mp.solutions.pose.Pose(
-                static_image_mode=False,
-                model_complexity=0,  # Fastest model for real-time
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            )
+
+        self._pose_estimator = create_pose_estimator(
+            static_image_mode=False,
+            # Complexity 1 ships with MediaPipe; 0/2 trigger first-run downloads.
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            log_prefix="PoseTracker",
+        )
+        if self._pose_estimator is not None:
             self._available = True
-            print("[PoseTracker] MediaPipe initialized successfully")
-        except ImportError:
-            print("[PoseTracker] MediaPipe not available — pose tracking disabled")
     
     @property
     def available(self):
@@ -67,28 +61,9 @@ class PoseTracker:
         if not self._available:
             return None, None
         
-        results = self._pose.process(frame_rgb)
-        
-        if not results.pose_landmarks:
+        landmarks, normalized = self._pose_estimator.extract(frame_rgb)
+        if not normalized:
             return None, None
-        
-        landmarks = []
-        for lm in results.pose_landmarks.landmark:
-            landmarks.append([lm.x, lm.y, lm.z, lm.visibility])
-        
-        # Normalize relative to hip center
-        hip_x = (landmarks[23][0] + landmarks[24][0]) / 2
-        hip_y = (landmarks[23][1] + landmarks[24][1]) / 2
-        hip_z = (landmarks[23][2] + landmarks[24][2]) / 2
-        
-        normalized = []
-        for lm in landmarks:
-            normalized.append([
-                lm[0] - hip_x,
-                lm[1] - hip_y,
-                lm[2] - hip_z,
-                lm[3]
-            ])
         
         # Add to history buffer
         self._pose_history.append(normalized)
@@ -153,47 +128,18 @@ class PoseTracker:
         if len(self._pose_history) < 5 or not reference_poses:
             return None, None
         
-        try:
-            from dtaidistance import dtw
-        except ImportError:
+        score = compute_pose_dtw_score(self._pose_history, reference_poses)
+        if score is None:
             return None, None
-        
-        # Flatten pose data for DTW: use key joints only (shoulders, elbows, wrists, hips)
-        key_joints = [11, 12, 13, 14, 15, 16, 23, 24]
-        
-        def flatten_poses(poses):
-            flat = []
-            for pose in poses:
-                coords = []
-                for j in key_joints:
-                    if j < len(pose):
-                        coords.extend([pose[j][0], pose[j][1]])
-                flat.append(coords)
-            return np.array(flat, dtype=np.float64)
-        
-        user_seq = flatten_poses(self._pose_history)
-        
-        # Get matching window from reference
-        ref_normalized = [p["normalized"] for p in reference_poses]
-        if len(ref_normalized) < len(user_seq):
-            return None, None
-        
-        ref_seq = flatten_poses(ref_normalized[:len(user_seq) * 2])
-        
-        # Compute DTW
-        try:
-            distance = dtw.distance_fast(
-                user_seq.flatten().astype(np.float64),
-                ref_seq[:len(user_seq)].flatten().astype(np.float64)
-            )
-            score = max(0, 100 - int(distance * 50))  # Normalize to 0-100
-            return score, None
-        except Exception:
-            return None, None
+        return score, None
+
+    def compute_sequence_dtw_score(self, user_poses, reference_poses):
+        """Computes a 0-100 DTW similarity score for uploaded clip poses."""
+        return compute_pose_dtw_score(user_poses, reference_poses)
     
     def close(self):
-        if self._pose:
-            self._pose.close()
+        if self._pose_estimator:
+            self._pose_estimator.close()
 
 # ============================================================
 # CAMERA MOTION CHECK — Compare user's camera to reference
