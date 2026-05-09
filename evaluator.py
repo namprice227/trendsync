@@ -3,7 +3,7 @@ import base64
 import requests
 import json
 import time
-from config import VLLM_API_URL, EVALUATOR_MODEL, EVALUATOR_TIMEOUT
+from config import VLLM_API_URL, EVALUATOR_MODEL, EVALUATOR_TIMEOUT, vlm_request_with_retry
 
 def encode_image_base64(frame):
     """Encodes a cv2 image frame to base64 string."""
@@ -69,9 +69,7 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=EVALUATOR_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
+        data = vlm_request_with_retry(VLLM_API_URL, payload, timeout=EVALUATOR_TIMEOUT)
         feedback = data['choices'][0]['message']['content'].strip()
         # Strip <think> blocks if present
         import re

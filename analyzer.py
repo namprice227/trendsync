@@ -86,7 +86,7 @@ def detect_video_cuts(video_path: str):
 
 import requests
 import numpy as np
-from config import VLLM_API_URL, ANALYSIS_MODEL, ANALYSIS_TIMEOUT
+from config import VLLM_API_URL, ANALYSIS_MODEL, ANALYSIS_TIMEOUT, vlm_request_with_retry
 
 # ============================================================
 # OPTICAL FLOW — Camera Motion Analysis
@@ -416,9 +416,7 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
-    response = requests.post(VLLM_API_URL, json=payload, timeout=ANALYSIS_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+    data = vlm_request_with_retry(VLLM_API_URL, payload, timeout=ANALYSIS_TIMEOUT)
     content = data['choices'][0]['message']['content'].strip()
     
     import re
@@ -462,9 +460,7 @@ def _merge_observations(observations: list, model_name: str, extra_context: str 
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
-    response = requests.post(VLLM_API_URL, json=payload, timeout=ANALYSIS_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+    data = vlm_request_with_retry(VLLM_API_URL, payload, timeout=ANALYSIS_TIMEOUT)
     content = data['choices'][0]['message']['content'].strip()
     
     import re

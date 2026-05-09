@@ -1,6 +1,6 @@
 import requests
 import json
-from config import VLLM_API_URL, SCRIPT_MODEL, SCRIPT_TIMEOUT
+from config import VLLM_API_URL, SCRIPT_MODEL, SCRIPT_TIMEOUT, vlm_request_with_retry
 
 def generate_script(style_profile: dict, model_name: str = None):
     if model_name is None:
@@ -46,9 +46,7 @@ def generate_script(style_profile: dict, model_name: str = None):
     }
     
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=SCRIPT_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
+        data = vlm_request_with_retry(VLLM_API_URL, payload, timeout=SCRIPT_TIMEOUT)
         content = data['choices'][0]['message']['content'].strip()
         # Strip <think> blocks if present
         import re

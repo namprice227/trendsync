@@ -4,7 +4,7 @@ import requests
 import json
 import time
 import numpy as np
-from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, DIRECTOR_VLM_INTERVAL
+from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, DIRECTOR_VLM_INTERVAL, vlm_request_with_retry
 
 VLLM_API_URL = DIRECTOR_VLLM_API_URL
 
@@ -328,9 +328,7 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=DIRECTOR_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
+        data = vlm_request_with_retry(VLLM_API_URL, payload, timeout=DIRECTOR_TIMEOUT)
         content = data['choices'][0]['message']['content'].strip()
         import re
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
