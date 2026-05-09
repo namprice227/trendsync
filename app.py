@@ -407,7 +407,7 @@ def judge_video():
 # ==========================================
 # BUILD THE GRADIO UI
 # ==========================================
-with gr.Blocks(title="TrendFlow AI — Autonomous TikTok Director", css=custom_css, theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="TrendFlow AI — Autonomous TikTok Director") as demo:
     
     # --- Header ---
     gr.Markdown("# 🎬 TrendFlow AI", elem_classes=["header-title"])
@@ -534,12 +534,12 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                         if ref_poses and app_state.get("pose_tracker"):
                             user_poses = extract_reference_poses(dest)
                             if user_poses:
-                                score = app_state["pose_tracker"].compute_dtw_score(
-                                    [p["normalized"] for p in user_poses],
-                                    [p["normalized"] for p in ref_poses]
+                                score = app_state["pose_tracker"].compute_sequence_dtw_score(
+                                    user_poses,
+                                    ref_poses
                                 )
-                                pct = max(0, min(100, int((1 - score / 5.0) * 100)))
-                                clip_review_parts.append(f"🤸 Pose match: **{pct}%**")
+                                if score is not None:
+                                    clip_review_parts.append(f"🤸 Pose match: **{int(score)}%**")
                         
                         # Camera motion comparison
                         ref_motion = app_state.get("camera_motion", [])
@@ -621,8 +621,8 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                 
                 # Pose detection check
                 if app_state.get("pose_tracker") and app_state["pose_tracker"].available:
-                    pose = app_state["pose_tracker"].extract_pose(frame)
-                    if pose:
+                    _, normalized = app_state["pose_tracker"].extract_pose(frame)
+                    if normalized:
                         checks.append("✅ **Person detected**: Body visible in frame")
                     else:
                         checks.append("❌ **Person not detected**: Step into frame")
@@ -713,5 +713,9 @@ Then let the AI judge your result!
 </center>
 """)
 
+def launch_demo(**kwargs):
+    return demo.launch(css=custom_css, theme=gr.themes.Soft(), **kwargs)
+
+
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    launch_demo(server_name="0.0.0.0", server_port=7860, share=True)

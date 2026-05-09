@@ -1,5 +1,6 @@
 import os
-from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip
+from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
+from moviepy.video.fx import CrossFadeIn, CrossFadeOut
 
 def snap_cuts_to_beats(cuts: list, beats: list, threshold: float = 0.2) -> list:
     """
@@ -35,12 +36,12 @@ def _apply_crossfade(clips: list, fade_duration: float = 0.3):
         
         c = clip
         if i > 0:  # Fade in (not the first clip)
-            c = c.with_effects([lambda clip: clip.crossfadein(fade_duration)])
+            c = c.with_effects([CrossFadeIn(fade_duration)])
         if i < len(clips) - 1:  # Fade out (not the last clip)
-            c = c.with_effects([lambda clip: clip.crossfadeout(fade_duration)])
+            c = c.with_effects([CrossFadeOut(fade_duration)])
         faded_clips.append(c)
     
-    return concatenate_videoclips(faded_clips, method="compose")
+    return concatenate_videoclips(faded_clips, method="compose", padding=-fade_duration)
 
 def render_final_video(clips_paths: list, skill_dir: str, output_path: str = "final_trend.mp4"):
     """
