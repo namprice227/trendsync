@@ -2,7 +2,9 @@ from fastmcp import FastMCP
 from analyzer import analyze_trend
 from renderer import render_final_video
 from evaluator import evaluate_final_video
+from scriptwriter import generate_script
 import os
+import json
 
 # Create an MCP server
 mcp = FastMCP("TrendFlowAI")
@@ -48,6 +50,23 @@ def evaluate_rendered_video(video_path: str, skill_dir: str) -> str:
         return feedback
     except Exception as e:
         return f"Failed to evaluate video: {str(e)}"
+
+@mcp.tool()
+def generate_trend_script(skill_dir: str) -> str:
+    """
+    Generates a TikTok script and viral caption based on the style profile
+    extracted from the given skill directory.
+    Returns the generated script and caption text.
+    """
+    try:
+        from skill_manager import load_skill
+        trend_name = os.path.basename(skill_dir)
+        frontmatter, _, _ = load_skill(trend_name)
+        
+        script = generate_script(frontmatter)
+        return script
+    except Exception as e:
+        return f"Failed to generate script: {str(e)}"
 
 if __name__ == "__main__":
     # Start the MCP stdio server

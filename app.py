@@ -92,15 +92,22 @@ def fmt(val):
 
 # --- Tab 1: Analyzer ---
 def process_trend_link(url, progress=gr.Progress()):
-    """Handler for Tab 1: Analyzer"""
+    """Handler for Tab 1: Analyzer — streams progress logs to the UI."""
     try:
-        progress(0, desc="Downloading video...")
+        # Fix 3: Clean up previous session's temp files
+        from config import cleanup_session
+        cleanup_session()
+        
+        progress(0.05, desc="🗂️ Cleaning workspace...")
+        progress(0.1, desc="📥 Downloading video...")
+        
         skill_dir, style, context = analyze_trend(url)
         app_state["skill_dir"] = skill_dir
         app_state["style"] = style
         app_state["cuts"] = context["cuts"]
         app_state["camera_motion"] = context.get("camera_motion", [])
         
+        progress(0.7, desc="🤸 Loading reference poses...")
         # Load reference poses for hybrid director
         trend_name = os.path.basename(skill_dir)
         app_state["reference_poses"] = load_reference_poses(trend_name)
@@ -108,14 +115,33 @@ def process_trend_link(url, progress=gr.Progress()):
         # Initialize pose tracker
         if app_state["pose_tracker"] is None:
             app_state["pose_tracker"] = PoseTracker()
+        
+        # Fix 2: Initialize depth estimator if available
+        depth_profile = context.get("depth_profile", [])
+        app_state["depth_profile"] = depth_profile
+        if depth_profile and not app_state.get("depth_estimator"):
+            try:
+                from depth_estimator import DepthEstimator
+                de = DepthEstimator()
+                if de.available:
+                    app_state["depth_estimator"] = de
+                    print(f"[Depth] Loaded with {len(depth_profile)} reference samples")
+            except Exception as e:
+                print(f"[Depth] Not available: {e}")
 
         # Calculate number of required shots based on cuts
         num_shots = len(context["cuts"]) - 1 if len(context["cuts"]) > 1 else 1
         app_state["required_shots"] = num_shots
         app_state["current_shot_idx"] = 0
         app_state["recorded_clips"] = []
+        
+        # Reset studio state for fresh session
+        app_state["prev_gray"] = None
+        app_state["studio_start_time"] = None
+        app_state["last_vlm_time"] = 0
+        app_state["last_vlm_feedback"] = ""
 
-        progress(1.0, desc="Analysis complete!")
+        progress(0.85, desc="📝 Generating script...")
 
         metadata_display = json.dumps(context, indent=2)
         
@@ -195,12 +221,20 @@ def process_trend_link(url, progress=gr.Progress()):
         ref_poses = app_state.get("reference_poses", [])
         if ref_poses:
             results_md += f"\n### 🤸 Pose Data\n\n✅ {len(ref_poses)} reference poses extracted — pose comparison enabled in Studio.\n"
+        
+        # Add beat-cut sync info
+        beat_sync = context.get("beat_cut_sync", [])
+        if beat_sync:
+            synced = sum(1 for s in beat_sync if s.get("synced"))
+            results_md += f"\n### 🎵 Beat-Cut Sync\n\n{synced}/{len(beat_sync)} scene cuts are rhythmically aligned with beats.\n"
 
+        progress(0.95, desc="📝 Generating script...")
         # Generate script using Few-Shot style transfer
         generated_script = generate_script(style)
         
         next_step = "✅ **Ready!** Go to **Step 2: The Studio** to start filming."
         
+        progress(1.0, desc="✅ Analysis complete!")
         return metadata_display, results_md, generated_script, next_step
     except Exception as e:
         error_md = f"### ❌ Error\n\n`{str(e)}`\n\nPlease check the URL and try again."
@@ -247,6 +281,31 @@ def studio_feedback_loop(frame):
         app_state.get("prev_gray")
     )
     app_state["prev_gray"] = new_prev_gray
+    
+    # Fix 2: Depth feedback (if DepthEstimator is available)
+    depth_feedback = ""
+    if app_state.get("depth_estimator") and app_state.get("depth_profile"):
+        try:
+            depth_est = app_state["depth_estimator"]
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            user_depth = depth_est.estimate_depth(frame_bgr)
+            if user_depth is not None:
+                ref_profile = app_state["depth_profile"]
+                # Find closest reference depth sample
+                closest = min(ref_profile, key=lambda p: abs(p["time"] - current_time))
+                ref_mean = closest["mean_depth"]
+                user_mean = float(user_depth.mean())
+                diff = user_mean - ref_mean
+                if abs(diff) > 0.15:
+                    direction = "closer" if diff > 0 else "further back"
+                    depth_feedback = f"📏 Move {direction} to match reference depth"
+        except Exception:
+            pass
+    
+    if depth_feedback and fast_feedback and fast_feedback != "Analyzing...":
+        fast_feedback = f"{fast_feedback} | {depth_feedback}"
+    elif depth_feedback:
+        fast_feedback = depth_feedback
     
     # ===== SLOW LOOP: VLM-based feedback (every 3 seconds, GPU) =====
     from config import DIRECTOR_VLM_INTERVAL
