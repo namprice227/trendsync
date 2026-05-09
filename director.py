@@ -4,8 +4,9 @@ import requests
 import json
 import time
 import numpy as np
+from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, DIRECTOR_VLM_INTERVAL
 
-VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
+VLLM_API_URL = DIRECTOR_VLLM_API_URL
 
 def encode_image_base64(frame):
     """Encodes a cv2 image frame to base64 string."""
@@ -275,17 +276,32 @@ def get_fast_feedback(frame_rgb, pose_tracker, reference_poses, camera_motion_ti
 # SLOW FEEDBACK LOOP — VLM-based (runs every 2-3 seconds, GPU)
 # ============================================================
 
-def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: str = "Qwen/Qwen3.6-35B-A3B") -> str:
+def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: str = None,
+                     cv_context: str = None) -> str:
     """
     Sends the base64 encoded image to the local vLLM server and returns the feedback.
+    B1: If cv_context is provided, injects CV pipeline observations into the prompt.
     Falls back to a mock response if the server is not reachable.
     """
+    if model_name is None:
+        model_name = DIRECTOR_MODEL
+
     if not system_prompt:
         system_prompt = (
             "You are a film director. "
             "Look at the attached camera frame. Is the user matching the style? Is the user centered? Is the lighting good? "
             "Reply ONLY with brief instructions like 'Move left', 'Too dark', 'Change outfit', or 'Perfect'."
         )
+
+    # B1: Inject CV observations into the prompt
+    if cv_context:
+        system_prompt += (
+            f"\n\nThe computer vision pipeline detected the following about the user's current frame:\n"
+            f"{cv_context}\n"
+            "Use this information to give more precise, actionable feedback."
+        )
+
+    user_text = "Evaluate this frame."
 
     payload = {
         "model": model_name,
@@ -297,7 +313,7 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Evaluate this frame."},
+                    {"type": "text", "text": user_text},
                     {
                         "type": "image_url",
                         "image_url": {
@@ -307,29 +323,25 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
                 ]
             }
         ],
-        "max_tokens": 50,
+        "max_tokens": 80,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=30)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=DIRECTOR_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         content = data['choices'][0]['message']['content'].strip()
-        # Strip <think> blocks if present
         import re
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
         return content
     except Exception as e:
-        # Fallback to Mock VLM if vLLM server isn't running (e.g. local dev before cloud deploy)
         import random
         time.sleep(1)
         if random.random() > 0.6:
             return "Perfect"
         else:
-            if system_prompt:
-                return "Match the requested outfit or improve lighting."
-            return "Move a bit to the left"
+            return "Match the requested outfit or improve lighting."
 
 def capture_shot(duration_seconds: float, output_path: str, camera_index: int = 0):
     """

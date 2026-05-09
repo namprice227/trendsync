@@ -113,27 +113,44 @@ MediaPipe 33-Point Skeleton
 - Saved to `reference_poses.json` in the Skill archive
 - Used by the Hybrid Director in Step 2 for **DTW comparison**
 
-#### 1e. Style Profile Extraction (VLM — Batched 3×3 Analysis)
+#### 1e. Beat-Cut Correlation (Audio-Visual Sync)
+- For each scene cut, finds the nearest beat timestamp
+- Flags if cuts are rhythmically aligned (within 150ms)
+- Feeds sync data into the VLM merge prompt for better style understanding
 
-Uses the **Qwen3.6-35B-A3B** vision-language model for narrative-aware analysis:
+#### 1f. Style Profile Extraction (VLM — Scene-Aligned Batched Analysis)
+
+Uses the VLM for **narrative-aware, scene-aligned** analysis:
 
 ```
 69s video @ 0.3s intervals = ~232 frames
     │
     ▼
-Split into batches of 9 → 26 batches
+Align sampling to scene cuts (A1)
+Group by scene → chunk into 3×3 batches
     │
-    ├── Batch  1/26 (beginning): 3×3 grid → VLM → "Person in casual clothes..."
-    ├── Batch 14/26 (middle):    3×3 grid → VLM → "Hand covers camera, transition..."
-    ├── Batch 26/26 (end):       3×3 grid → VLM → "Full cosplay revealed..."
+    ├── Scene 1 Batch (0.0-2.3s): 3×3 grid + "Previously: N/A" → VLM → obs_1
+    ├── Scene 2 Batch (2.3-5.1s): 3×3 grid + "Previously: obs_1" → VLM → obs_2  ← Rolling Context (A2)
+    ├── Scene N Batch:            (blur-free frames selected) → VLM → obs_N       ← Blur Detection (A3)
     │
     ▼
-MERGE STEP: All 26 observations → VLM → Final JSON profile
+MERGE STEP: All observations + beat-cut sync data → VLM → Final JSON profile
 ```
+
+**Improvements over v2:**
+- **Scene-aligned batching (A1):** Batches never cross scene cuts, improving VLM comprehension
+- **Rolling context (A2):** Each batch sees a summary of the previous batch for narrative continuity
+- **Blur detection (A3):** Blurry frames are replaced with sharper nearby alternatives
+- **Beat-cut correlation (A4):** The merge step knows which transitions are beat-synced
 
 **Output fields:** `video_type`, `narrative`, `clothing`, `setting`, `camera_angle`, `key_transition`, `recreation_tips`
 
-#### 1f. Script & Caption Generation (VLM — Few-Shot)
+#### 1g. Pose Interpolation
+- After extraction, scans for gaps (frames where MediaPipe lost tracking)
+- Fills gaps with linear interpolation between neighboring poses
+- Marks interpolated frames with lower confidence for downstream DTW
+
+#### 1h. Script & Caption Generation (VLM — Few-Shot)
 - Uses few-shot style transfer prompting
 - Generates a viral caption and hook script matching the extracted style
 
@@ -183,10 +200,18 @@ DTW aligns them optimally even if the user is slightly faster/slower:
 - Reports per-joint deviations: *"right hand 15% too far left"*
 - Reports temporal offset: *"You're 0.5s behind the beat"*
 
-#### Two Input Modes
+#### Scene-Aware Direction (Per-Shot Prompts)
 
-1. **Upload Mode** (works everywhere): Upload pre-filmed clips, get AI review per clip
-2. **Webcam Mode** (requires HTTPS): Real-time hybrid direction with auto-recording
+The Director adapts its prompt based on the current shot:
+- **Shot 1 (opening):** "Verify casual outfit, good lighting"
+- **Shot 3 (transition):** "Hand covers camera — ready to reveal"
+- **Shot 5 (reveal):** "Verify cosplay outfit matches reference"
+
+#### Three Input Modes
+
+1. **Pre-Flight Check** (recommended first): Static analysis of outfit + lighting before recording
+2. **Upload Mode** (works everywhere): Upload pre-filmed clips, get **CV + VLM** review per clip
+3. **Webcam Mode** (requires HTTPS): Real-time hybrid direction with auto-recording
 
 ---
 
@@ -230,13 +255,14 @@ recorded_shots/     context.json
 | `app.py` | Main Gradio web application with 3-tab UI; orchestrates all modules |
 | `analyzer.py` | Downloads videos, extracts audio, analyzes beats/cuts, **optical flow**, **MediaPipe poses**, and VLM style |
 | `director.py` | **Hybrid Director**: `PoseTracker` (MediaPipe + DTW), `check_camera_motion` (optical flow), fast/slow feedback loops |
-| `depth_estimator.py` | **Depth Anything V2** wrapper for monocular depth comparison (optional, GPU) |
+| `config.py` | **Centralized configuration** — model names, API URLs, timeouts via environment variables |
+| `depth_estimator.py` | **Depth Anything V2** wrapper for monocular depth comparison (🧪 experimental, GPU) |
 | `renderer.py` | Trims and stitches clips using `moviepy`, beat-synced cut alignment, audio overlay |
 | `evaluator.py` | Extracts a frame from the final video and scores it against the style profile via VLM |
 | `scriptwriter.py` | Generates a TikTok caption and hook script using few-shot style transfer |
-| `skill_manager.py` | Saves/loads Skill archives (style + context + **reference poses** + **camera motion**) |
+| `skill_manager.py` | Saves/loads Skill archives, generates **per-scene director prompts** |
 | `mcp_server.py` | MCP server for external AI agent integration |
-| `Depth-Anything-V2/` | Cloned repo for depth estimation (not tracked in git) |
+| `Depth-Anything-V2/` | Cloned repo for depth estimation (🧪 not tracked in git) |
 
 ### Skill Archive Format
 
@@ -285,6 +311,34 @@ The system demonstrates running **multiple AI models simultaneously** on the MI3
 
 ---
 
+## ⚙️ Configuration (Environment Variables)
+
+All model names and endpoints are configurable via `config.py`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRENDFLOW_VLLM_URL` | `http://localhost:8000/v1/chat/completions` | Main vLLM API endpoint |
+| `TRENDFLOW_DIRECTOR_VLLM_URL` | Same as above | Separate endpoint for fast director model |
+| `TRENDFLOW_ANALYSIS_MODEL` | `Qwen/Qwen3.6-35B-A3B` | Model for trend analysis (72B recommended) |
+| `TRENDFLOW_DIRECTOR_MODEL` | `Qwen/Qwen3.6-35B-A3B` | Model for real-time directing (12B recommended) |
+| `TRENDFLOW_DIRECTOR_VLM_INTERVAL` | `3.0` | Seconds between VLM director checks |
+
+**Dual-Model Strategy (MI300X):**
+```bash
+# Terminal 1: Heavy model for analysis (port 8000)
+vllm serve Qwen/Qwen2-VL-72B-Instruct --port 8000
+
+# Terminal 2: Fast model for directing (port 8001)
+vllm serve mistralai/Pixtral-12B-2409 --port 8001
+
+# Set env vars
+export TRENDFLOW_ANALYSIS_MODEL="Qwen/Qwen2-VL-72B-Instruct"
+export TRENDFLOW_DIRECTOR_MODEL="mistralai/Pixtral-12B-2409"
+export TRENDFLOW_DIRECTOR_VLLM_URL="http://localhost:8001/v1/chat/completions"
+```
+
+---
+
 ## 🛠️ Environment & Setup
 
 ### Option A: AMD Cloud GPU Deployment (Recommended)
@@ -295,8 +349,11 @@ The system demonstrates running **multiple AI models simultaneously** on the MI3
 docker run -it --network=host --device=/dev/kfd --device=/dev/dri \
   --group-add=video --ipc=host --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
+  -e HSA_OVERRIDE_GFX_VERSION=9.0.0 \
   rocm/vllm-dev:latest
 ```
+
+> **Note:** `HSA_OVERRIDE_GFX_VERSION=9.0.0` may be needed for MI300X compatibility.
 
 **2. Inside Docker — Start vLLM:**
 
@@ -358,11 +415,12 @@ python app.py
    - **Generated Script & Caption**
 
 ### ② The Studio
-1. **Upload clips** (recommended) or use webcam (HTTPS only)
-2. See **hybrid feedback**:
-   - ⚡ **CV (real-time):** Pose alignment, camera motion matching
-   - 🧠 **AI Director (style):** Outfit, lighting, composition
-3. Auto-records when VLM says "Perfect"
+1. **🔍 Pre-Flight Check** — verify outfit + lighting before recording
+2. **Upload clips** or use webcam (HTTPS only)
+3. See **hybrid feedback**:
+   - ⚡ **CV (real-time):** Pose alignment (DTW %), camera motion matching
+   - 🧠 **AI Director (style, scene-aware):** Per-shot outfit, lighting, composition
+4. Auto-records when VLM says "Perfect"
 
 ### ③ Final Output
 1. **🎬 Assemble Final Video** — beat-synced rendering

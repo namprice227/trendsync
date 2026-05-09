@@ -3,15 +3,16 @@ import base64
 import requests
 import json
 import time
-
-VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
+from config import VLLM_API_URL, EVALUATOR_MODEL, EVALUATOR_TIMEOUT
 
 def encode_image_base64(frame):
     """Encodes a cv2 image frame to base64 string."""
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def evaluate_final_video(video_path: str, style_profile: dict = None, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
+def evaluate_final_video(video_path: str, style_profile: dict = None, model_name: str = None):
+    if model_name is None:
+        model_name = EVALUATOR_MODEL
     """
     Extracts a frame from the final video and asks the VLM to score it out of 10 based on style profile.
     Falls back to a mock response.
@@ -68,7 +69,7 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
     }
 
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=60)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=EVALUATOR_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         feedback = data['choices'][0]['message']['content'].strip()

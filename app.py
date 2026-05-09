@@ -249,25 +249,34 @@ def studio_feedback_loop(frame):
     app_state["prev_gray"] = new_prev_gray
     
     # ===== SLOW LOOP: VLM-based feedback (every 3 seconds, GPU) =====
+    from config import DIRECTOR_VLM_INTERVAL
     now = time.time()
     vlm_feedback = app_state.get("last_vlm_feedback", "")
     
-    if now - app_state.get("last_vlm_time", 0) > 3.0:
-        # Time for a VLM check
+    if now - app_state.get("last_vlm_time", 0) > DIRECTOR_VLM_INTERVAL:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         base64_img = encode_image_base64(frame_bgr)
         
+        # B2: Scene-aware director prompt — select by current shot index
         system_prompt = None
         if app_state["skill_dir"]:
             try:
                 from skill_manager import load_skill
                 trend_name = os.path.basename(app_state["skill_dir"])
-                _, markdown_body, _ = load_skill(trend_name)
-                system_prompt = markdown_body
+                frontmatter, markdown_body, ctx = load_skill(trend_name)
+
+                # Try to load scene-specific prompts
+                scene_prompts = ctx.get("scene_prompts", [])
+                if scene_prompts and current < len(scene_prompts):
+                    system_prompt = scene_prompts[current]
+                else:
+                    system_prompt = markdown_body
             except Exception as e:
                 print("Failed to load skill:", e)
         
-        vlm_feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
+        # B1: Inject CV observations into VLM prompt
+        cv_context = fast_feedback if (fast_feedback and fast_feedback != "Analyzing...") else None
+        vlm_feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt, cv_context=cv_context)
         app_state["last_vlm_feedback"] = vlm_feedback
         app_state["last_vlm_time"] = now
         
@@ -416,6 +425,11 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
             gr.Markdown("### 📹 Or Use Webcam — Hybrid Director")
             gr.Markdown("Real-time **⚡ CV feedback** (pose alignment, camera motion) on every frame + **🧠 VLM style check** every 3 seconds.")
             
+            # B3: Pre-flight check
+            with gr.Row():
+                preflight_btn = gr.Button("🔍 Pre-Flight Check (check outfit & lighting first)", variant="secondary")
+            preflight_result = gr.Markdown("")
+
             with gr.Row():
                 with gr.Column(scale=2):
                     camera_input = gr.Image(
@@ -432,7 +446,7 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                     )
                     director_feedback = gr.Markdown("Webcam feedback will appear here.")
 
-            # Upload handler
+            # Upload handler — B4: includes CV pose/motion analysis
             def handle_clip_upload(files):
                 if not files:
                     return "⚠️ No files uploaded.", ""
@@ -440,19 +454,47 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                 if not app_state["skill_dir"]:
                     return "⚠️ Go to **Step 1** first and analyze a trend.", ""
                 
+                from analyzer import analyze_camera_motion, extract_reference_poses
+
                 os.makedirs("recorded_shots", exist_ok=True)
                 app_state["recorded_clips"] = []
                 
                 reviews = []
                 for i, f in enumerate(files):
-                    # Copy uploaded file to recorded_shots
                     import shutil
                     dest = os.path.join("recorded_shots", f"shot_{i}.mp4")
                     shutil.copy(f.name, dest)
                     app_state["recorded_clips"].append(dest)
                     
-                    # Get AI review of the clip
+                    clip_review_parts = []
+
                     try:
+                        # B4: CV analysis on the uploaded clip
+                        # Pose comparison via DTW
+                        ref_poses = app_state.get("reference_poses", [])
+                        if ref_poses and app_state.get("pose_tracker"):
+                            user_poses = extract_reference_poses(dest)
+                            if user_poses:
+                                score = app_state["pose_tracker"].compute_dtw_score(
+                                    [p["normalized"] for p in user_poses],
+                                    [p["normalized"] for p in ref_poses]
+                                )
+                                pct = max(0, min(100, int((1 - score / 5.0) * 100)))
+                                clip_review_parts.append(f"🤸 Pose match: **{pct}%**")
+
+                        # Camera motion comparison
+                        ref_motion = app_state.get("camera_motion", [])
+                        if ref_motion:
+                            user_motion = analyze_camera_motion(dest)
+                            ref_types = set(m["motion"] for m in ref_motion if m["motion"] != "static")
+                            user_types = set(m["motion"] for m in user_motion if m["motion"] != "static")
+                            if ref_types:
+                                matched = ref_types & user_types
+                                clip_review_parts.append(
+                                    f"🎥 Camera motion: {len(matched)}/{len(ref_types)} moves matched"
+                                )
+
+                        # VLM review (middle frame)
                         cap = cv2.VideoCapture(dest)
                         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames // 2))
@@ -461,47 +503,105 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                         
                         if ret:
                             base64_img = encode_image_base64(frame)
-                            
-                            # Load style prompt
                             system_prompt = None
                             if app_state["skill_dir"]:
                                 try:
                                     from skill_manager import load_skill
                                     trend_name = os.path.basename(app_state["skill_dir"])
-                                    _, markdown_body, _ = load_skill(trend_name)
-                                    system_prompt = markdown_body
+                                    _, markdown_body, ctx = load_skill(trend_name)
+                                    # B2: Use scene-specific prompt if available
+                                    scene_prompts = ctx.get("scene_prompts", [])
+                                    if scene_prompts and i < len(scene_prompts):
+                                        system_prompt = scene_prompts[i]
+                                    else:
+                                        system_prompt = markdown_body
                                 except:
                                     pass
                             
-                            feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
-                            reviews.append(f"**Clip {i+1}** (`{os.path.basename(f.name)}`): {feedback}")
-                        else:
-                            reviews.append(f"**Clip {i+1}**: ⚠️ Could not read frame for review")
+                            cv_summary = " | ".join(clip_review_parts) if clip_review_parts else None
+                            feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt, cv_context=cv_summary)
+                            clip_review_parts.append(f"🧠 AI: {feedback}")
+
                     except Exception as e:
-                        reviews.append(f"**Clip {i+1}**: Review failed — {str(e)}")
+                        clip_review_parts.append(f"⚠️ Review error: {str(e)}")
+
+                    review_text = " | ".join(clip_review_parts) if clip_review_parts else "Review failed"
+                    reviews.append(f"**Clip {i+1}** (`{os.path.basename(f.name)}`): {review_text}")
                 
                 app_state["current_shot_idx"] = len(files)
-                
                 total = app_state["required_shots"]
                 uploaded = len(files)
                 
                 status = f"✅ **{uploaded} clips uploaded!**"
                 if uploaded < total:
-                    status += f"\n\n⚠️ You need {total} shots but only uploaded {uploaded}. The renderer will use what's available."
-                
+                    status += f"\n\n⚠️ You need {total} shots but only uploaded {uploaded}."
                 status += "\n\n**→ Go to Step 3 to assemble your final video.**"
                 
                 review_md = "### 🎥 AI Director Review\n\n" + "\n\n".join(reviews) if reviews else ""
-                
                 return status, review_md
             
+            # B3: Pre-flight environment check handler
+            def preflight_check(frame):
+                if frame is None:
+                    return "⚠️ No webcam frame available. Enable your webcam first."
+                if not app_state["skill_dir"]:
+                    return "⚠️ Analyze a trend in Step 1 first."
+
+                checks = []
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                # Lighting check (simple brightness)
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                brightness = float(gray.mean())
+                if brightness < 60:
+                    checks.append("❌ **Lighting**: Too dark — turn on more lights")
+                elif brightness > 220:
+                    checks.append("❌ **Lighting**: Too bright — reduce exposure")
+                else:
+                    checks.append("✅ **Lighting**: Good")
+
+                # Pose detection check
+                if app_state.get("pose_tracker") and app_state["pose_tracker"].available:
+                    pose = app_state["pose_tracker"].extract_pose(frame)
+                    if pose:
+                        checks.append("✅ **Person detected**: Body visible in frame")
+                    else:
+                        checks.append("❌ **Person not detected**: Step into frame")
+
+                # VLM outfit/setting check
+                base64_img = encode_image_base64(frame_bgr)
+                system_prompt = None
+                if app_state["skill_dir"]:
+                    try:
+                        from skill_manager import load_skill
+                        trend_name = os.path.basename(app_state["skill_dir"])
+                        _, markdown_body, _ = load_skill(trend_name)
+                        system_prompt = (
+                            markdown_body +
+                            "\n\nThis is a PRE-FLIGHT CHECK. Evaluate ONLY outfit and background. "
+                            "List what matches and what needs to change. Do NOT say 'Perfect' yet."
+                        )
+                    except:
+                        pass
+
+                vlm_check = get_vlm_feedback(base64_img, system_prompt=system_prompt)
+                checks.append(f"🧠 **AI Assessment**: {vlm_check}")
+
+                return "### 🔍 Pre-Flight Check Results\n\n" + "\n\n".join(checks)
+
             upload_btn.click(
                 fn=handle_clip_upload,
                 inputs=clip_upload,
                 outputs=[upload_status, ai_review]
             )
 
-            # Webcam streaming handler (still works if HTTPS available)
+            preflight_btn.click(
+                fn=preflight_check,
+                inputs=camera_input,
+                outputs=preflight_result
+            )
+
+            # Webcam streaming handler
             camera_input.stream(
                 fn=studio_feedback_loop,
                 inputs=camera_input,

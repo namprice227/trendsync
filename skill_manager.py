@@ -13,12 +13,7 @@ def save_skill(trend_name: str, style_profile: dict, context: dict, reference_po
     skill_dir = os.path.join(SKILLS_DIR, trend_name)
     os.makedirs(skill_dir, exist_ok=True)
     
-    # Save context (beats, cuts, audio_path, camera_motion)
-    context_path = os.path.join(skill_dir, "context.json")
-    with open(context_path, "w") as f:
-        json.dump(context, f, indent=4)
-    
-    # Save reference poses as numpy array if available
+    # Save reference poses if available
     if reference_poses:
         poses_path = os.path.join(skill_dir, "reference_poses.json")
         with open(poses_path, "w") as f:
@@ -40,7 +35,6 @@ def save_skill(trend_name: str, style_profile: dict, context: dict, reference_po
     camera_motion = context.get("camera_motion", [])
     motion_instructions = ""
     if camera_motion:
-        # Summarize dominant motions
         motion_counts = {}
         for entry in camera_motion:
             m = entry["motion"]
@@ -76,8 +70,80 @@ If the framing and style are completely perfect, reply ONLY with the word "Perfe
         yaml.dump(frontmatter, f, default_flow_style=False, sort_keys=False)
         f.write("---\n")
         f.write(markdown_body)
+
+    # B2: Generate per-scene director prompts
+    cuts = context.get("cuts", [])
+    scene_prompts = _generate_scene_prompts(style_profile, cuts, camera_motion, narrative)
+    if scene_prompts:
+        context["scene_prompts"] = scene_prompts
+
+    # Save context (beats, cuts, audio_path, camera_motion, scene_prompts)
+    context_path = os.path.join(skill_dir, "context.json")
+    with open(context_path, "w") as f:
+        json.dump(context, f, indent=4)
         
     return skill_dir
+
+def _generate_scene_prompts(style_profile: dict, cuts: list, camera_motion: list, narrative: str) -> list:
+    """
+    B2: Generates shot-specific director prompts.
+    Each shot gets a customized prompt based on its position in the narrative.
+    """
+    if len(cuts) < 2:
+        return []
+
+    num_shots = len(cuts) - 1
+    prompts = []
+
+    video_type = style_profile.get("video_type", "")
+    clothing = style_profile.get("clothing", "N/A")
+    setting = style_profile.get("setting", "N/A")
+    transition = style_profile.get("key_transition", "none")
+    camera_angle = style_profile.get("camera_angle", "N/A")
+
+    for i in range(num_shots):
+        shot_start = cuts[i]
+        shot_end = cuts[i + 1] if i + 1 < len(cuts) else cuts[-1] + 3.0
+        duration = shot_end - shot_start
+
+        # Determine shot position in narrative
+        if i == 0:
+            position = "opening"
+        elif i == num_shots - 1:
+            position = "final/reveal"
+        else:
+            position = f"middle (shot {i+1})"
+
+        # Find camera motion for this shot's timeframe
+        shot_motions = [m["motion"] for m in camera_motion
+                        if m["time"] >= shot_start and m["time"] < shot_end and m["motion"] != "static"]
+        motion_str = f"Camera should: {', '.join(set(shot_motions))}" if shot_motions else "Camera: static"
+
+        # Build shot-specific prompt
+        prompt = (
+            f"You are directing Shot {i+1}/{num_shots} ({position}, {duration:.1f}s).\n"
+            f"Video type: {video_type}. {motion_str}.\n"
+        )
+
+        # Customize based on position in transition videos
+        is_transition = any(t in video_type.lower() for t in ["transition", "reveal", "transform"])
+        if is_transition:
+            if i < num_shots // 2:
+                prompt += f"This is a BEFORE shot. The user should wear: the FIRST outfit from '{clothing}'.\n"
+            elif i == num_shots // 2 and transition.lower() != "none":
+                prompt += f"This is the TRANSITION shot. Expected: {transition}.\n"
+            else:
+                prompt += f"This is an AFTER/REVEAL shot. The user should wear: the SECOND outfit from '{clothing}'.\n"
+        else:
+            prompt += f"Outfit: {clothing}. Setting: {setting}. Framing: {camera_angle}.\n"
+
+        prompt += (
+            "Give short feedback. If everything matches, reply ONLY with 'Perfect'."
+        )
+        prompts.append(prompt)
+
+    print(f"Generated {len(prompts)} scene-specific director prompts")
+    return prompts
 
 def load_skill(trend_name: str):
     """
