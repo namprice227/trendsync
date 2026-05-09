@@ -40,6 +40,9 @@ class PoseTracker:
         
         try:
             import mediapipe as mp
+            if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "pose"):
+                print("[PoseTracker] MediaPipe legacy solutions API unavailable — pose tracking disabled")
+                return
             self._mp = mp
             self._pose = mp.solutions.pose.Pose(
                 static_image_mode=False,
