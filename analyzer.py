@@ -55,13 +55,25 @@ def detect_audio_beats(audio_path: str):
     Uses librosa to detect bpm and major beat timestamps.
     """
     print("Analyzing audio beats...")
-    y, sr = librosa.load(audio_path)
-    bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    try:
+        import os
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            print("Audio file is missing or empty. Skipping beat detection.")
+            return 120.0, []
+            
+        y, sr = librosa.load(audio_path)
+        if len(y) == 0:
+            return 120.0, []
+            
+        bpm, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
-    # Handle bpm arrays from newer librosa versions
-    bpm_val = float(bpm[0]) if isinstance(bpm, (list, tuple)) or (hasattr(bpm, 'ndim') and bpm.ndim > 0) else float(bpm)
-    return bpm_val, beat_times.tolist()
+        # Handle bpm arrays from newer librosa versions
+        bpm_val = float(bpm[0]) if isinstance(bpm, (list, tuple)) or (hasattr(bpm, 'ndim') and bpm.ndim > 0) else float(bpm)
+        return bpm_val, beat_times.tolist()
+    except Exception as e:
+        print(f"Warning: Audio beat detection failed: {str(e)}. Using fallback.")
+        return 120.0, []
 
 def detect_video_cuts(video_path: str):
     """
@@ -197,6 +209,14 @@ def extract_reference_poses(video_path: str, sample_interval: float = 0.1):
         import mediapipe as mp
     except ImportError:
         print("MediaPipe not installed — skipping pose extraction. Install with: pip install mediapipe")
+        return []
+
+    if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "pose"):
+        print(
+            "MediaPipe legacy solutions API is unavailable — skipping pose extraction. "
+            "This venv appears to have the newer MediaPipe Tasks-only package; "
+            "use Python 3.9-3.12 with legacy solutions support for pose matching."
+        )
         return []
     
     print("Extracting reference poses (MediaPipe)...")
