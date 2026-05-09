@@ -1,7 +1,6 @@
 import os
 import json
 import yaml
-import numpy as np
 
 SKILLS_DIR = os.path.join(".storyline", "skills")
 

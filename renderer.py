@@ -1,5 +1,5 @@
 import os
-from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip
+from moviepy import VideoFileClip, concatenate_videoclips, AudioFileClip
 
 def snap_cuts_to_beats(cuts: list, beats: list, threshold: float = 0.2) -> list:
     """

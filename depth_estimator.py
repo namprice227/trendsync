@@ -52,7 +52,7 @@ class DepthEstimator:
                 # Check for pretrained weights
                 weights_path = os.path.join(local_path, f"checkpoints/depth_anything_v2_vit{config['encoder'][3]}.pth")
                 if os.path.exists(weights_path):
-                    self._model.load_state_dict(torch.load(weights_path, map_location='cuda'))
+                    self._model.load_state_dict(torch.load(weights_path, map_location='cuda', weights_only=True))
                     self._model = self._model.cuda().eval()
                     self._available = True
                     print(f"[DepthEstimator] Loaded Depth Anything V2 {model_size} from local weights")

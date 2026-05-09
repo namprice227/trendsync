@@ -9,7 +9,7 @@ import time
 from analyzer import analyze_trend
 from director import (
     get_vlm_feedback, encode_image_base64, capture_shot,
-    PoseTracker, get_fast_feedback, check_camera_motion
+    PoseTracker, get_fast_feedback
 )
 from renderer import render_final_video
 from evaluator import evaluate_final_video

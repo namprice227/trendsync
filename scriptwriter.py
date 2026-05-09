@@ -1,5 +1,3 @@
-import requests
-import json
 from config import VLLM_API_URL, SCRIPT_MODEL, SCRIPT_TIMEOUT, vlm_request_with_retry
 
 def generate_script(style_profile: dict, model_name: str = None):

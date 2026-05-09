@@ -84,7 +84,6 @@ def detect_video_cuts(video_path: str):
 
     return cuts
 
-import requests
 import numpy as np
 from config import VLLM_API_URL, ANALYSIS_MODEL, ANALYSIS_TIMEOUT, vlm_request_with_retry
 

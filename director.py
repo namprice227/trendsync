@@ -1,10 +1,8 @@
 import cv2
 import base64
-import requests
-import json
 import time
 import numpy as np
-from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, DIRECTOR_VLM_INTERVAL, vlm_request_with_retry
+from config import DIRECTOR_VLLM_API_URL, DIRECTOR_MODEL, DIRECTOR_TIMEOUT, vlm_request_with_retry
 
 VLLM_API_URL = DIRECTOR_VLLM_API_URL
 
@@ -333,7 +331,7 @@ def get_vlm_feedback(base64_image: str, system_prompt: str = None, model_name: s
         import re
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
         return content
-    except Exception as e:
+    except Exception:
         import random
         time.sleep(1)
         if random.random() > 0.6:

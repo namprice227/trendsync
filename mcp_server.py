@@ -4,7 +4,6 @@ from renderer import render_final_video
 from evaluator import evaluate_final_video
 from scriptwriter import generate_script
 import os
-import json
 
 # Create an MCP server
 mcp = FastMCP("TrendFlowAI")

@@ -1,7 +1,5 @@
 import cv2
 import base64
-import requests
-import json
 import time
 from config import VLLM_API_URL, EVALUATOR_MODEL, EVALUATOR_TIMEOUT, vlm_request_with_retry
 
@@ -75,7 +73,7 @@ def evaluate_final_video(video_path: str, style_profile: dict = None, model_name
         import re
         feedback = re.sub(r'<think>.*?</think>', '', feedback, flags=re.DOTALL).strip()
         return feedback
-    except Exception as e:
+    except Exception:
         # Fallback Mock
         time.sleep(2)
         score = 8.5
