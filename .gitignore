@@ -1,1 +1,8 @@
 __pycache__/
+temp/
+recorded_shots/
+.storyline/
+.gradio/
+*.pyc
+Depth-Anything-V2/
+FireRed-OpenStoryline/

@@ -7,10 +7,14 @@ import time
 
 # Import our modular components
 from analyzer import analyze_trend
-from director import get_vlm_feedback, encode_image_base64, capture_shot
+from director import (
+    get_vlm_feedback, encode_image_base64, capture_shot,
+    PoseTracker, get_fast_feedback, check_camera_motion
+)
 from renderer import render_final_video
 from evaluator import evaluate_final_video
 from scriptwriter import generate_script
+from skill_manager import load_reference_poses
 
 # Global state for the hackathon prototype
 app_state = {
@@ -21,7 +25,14 @@ app_state = {
     "recorded_clips": [],
     "is_recording": False,
     "cuts": [],
-    "final_video_path": None
+    "final_video_path": None,
+    "camera_motion": [],
+    "reference_poses": [],
+    "pose_tracker": None,
+    "prev_gray": None,
+    "studio_start_time": None,
+    "last_vlm_time": 0,
+    "last_vlm_feedback": "",
 }
 
 # --- Custom CSS ---
@@ -88,6 +99,15 @@ def process_trend_link(url, progress=gr.Progress()):
         app_state["skill_dir"] = skill_dir
         app_state["style"] = style
         app_state["cuts"] = context["cuts"]
+        app_state["camera_motion"] = context.get("camera_motion", [])
+        
+        # Load reference poses for hybrid director
+        trend_name = os.path.basename(skill_dir)
+        app_state["reference_poses"] = load_reference_poses(trend_name)
+        
+        # Initialize pose tracker
+        if app_state["pose_tracker"] is None:
+            app_state["pose_tracker"] = PoseTracker()
 
         # Calculate number of required shots based on cuts
         num_shots = len(context["cuts"]) - 1 if len(context["cuts"]) > 1 else 1
@@ -161,6 +181,21 @@ def process_trend_link(url, progress=gr.Progress()):
 3. **Go to Step 2: The Studio** to upload your clips
 """
 
+        # Add camera motion summary if available
+        camera_motion = context.get("camera_motion", [])
+        if camera_motion:
+            motion_counts = {}
+            for entry in camera_motion:
+                m = entry["motion"]
+                motion_counts[m] = motion_counts.get(m, 0) + 1
+            motion_lines = [f"  - **{k.replace('_', ' ').title()}**: {v} segments" for k, v in sorted(motion_counts.items(), key=lambda x: -x[1])]
+            results_md += f"\n### 🎥 Camera Motion Profile\n\n" + "\n".join(motion_lines) + "\n"
+        
+        # Add pose extraction status
+        ref_poses = app_state.get("reference_poses", [])
+        if ref_poses:
+            results_md += f"\n### 🤸 Pose Data\n\n✅ {len(ref_poses)} reference poses extracted — pose comparison enabled in Studio.\n"
+
         # Generate script using Few-Shot style transfer
         generated_script = generate_script(style)
         
@@ -174,8 +209,7 @@ def process_trend_link(url, progress=gr.Progress()):
 # --- Tab 2: The Studio ---
 def studio_feedback_loop(frame):
     """
-    Handler for Tab 2: The Studio.
-    Takes a webcam frame from Gradio, sends it to VLM, and returns the frame + feedback text.
+    Hybrid Director: Fast CV feedback on every frame + Slow VLM feedback every 3 seconds.
     """
     if frame is None:
         return frame, "⏳ Waiting for camera feed...", "Connect your webcam above to begin."
@@ -186,7 +220,6 @@ def studio_feedback_loop(frame):
     total = app_state["required_shots"]
     current = app_state["current_shot_idx"]
 
-    # Check if we've completed all shots
     if total > 0 and current >= total:
         return (
             frame,
@@ -197,50 +230,76 @@ def studio_feedback_loop(frame):
     if app_state["is_recording"]:
         return frame, "🔴 Recording...", f"Recording shot {current + 1}/{total} — hold still!"
 
-    # Process frame for VLM
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    base64_img = encode_image_base64(frame_bgr)
+    # Track time since studio started
+    if app_state["studio_start_time"] is None:
+        app_state["studio_start_time"] = time.time()
+    
+    current_time = time.time() - app_state["studio_start_time"]
+    
+    # ===== FAST LOOP: CV-based feedback (every frame, CPU) =====
+    frame_rgb = frame  # Gradio provides RGB
+    fast_feedback, new_prev_gray = get_fast_feedback(
+        frame_rgb,
+        app_state.get("pose_tracker"),
+        app_state.get("reference_poses", []),
+        app_state.get("camera_motion", []),
+        current_time,
+        app_state.get("prev_gray")
+    )
+    app_state["prev_gray"] = new_prev_gray
+    
+    # ===== SLOW LOOP: VLM-based feedback (every 3 seconds, GPU) =====
+    now = time.time()
+    vlm_feedback = app_state.get("last_vlm_feedback", "")
+    
+    if now - app_state.get("last_vlm_time", 0) > 3.0:
+        # Time for a VLM check
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        base64_img = encode_image_base64(frame_bgr)
+        
+        system_prompt = None
+        if app_state["skill_dir"]:
+            try:
+                from skill_manager import load_skill
+                trend_name = os.path.basename(app_state["skill_dir"])
+                _, markdown_body, _ = load_skill(trend_name)
+                system_prompt = markdown_body
+            except Exception as e:
+                print("Failed to load skill:", e)
+        
+        vlm_feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
+        app_state["last_vlm_feedback"] = vlm_feedback
+        app_state["last_vlm_time"] = now
+        
+        # Check if perfect and trigger recording
+        if "perfect" in vlm_feedback.lower() and app_state["skill_dir"] is not None:
+            def start_recording():
+                app_state["is_recording"] = True
+                shot_idx = app_state["current_shot_idx"]
+                cuts = app_state["cuts"]
+                duration = cuts[shot_idx + 1] - cuts[shot_idx] if shot_idx < len(cuts) - 1 else 3.0
+                os.makedirs("recorded_shots", exist_ok=True)
+                output_path = os.path.join("recorded_shots", f"shot_{shot_idx}.mp4")
+                print(f"Recording shot {shot_idx} ({duration:.1f}s)")
+                capture_shot(duration, output_path)
+                app_state["recorded_clips"].append(output_path)
+                app_state["current_shot_idx"] += 1
+                app_state["is_recording"] = False
 
-    # Load system prompt from skill
-    system_prompt = None
-    if app_state["skill_dir"]:
-        try:
-            from skill_manager import load_skill
-            trend_name = os.path.basename(app_state["skill_dir"])
-            frontmatter, markdown_body, context = load_skill(trend_name)
-            system_prompt = markdown_body
-        except Exception as e:
-            print("Failed to load skill:", e)
-
-    feedback = get_vlm_feedback(base64_img, system_prompt=system_prompt)
-
-    # Check if perfect and trigger recording
-    if "perfect" in feedback.lower() and app_state["skill_dir"] is not None:
-        def start_recording():
-            app_state["is_recording"] = True
-            shot_idx = app_state["current_shot_idx"]
-
-            cuts = app_state["cuts"]
-            if shot_idx < len(cuts) - 1:
-                duration = cuts[shot_idx + 1] - cuts[shot_idx]
-            else:
-                duration = 3.0
-
-            os.makedirs("recorded_shots", exist_ok=True)
-            output_path = os.path.join("recorded_shots", f"shot_{shot_idx}.mp4")
-
-            print(f"Triggering recording for shot {shot_idx} (Duration: {duration}s)")
-            capture_shot(duration, output_path)
-
-            app_state["recorded_clips"].append(output_path)
-            app_state["current_shot_idx"] += 1
-            app_state["is_recording"] = False
-
-        threading.Thread(target=start_recording).start()
-        feedback = "✅ Perfect! Recording started..."
-
+            threading.Thread(target=start_recording).start()
+            vlm_feedback = "✅ Perfect! Recording started..."
+    
+    # Build combined feedback display
     progress_text = f"📸 Shot {current + 1} / {total}"
-    detail = f"**Director says:** {feedback}"
+    
+    detail_parts = []
+    if fast_feedback and fast_feedback != "Analyzing...":
+        detail_parts.append(f"**⚡ CV Feedback (real-time):** {fast_feedback}")
+    if vlm_feedback:
+        detail_parts.append(f"**🧠 AI Director (style):** {vlm_feedback}")
+    
+    detail = "\n\n".join(detail_parts) if detail_parts else "Analyzing..."
+    
     return frame, progress_text, detail
 
 # --- Tab 3: Render ---
@@ -328,8 +387,9 @@ and use vision AI to analyze the style — clothing, setting, and camera angles.
         with gr.Tab("② The Studio", id="tab2"):
             gr.Markdown("""
 <div class="step-banner">
-<strong>Step 2:</strong> Upload your filmed clips below. The AI Director will review each clip against the style guide 
-and give you feedback. You can also use a webcam if available (requires HTTPS).
+<strong>Step 2:</strong> Upload your filmed clips for AI review, or use the webcam for <strong>hybrid real-time directing</strong>. 
+The system uses two feedback loops: <strong>⚡ Fast (CPU)</strong> — pose tracking + camera motion at 10fps, 
+and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 seconds.
 </div>
 """)
 
@@ -353,8 +413,8 @@ and give you feedback. You can also use a webcam if available (requires HTTPS).
             ai_review = gr.Markdown("")
             
             gr.Markdown("---")
-            gr.Markdown("### 📹 Or Use Webcam (requires HTTPS)")
-            gr.Markdown("If you have webcam access, the AI Director will guide you in real-time and auto-record.")
+            gr.Markdown("### 📹 Or Use Webcam — Hybrid Director")
+            gr.Markdown("Real-time **⚡ CV feedback** (pose alignment, camera motion) on every frame + **🧠 VLM style check** every 3 seconds.")
             
             with gr.Row():
                 with gr.Column(scale=2):

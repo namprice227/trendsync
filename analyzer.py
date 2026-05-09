@@ -85,10 +85,180 @@ def detect_video_cuts(video_path: str):
     return cuts
 
 import requests
+import numpy as np
 
 VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
 
-import numpy as np
+# ============================================================
+# OPTICAL FLOW — Camera Motion Analysis
+# ============================================================
+
+def analyze_camera_motion(video_path: str, sample_interval: float = 0.3):
+    """
+    Analyzes camera motion throughout the video using Farneback optical flow.
+    Returns a timeline of camera motion events:
+      [{"time": 0.0, "motion": "static", "magnitude": 0.1}, ...]
+    
+    Motion types: static, pan_left, pan_right, pan_up, pan_down, zoom_in, zoom_out, complex
+    """
+    print("Analyzing camera motion (optical flow)...")
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps
+    
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        return []
+    
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.resize(prev_gray, (320, 240))  # Downscale for speed
+    
+    h, w = prev_gray.shape
+    center_x, center_y = w / 2, h / 2
+    y_grid, x_grid = np.indices((h, w))
+    dx_from_center = (x_grid - center_x).astype(np.float32)
+    dy_from_center = (y_grid - center_y).astype(np.float32)
+    
+    # Thresholds for motion classification
+    PAN_THRESHOLD = 1.5
+    ZOOM_THRESHOLD = 50.0
+    
+    motion_timeline = []
+    current_time = sample_interval  # Skip first frame
+    
+    while current_time < duration:
+        frame_idx = int(current_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (320, 240))
+        
+        # Compute dense optical flow
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        fx, fy = flow[..., 0], flow[..., 1]
+        
+        # Global average for pan detection
+        mean_dx = float(np.mean(fx))
+        mean_dy = float(np.mean(fy))
+        magnitude = float(np.sqrt(mean_dx**2 + mean_dy**2))
+        
+        # Radial flow for zoom detection
+        radial_flow = float(np.mean(fx * dx_from_center + fy * dy_from_center))
+        
+        # Classify motion
+        if abs(radial_flow) > ZOOM_THRESHOLD:
+            motion = "zoom_in" if radial_flow < 0 else "zoom_out"
+        elif magnitude > PAN_THRESHOLD:
+            if abs(mean_dx) > abs(mean_dy):
+                motion = "pan_right" if mean_dx > 0 else "pan_left"
+            else:
+                motion = "pan_down" if mean_dy > 0 else "pan_up"
+        else:
+            motion = "static"
+        
+        motion_timeline.append({
+            "time": round(current_time, 2),
+            "motion": motion,
+            "magnitude": round(magnitude, 2)
+        })
+        
+        prev_gray = gray
+        current_time += sample_interval
+    
+    cap.release()
+    
+    # Summarize dominant motions
+    motion_counts = {}
+    for entry in motion_timeline:
+        m = entry["motion"]
+        motion_counts[m] = motion_counts.get(m, 0) + 1
+    
+    print(f"Camera motion analysis complete: {len(motion_timeline)} segments analyzed")
+    print(f"  Motion summary: {motion_counts}")
+    return motion_timeline
+
+# ============================================================
+# POSE EXTRACTION — MediaPipe Reference Poses
+# ============================================================
+
+def extract_reference_poses(video_path: str, sample_interval: float = 0.1):
+    """
+    Extracts body pose landmarks from the reference video using MediaPipe.
+    Returns a list of pose snapshots: [{"time": 0.0, "landmarks": [...], "normalized": [...]}, ...]
+    Each landmark has (x, y, z, visibility) for 33 body points.
+    
+    Falls back gracefully if MediaPipe is not installed.
+    """
+    try:
+        import mediapipe as mp
+    except ImportError:
+        print("MediaPipe not installed — skipping pose extraction. Install with: pip install mediapipe")
+        return []
+    
+    print("Extracting reference poses (MediaPipe)...")
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        min_detection_confidence=0.5
+    )
+    
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps
+    
+    pose_timeline = []
+    current_time = 0.0
+    
+    while current_time < duration:
+        frame_idx = int(current_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # MediaPipe expects RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb_frame)
+        
+        if results.pose_landmarks:
+            landmarks = []
+            for lm in results.pose_landmarks.landmark:
+                landmarks.append([lm.x, lm.y, lm.z, lm.visibility])
+            
+            # Normalize relative to hip center (landmark 23=left hip, 24=right hip)
+            hip_x = (landmarks[23][0] + landmarks[24][0]) / 2
+            hip_y = (landmarks[23][1] + landmarks[24][1]) / 2
+            hip_z = (landmarks[23][2] + landmarks[24][2]) / 2
+            
+            normalized = []
+            for lm in landmarks:
+                normalized.append([
+                    lm[0] - hip_x,
+                    lm[1] - hip_y,
+                    lm[2] - hip_z,
+                    lm[3]  # visibility stays as-is
+                ])
+            
+            pose_timeline.append({
+                "time": round(current_time, 2),
+                "landmarks": landmarks,
+                "normalized": normalized
+            })
+        
+        current_time += sample_interval
+    
+    cap.release()
+    pose.close()
+    
+    print(f"Pose extraction complete: {len(pose_timeline)} poses extracted from {duration:.1f}s video")
+    return pose_timeline
 
 def encode_image_base64(frame):
     """Encodes a cv2 image frame to base64 string."""
@@ -333,7 +503,10 @@ def analyze_trend(url: str, output_dir: str = "temp"):
     2. Extract audio
     3. Find beats
     4. Find cuts
-    5. Save trend_profile.json
+    5. Analyze camera motion (optical flow)
+    6. Extract reference poses (MediaPipe)
+    7. Extract style profile (VLM)
+    8. Save Skill archive
     """
     try:
         video_path = download_video(url, output_dir)
@@ -342,6 +515,14 @@ def analyze_trend(url: str, output_dir: str = "temp"):
 
         bpm, beats = detect_audio_beats(audio_path)
         cuts = detect_video_cuts(video_path)
+        
+        # New: Camera motion analysis (optical flow — no extra deps)
+        camera_motion = analyze_camera_motion(video_path)
+        
+        # New: Reference pose extraction (MediaPipe — graceful fallback)
+        reference_poses = extract_reference_poses(video_path)
+        
+        # VLM-based style profile
         style = extract_style_profile(video_path)
 
         context = {
@@ -350,11 +531,12 @@ def analyze_trend(url: str, output_dir: str = "temp"):
             "beats": beats,
             "audio_path": audio_path,
             "reference_video_path": video_path,
+            "camera_motion": camera_motion,
         }
 
         # Use the video ID as the trend name (extracted from URL or fallback)
         trend_name = "trend_" + os.path.basename(video_path).split('.')[0]
-        skill_dir = save_skill(trend_name, style, context)
+        skill_dir = save_skill(trend_name, style, context, reference_poses)
 
         print(f"Trend analysis complete! Skill saved to {skill_dir}")
         return skill_dir, style, context
