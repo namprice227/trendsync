@@ -1,9 +1,10 @@
 import requests
 import json
+from config import VLLM_API_URL, SCRIPT_MODEL, SCRIPT_TIMEOUT
 
-VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
-
-def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
+def generate_script(style_profile: dict, model_name: str = None):
+    if model_name is None:
+        model_name = SCRIPT_MODEL
     """
     Uses Few-Shot Style Transfer to generate a TikTok script and caption based on the visual style.
     Falls back to a mock if vLLM isn't running.
@@ -45,7 +46,7 @@ def generate_script(style_profile: dict, model_name: str = "Qwen/Qwen3.6-35B-A3B
     }
     
     try:
-        response = requests.post(VLLM_API_URL, json=payload, timeout=60)
+        response = requests.post(VLLM_API_URL, json=payload, timeout=SCRIPT_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         content = data['choices'][0]['message']['content'].strip()

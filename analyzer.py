@@ -86,8 +86,7 @@ def detect_video_cuts(video_path: str):
 
 import requests
 import numpy as np
-
-VLLM_API_URL = "http://localhost:8000/v1/chat/completions"
+from config import VLLM_API_URL, ANALYSIS_MODEL, ANALYSIS_TIMEOUT
 
 # ============================================================
 # OPTICAL FLOW — Camera Motion Analysis
@@ -265,10 +264,15 @@ def encode_image_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
     return base64.b64encode(buffer).decode('utf-8')
 
-def sample_frames(video_path: str, interval: float = 0.3):
+def is_blurry(frame, threshold: float = 100.0) -> bool:
+    """Checks if a frame is too blurry using Laplacian variance."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
+
+def sample_frames(video_path: str, interval: float = 0.3, cuts: list = None):
     """
-    Samples frames from the video at the given interval (in seconds).
-    Returns a list of (timestamp, frame) tuples.
+    Samples frames from the video. If cuts are provided, aligns sampling
+    to scene boundaries (A1: scene-cut-aligned batching). Skips blurry frames (A3).
     """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -276,17 +280,58 @@ def sample_frames(video_path: str, interval: float = 0.3):
     duration = total_frames / fps
     
     frames = []
-    current_time = 0.0
-    while current_time < duration:
+    blur_replaced = 0
+    
+    # Build sample times — aligned to scene cuts if available
+    if cuts and len(cuts) >= 2:
+        sample_times = []
+        for i in range(len(cuts) - 1):
+            scene_start, scene_end = cuts[i], cuts[i + 1] if i + 1 < len(cuts) else duration
+            t = scene_start
+            while t < scene_end:
+                sample_times.append(t)
+                t += interval
+        # Add samples after the last cut
+        t = cuts[-1]
+        while t < duration:
+            sample_times.append(t)
+            t += interval
+    else:
+        sample_times = []
+        t = 0.0
+        while t < duration:
+            sample_times.append(t)
+            t += interval
+    
+    for current_time in sample_times:
         frame_idx = int(current_time * fps)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-        if ret:
-            frames.append((current_time, frame))
-        current_time += interval
+        if not ret:
+            continue
+        
+        # Blur detection: try nearby frames if blurry
+        if is_blurry(frame):
+            best_frame = frame
+            best_var = cv2.Laplacian(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+            for offset in [-2, -1, 1, 2]:
+                alt_idx = max(0, frame_idx + offset)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+                ret2, alt_frame = cap.read()
+                if ret2:
+                    alt_var = cv2.Laplacian(cv2.cvtColor(alt_frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+                    if alt_var > best_var:
+                        best_frame = alt_frame
+                        best_var = alt_var
+            if best_var > cv2.Laplacian(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var():
+                blur_replaced += 1
+            frame = best_frame
+        
+        frames.append((current_time, frame))
     
     cap.release()
-    print(f"Sampled {len(frames)} frames at {interval}s intervals ({duration:.1f}s video)")
+    mode = "scene-aligned" if (cuts and len(cuts) >= 2) else f"{interval}s intervals"
+    print(f"Sampled {len(frames)} frames ({mode}, {duration:.1f}s video, {blur_replaced} blur-replaced)")
     return frames
 
 def create_contact_sheet(frames: list, thumb_width: int = 320, cols: int = 3):
@@ -323,18 +368,26 @@ def create_contact_sheet(frames: list, thumb_width: int = 320, cols: int = 3):
     return contact_sheet
 
 def _analyze_batch(base64_image: str, batch_num: int, total_batches: int, 
-                   num_frames: int, time_range: str, model_name: str) -> str:
+                   num_frames: int, time_range: str, model_name: str,
+                   previous_context: str = None) -> str:
     """
     Sends a single 3x3 contact sheet batch to the VLM.
+    Includes rolling context from the previous batch for narrative continuity.
     Returns the raw text observation from the model.
     """
-    # Tell the model where in the video timeline this batch falls
     position = "beginning" if batch_num <= total_batches * 0.33 else ("middle" if batch_num <= total_batches * 0.66 else "end")
+    
+    context_line = ""
+    if previous_context:
+        # Truncate to ~200 chars to save tokens
+        prev_summary = previous_context[:200]
+        context_line = f"\nPreviously in this video: {prev_summary}\nNow describe what happens NEXT.\n"
     
     system_prompt = (
         "You are an expert TikTok trend analyst studying viral video patterns. "
         f"This is batch {batch_num}/{total_batches} (the {position}) of a TikTok video. "
         f"The image is a 3x3 grid of {num_frames} frames covering timestamps {time_range}. "
+        f"{context_line}"
         "Describe what you see in detail. Focus on:\n"
         "- What is happening (actions, transitions, costume changes, reveals)\n"
         "- Any CHANGES between frames (outfit swap, scene change, before/after)\n"
@@ -363,7 +416,7 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
-    response = requests.post(VLLM_API_URL, json=payload, timeout=120)
+    response = requests.post(VLLM_API_URL, json=payload, timeout=ANALYSIS_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     content = data['choices'][0]['message']['content'].strip()
@@ -372,7 +425,7 @@ def _analyze_batch(base64_image: str, batch_num: int, total_batches: int,
     content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
     return content
 
-def _merge_observations(observations: list, model_name: str) -> dict:
+def _merge_observations(observations: list, model_name: str, extra_context: str = "") -> dict:
     """
     Sends all batch observations to the VLM to produce one final merged style profile JSON.
     Understands narrative structure: transitions, costume changes, story arcs.
@@ -394,17 +447,22 @@ def _merge_observations(observations: list, model_name: str) -> dict:
         "Reply ONLY with the raw JSON object."
     )
 
+    user_content = f"Here are the chronological observations:\n\n{combined}"
+    if extra_context:
+        user_content += f"\n\nAdditional analysis data:{extra_context}"
+    user_content += "\n\nAnalyze the full narrative and provide the merged JSON."
+
     payload = {
         "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Here are the chronological observations:\n\n{combined}\n\nAnalyze the full narrative and provide the merged JSON."}
+            {"role": "user", "content": user_content}
         ],
         "max_tokens": 600,
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
-    response = requests.post(VLLM_API_URL, json=payload, timeout=90)
+    response = requests.post(VLLM_API_URL, json=payload, timeout=ANALYSIS_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     content = data['choices'][0]['message']['content'].strip()
@@ -417,35 +475,84 @@ def _merge_observations(observations: list, model_name: str) -> dict:
     elif content.startswith("```"):
         content = content.split("```")[1].split("```")[0].strip()
     
-    # Find JSON — may be nested, so use a greedy match
     json_match = re.search(r'\{.*\}', content, flags=re.DOTALL)
     if json_match:
         content = json_match.group(0)
     
     return json.loads(content)
 
-def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A3B"):
+def correlate_beats_and_cuts(beats: list, cuts: list, threshold: float = 0.15) -> list:
     """
-    Samples frames every 0.3s, groups them into 3x3 batches (9 frames each),
-    analyzes each batch with the VLM, then merges all observations into a 
-    single style profile with one final VLM call.
+    A4: Correlates beat timestamps with cut timestamps.
+    Returns a list of sync events showing if cuts align with beats.
     """
-    print("Extracting style profile (batched 3x3 analysis)...")
+    sync_data = []
+    for cut_time in cuts:
+        if not beats:
+            sync_data.append({"cut_time": cut_time, "nearest_beat": None, "synced": False, "offset_ms": None})
+            continue
+        nearest_beat = min(beats, key=lambda b: abs(b - cut_time))
+        offset = abs(nearest_beat - cut_time)
+        sync_data.append({
+            "cut_time": round(cut_time, 3),
+            "nearest_beat": round(nearest_beat, 3),
+            "synced": offset <= threshold,
+            "offset_ms": round(offset * 1000, 1)
+        })
+    synced_count = sum(1 for s in sync_data if s["synced"])
+    print(f"Beat-cut correlation: {synced_count}/{len(sync_data)} cuts are beat-synced (within {threshold*1000:.0f}ms)")
+    return sync_data
+
+def extract_style_profile(video_path: str, model_name: str = None, cuts: list = None,
+                          beats: list = None):
+    """
+    Scene-cut-aligned, rolling-context style extraction:
+    - Aligns frame sampling to scene boundaries (A1)
+    - Feeds previous batch context into next batch (A2)
+    - Skips blurry frames (A3, via sample_frames)
+    - Includes beat-cut sync data in merge prompt (A4)
+    """
+    if model_name is None:
+        model_name = ANALYSIS_MODEL
     
-    # Sample frames every 0.3 seconds
-    frames = sample_frames(video_path, interval=0.3)
+    print("Extracting style profile (scene-aligned batched analysis)...")
+    
+    # Sample frames — scene-aligned if cuts available
+    frames = sample_frames(video_path, interval=0.3, cuts=cuts)
     
     if not frames:
         print("Failed to extract frames for style analysis.")
         return {"clothing": "casual", "setting": "well-lit room", "camera_angle": "medium shot"}
     
-    # Split into batches of 9 (3x3 grids)
+    # Split into batches of 9 (3x3 grids), respecting scene boundaries
     BATCH_SIZE = 9
-    batches = [frames[i:i + BATCH_SIZE] for i in range(0, len(frames), BATCH_SIZE)]
+    if cuts and len(cuts) >= 2:
+        # Group frames by scene, then chunk each scene into batches of 9
+        batches = []
+        scene_idx = 0
+        current_scene_frames = []
+        for timestamp, frame in frames:
+            # Move to next scene if we've passed the boundary
+            while scene_idx < len(cuts) - 1 and timestamp >= cuts[scene_idx + 1]:
+                # Flush current scene frames as batches
+                if current_scene_frames:
+                    for i in range(0, len(current_scene_frames), BATCH_SIZE):
+                        batches.append(current_scene_frames[i:i + BATCH_SIZE])
+                current_scene_frames = []
+                scene_idx += 1
+            current_scene_frames.append((timestamp, frame))
+        # Flush remaining
+        if current_scene_frames:
+            for i in range(0, len(current_scene_frames), BATCH_SIZE):
+                batches.append(current_scene_frames[i:i + BATCH_SIZE])
+    else:
+        batches = [frames[i:i + BATCH_SIZE] for i in range(0, len(frames), BATCH_SIZE)]
+    
     total_batches = len(batches)
     print(f"Processing {total_batches} batches of up to {BATCH_SIZE} frames each...")
     
     observations = []
+    previous_context = None  # A2: rolling context
     for idx, batch in enumerate(batches):
         time_start = f"{batch[0][0]:.1f}s"
         time_end = f"{batch[-1][0]:.1f}s"
@@ -456,9 +563,11 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
         
         try:
             print(f"  Analyzing batch {idx+1}/{total_batches} ({time_range})...")
-            obs = _analyze_batch(base64_image, idx+1, total_batches, len(batch), time_range, model_name)
+            obs = _analyze_batch(base64_image, idx+1, total_batches, len(batch), 
+                                time_range, model_name, previous_context=previous_context)
             print(f"  [Batch {idx+1}] {obs[:150]}")
             observations.append(obs)
+            previous_context = obs  # Feed into next batch
         except Exception as e:
             print(f"  [Batch {idx+1}] Failed: {str(e)}")
     
@@ -473,7 +582,15 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
     # Merge all observations into one final style profile
     try:
         print(f"Merging {len(observations)} batch observations into final style profile...")
-        style_data = _merge_observations(observations, model_name)
+        
+        # A4: Add beat-cut correlation info to merge context
+        beat_sync_info = ""
+        if beats and cuts:
+            sync_data = correlate_beats_and_cuts(beats, cuts)
+            synced_count = sum(1 for s in sync_data if s["synced"])
+            beat_sync_info = f"\nBeat-cut sync: {synced_count}/{len(sync_data)} cuts are rhythmically aligned with beats."
+        
+        style_data = _merge_observations(observations, model_name, extra_context=beat_sync_info)
         print(f"[DEBUG] Merged style: {style_data}")
         return {
             "video_type": style_data.get("video_type", "unknown"),
@@ -496,16 +613,73 @@ def extract_style_profile(video_path: str, model_name: str = "Qwen/Qwen3.6-35B-A
             "recreation_tips": ""
         }
 
+def interpolate_pose_gaps(pose_timeline: list, sample_interval: float = 0.1) -> list:
+    """
+    A5: Fills gaps in pose timeline with linear interpolation.
+    If MediaPipe lost tracking for some frames, this fills in the blanks.
+    """
+    if len(pose_timeline) < 2:
+        return pose_timeline
+    
+    interpolated = 0
+    filled = list(pose_timeline)
+    
+    for i in range(len(filled) - 1):
+        t1 = filled[i]["time"]
+        t2 = filled[i + 1]["time"]
+        gap = t2 - t1
+        
+        if gap > sample_interval * 2.5:
+            # Insert interpolated poses
+            n_missing = int(gap / sample_interval) - 1
+            for j in range(1, n_missing + 1):
+                alpha = j / (n_missing + 1)
+                interp_time = round(t1 + alpha * gap, 2)
+                
+                # Linear interpolation of normalized landmarks
+                norm1 = filled[i]["normalized"]
+                norm2 = filled[i + 1]["normalized"]
+                interp_norm = []
+                interp_lm = []
+                for k in range(min(len(norm1), len(norm2))):
+                    interp_norm.append([
+                        norm1[k][0] + alpha * (norm2[k][0] - norm1[k][0]),
+                        norm1[k][1] + alpha * (norm2[k][1] - norm1[k][1]),
+                        norm1[k][2] + alpha * (norm2[k][2] - norm1[k][2]),
+                        min(norm1[k][3], norm2[k][3]) * 0.5  # Lower visibility for interpolated
+                    ])
+                    lm1 = filled[i]["landmarks"][k]
+                    lm2 = filled[i + 1]["landmarks"][k]
+                    interp_lm.append([
+                        lm1[0] + alpha * (lm2[0] - lm1[0]),
+                        lm1[1] + alpha * (lm2[1] - lm1[1]),
+                        lm1[2] + alpha * (lm2[2] - lm1[2]),
+                        min(lm1[3], lm2[3]) * 0.5
+                    ])
+                
+                filled.append({
+                    "time": interp_time,
+                    "landmarks": interp_lm,
+                    "normalized": interp_norm,
+                    "interpolated": True
+                })
+                interpolated += 1
+    
+    filled.sort(key=lambda p: p["time"])
+    if interpolated > 0:
+        print(f"Pose interpolation: filled {interpolated} gap frames")
+    return filled
+
 def analyze_trend(url: str, output_dir: str = "temp"):
     """
-    End-to-end analysis:
+    End-to-end analysis pipeline:
     1. Download video
-    2. Extract audio
-    3. Find beats
-    4. Find cuts
+    2. Extract audio → beats
+    3. Find scene cuts
+    4. Correlate beats ↔ cuts (A4)
     5. Analyze camera motion (optical flow)
-    6. Extract reference poses (MediaPipe)
-    7. Extract style profile (VLM)
+    6. Extract reference poses + interpolate gaps (A5)
+    7. Extract style profile (scene-aligned, rolling context, blur-aware) (A1-A3)
     8. Save Skill archive
     """
     try:
@@ -516,25 +690,41 @@ def analyze_trend(url: str, output_dir: str = "temp"):
         bpm, beats = detect_audio_beats(audio_path)
         cuts = detect_video_cuts(video_path)
         
-        # New: Camera motion analysis (optical flow — no extra deps)
+        # A4: Beat-cut correlation
+        beat_cut_sync = correlate_beats_and_cuts(beats, cuts)
+        
+        # Camera motion analysis (optical flow)
         camera_motion = analyze_camera_motion(video_path)
         
-        # New: Reference pose extraction (MediaPipe — graceful fallback)
+        # Reference pose extraction + A5: interpolation
         reference_poses = extract_reference_poses(video_path)
+        if reference_poses:
+            reference_poses = interpolate_pose_gaps(reference_poses)
         
-        # VLM-based style profile
-        style = extract_style_profile(video_path)
+        # C2: Depth estimation (optional — requires GPU + weights)
+        depth_profile = []
+        try:
+            from depth_estimator import DepthEstimator
+            depth_est = DepthEstimator()
+            if depth_est.available:
+                depth_profile = depth_est.extract_reference_depth(video_path)
+        except Exception as e:
+            print(f"Depth estimation skipped: {e}")
+        
+        # VLM-based style profile — now scene-aligned with rolling context
+        style = extract_style_profile(video_path, cuts=cuts, beats=beats)
 
         context = {
             "bpm": bpm,
             "cuts": cuts,
             "beats": beats,
+            "beat_cut_sync": beat_cut_sync,
             "audio_path": audio_path,
             "reference_video_path": video_path,
             "camera_motion": camera_motion,
+            "depth_profile": depth_profile,
         }
 
-        # Use the video ID as the trend name (extracted from URL or fallback)
         trend_name = "trend_" + os.path.basename(video_path).split('.')[0]
         skill_dir = save_skill(trend_name, style, context, reference_poses)
 
