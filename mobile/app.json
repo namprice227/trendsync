@@ -23,7 +23,8 @@
         }
       ],
       "expo-document-picker",
-      "expo-video"
+      "expo-video",
+      "expo-asset"
     ]
   }
 }
