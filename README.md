@@ -262,6 +262,11 @@ recorded_shots/     context.json
 | `scriptwriter.py` | Generates a TikTok caption and hook script using few-shot style transfer |
 | `skill_manager.py` | Saves/loads Skill archives, generates **per-scene director prompts** |
 | `mcp_server.py` | MCP server for external AI agent integration |
+| `pose_utils.py` | Utilities for 3D body pose tracking and DTW score calculations |
+| `api_server.py` | FastAPI backend to orchestrate the workflow for the mobile app |
+| `dummy_vllm_server.py` | A local dummy vLLM server to mock the LLM capabilities |
+| `test_ui_api.py` | A test script for the API |
+| `mobile/` | Expo app directory for the mobile interface |
 | `Depth-Anything-V2/` | Cloned repo for depth estimation (🧪 not tracked in git) |
 
 ### Skill Archive Format
