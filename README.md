@@ -323,81 +323,214 @@ All model names and endpoints are configurable via `config.py`:
 | `TRENDFLOW_DIRECTOR_MODEL` | `Qwen/Qwen3.6-35B-A3B` | Model for real-time directing (12B recommended) |
 | `TRENDFLOW_DIRECTOR_VLM_INTERVAL` | `3.0` | Seconds between VLM director checks |
 
-**Dual-Model Strategy (MI300X):**
+**Optional Dual-Model Strategy (MI300X):**
+
+Two vLLM servers must share the same GPU memory. If the first server starts with a high `--gpu-memory-utilization` value, the second server can fail with `Free memory ... is less than desired GPU memory utilization`. Check free VRAM first, then start each server with explicit memory caps.
+
 ```bash
-# Terminal 1: Heavy model for analysis (port 8000)
-vllm serve Qwen/Qwen2-VL-72B-Instruct --port 8000
+# Check current GPU memory usage
+rocm-smi
+
+# Terminal 1: Main model for analysis (port 8000)
+vllm serve Qwen/Qwen3.6-35B-A3B \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.65 \
+  --max-model-len 49152
 
 # Terminal 2: Fast model for directing (port 8001)
-vllm serve mistralai/Pixtral-12B-2409 --port 8001
+vllm serve mistralai/Pixtral-12B-2409 \
+  --port 8001 \
+  --gpu-memory-utilization 0.20 \
+  --max-model-len 16384
 
 # Set env vars
-export TRENDFLOW_ANALYSIS_MODEL="Qwen/Qwen2-VL-72B-Instruct"
+export TRENDFLOW_ANALYSIS_MODEL="Qwen/Qwen3.6-35B-A3B"
+export TRENDFLOW_VLLM_URL="http://localhost:8000/v1/chat/completions"
 export TRENDFLOW_DIRECTOR_MODEL="mistralai/Pixtral-12B-2409"
 export TRENDFLOW_DIRECTOR_VLLM_URL="http://localhost:8001/v1/chat/completions"
 ```
+
+If Pixtral fails with a safetensors or tokenizer-format error, relaunch it with:
+
+```bash
+vllm serve mistralai/Pixtral-12B-2409 \
+  --port 8001 \
+  --tokenizer-mode mistral \
+  --load-format mistral \
+  --limit-mm-per-prompt image=4 \
+  --gpu-memory-utilization 0.20 \
+  --max-model-len 16384
+```
+
+If Pixtral still cannot start, stop the first vLLM server or relaunch it with a lower `--gpu-memory-utilization` value before starting the second one.
 
 ---
 
 ## 🛠️ Environment & Setup
 
-### Option A: AMD Cloud GPU Deployment (Recommended)
+Use **Python 3.12**. The pinned MediaPipe stack in `requirements.txt` uses the legacy `mediapipe.solutions.pose` API, which is required for real-time pose tracking and reference pose extraction. Do not use Python 3.13 for this app.
 
-**1. Start the ROCm Docker Container:**
+### Quick Setup
+
+Run the setup script from the repo root:
 
 ```bash
-docker run -it --network=host --device=/dev/kfd --device=/dev/dri \
-  --group-add=video --ipc=host --cap-add=SYS_PTRACE \
-  --security-opt seccomp=unconfined \
-  -e HSA_OVERRIDE_GFX_VERSION=9.0.0 \
-  rocm/vllm-dev:latest
+./setup.sh
 ```
 
-> **Note:** `HSA_OVERRIDE_GFX_VERSION=9.0.0` may be needed for MI300X compatibility.
+The script creates or reuses `.conda/trendsync-py312`, installs `ffmpeg`, installs `requirements.txt`, runs `pip check`, and verifies `mediapipe.solutions.pose`.
 
-**2. Inside Docker — Start vLLM:**
+### 1. Clone The Repo
+
+```bash
+git clone https://github.com/namprice227/trendsync
+cd trendsync
+```
+
+### 2. Create The Conda Environment
+
+Create the environment inside the project so it is easy to find and reproduce:
+
+```bash
+conda create -y -p "$PWD/.conda/trendsync-py312" python=3.12 pip
+conda activate "$PWD/.conda/trendsync-py312"
+```
+
+If your shell has not been initialized for `conda`, use:
+
+```bash
+source /home/nam/miniconda3/bin/activate "$PWD/.conda/trendsync-py312"
+```
+
+### 3. Install Runtime Tools
+
+Install `ffmpeg` in the conda environment. It is used by `yt-dlp`, MoviePy, and the audio extraction path.
+
+```bash
+conda install -y -c conda-forge ffmpeg
+```
+
+The analyzer also falls back to the `imageio-ffmpeg` binary from Python packages if a system `ffmpeg` is not available, but the conda `ffmpeg` package is still recommended.
+
+### 4. Install Python Dependencies
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+Expected result:
+
+```text
+No broken requirements found.
+```
+
+### 5. Verify MediaPipe Pose Works
+
+Run this quick check before launching the app:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl python - <<'PY'
+import mediapipe as mp
+print("mediapipe", mp.__version__)
+print("has solutions:", hasattr(mp, "solutions"))
+print("has pose:", hasattr(mp.solutions, "pose"))
+pose = mp.solutions.pose.Pose(static_image_mode=True, model_complexity=1)
+pose.close()
+print("pose constructor ok")
+PY
+```
+
+Expected output includes:
+
+```text
+mediapipe 0.10.14
+has solutions: True
+has pose: True
+pose constructor ok
+```
+
+### 6. Run The App
+
+Normal run:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl python app.py
+```
+
+The UI is available at:
+
+- Local: `http://127.0.0.1:7860`
+- Remote VM: `http://<VM-IP>:7860`
+- Public Gradio share URL: printed in the terminal when `share=True`
+
+If port `7860` is already busy, launch on another port:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl python -c "import app; app.launch_demo(server_name='127.0.0.1', server_port=7861, share=False)"
+```
+
+### 7. Optional: Run The VLM Server
+
+The app can run without a local VLM server. VLM calls fall back to mock responses, while CPU features like MediaPipe pose tracking, optical flow, beat detection, and rendering still work.
+
+For full VLM analysis/directing on an AMD GPU, start vLLM separately:
 
 ```bash
 vllm serve Qwen/Qwen3.6-35B-A3B \
   --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.95 \
-  --max-model-len 32768
+  --gpu-memory-utilization 0.65 \
+  --max-model-len 49152
 ```
 
-> **Note:** `Qwen/Qwen3.6-35B-A3B` is a gated model. Run `huggingface-cli login` and accept the license on Hugging Face first.
-
-**3. On the Host VM — Install dependencies and run:**
+Then point the app at it if needed:
 
 ```bash
-apt-get update && apt-get install ffmpeg libsm6 libxext6 -y
+export TRENDFLOW_VLLM_URL="http://localhost:8000/v1/chat/completions"
+export TRENDFLOW_ANALYSIS_MODEL="Qwen/Qwen3.6-35B-A3B"
+export TRENDFLOW_DIRECTOR_MODEL="Qwen/Qwen3.6-35B-A3B"
+```
 
-git clone https://github.com/namprice227/trendsync
-cd trendsync
+For a dual-model setup, start a second server only if enough GPU memory is free. Your vLLM error `Free memory ... is less than desired GPU memory utilization` means another process already reserved most of the GPU.
 
-# Clone Depth Anything V2 (optional, for depth estimation)
+```bash
+rocm-smi
+
+vllm serve mistralai/Pixtral-12B-2409 \
+  --port 8001 \
+  --gpu-memory-utilization 0.20 \
+  --max-model-len 16384
+```
+
+If Pixtral fails with a safetensors or tokenizer-format error, add the Mistral loader flags:
+
+```bash
+vllm serve mistralai/Pixtral-12B-2409 \
+  --port 8001 \
+  --tokenizer-mode mistral \
+  --load-format mistral \
+  --limit-mm-per-prompt image=4 \
+  --gpu-memory-utilization 0.20 \
+  --max-model-len 16384
+```
+
+Then point the director at it:
+
+```bash
+export TRENDFLOW_DIRECTOR_VLLM_URL="http://localhost:8001/v1/chat/completions"
+export TRENDFLOW_DIRECTOR_MODEL="mistralai/Pixtral-12B-2409"
+```
+
+If the first vLLM server was started with `--gpu-memory-utilization 0.9` or higher, stop it or relaunch it with a lower cap before starting Pixtral.
+
+### 8. Optional: Depth Anything V2
+
+Depth estimation is optional. Clone the repo only if you want experimental depth feedback:
+
+```bash
 git clone --depth 1 https://github.com/DepthAnything/Depth-Anything-V2.git
-
-pip install -r requirements.txt
-python app.py
 ```
-
-**4. Access the UI:**
-- Local: `http://<VM-IP>:7860`
-- Public share link: shown in terminal (via Gradio `share=True`)
-
-### Option B: Local Testing (Without Cloud GPU)
-
-All VLM calls **fall back to mock responses** when no vLLM server is running. CV features (pose, optical flow) work locally.
-
-```bash
-conda create -n trendsync python=3.12 -y
-conda activate trendsync
-conda install -c conda-forge ffmpeg -y
-pip install -r requirements.txt
-python app.py
-```
-
-> **Note:** MediaPipe requires Python 3.9–3.12. Use Python 3.12 for full feature support.
 
 ---
 
@@ -436,14 +569,14 @@ python app.py
 - **Timeouts:** Analyzer (120s), Director (30s), Evaluator (60s), Scriptwriter (60s)
 
 ### CV Pipeline (CPU)
-- **MediaPipe Pose:** Model complexity 0 (fastest) for real-time, complexity 1 for reference extraction
+- **MediaPipe Pose:** Pinned to `mediapipe==0.10.14` on Python 3.12, using the legacy `mp.solutions.pose` API with model complexity 1
 - **Optical Flow:** Farneback, downscaled to 320×240 for speed
 - **DTW:** `dtaidistance` library with fast C implementation and pruning
 
 ### Graceful Fallbacks
 Every module works without GPU:
 - **VLM calls** → Mock responses
-- **MediaPipe** → Skipped if not installed
+- **MediaPipe** → Required for pose features; setup verifies `mp.solutions.pose` before running
 - **Depth Anything** → Skipped if no GPU or weights
 
 ---
@@ -457,12 +590,15 @@ librosa             # Audio analysis (BPM, beat detection)
 scenedetect         # Video scene cut detection
 moviepy             # Video editing (trim, concat, audio overlay)
 requests            # HTTP client for vLLM API
-opencv-python-headless  # Frame extraction, optical flow, encoding
+opencv-python       # Frame extraction and optical flow
+opencv-contrib-python  # Extra OpenCV modules used by the pinned stack
 PyYAML              # Skill archive serialization
 fastmcp             # MCP server for agent integration
-mediapipe           # Real-time pose tracking (CPU)
+mediapipe==0.10.14  # Real-time pose tracking (CPU, Python 3.12)
 dtaidistance        # Dynamic Time Warping for pose comparison
 numpy               # Numerical operations
+protobuf            # MediaPipe-compatible protobuf runtime
+jax / jaxlib        # MediaPipe runtime dependencies
 ```
 
 ---

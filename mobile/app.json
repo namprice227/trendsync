@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "TrendFlow",
+    "slug": "trendflow-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "trendflow",
+    "android": {
+      "package": "ai.trendflow.mobile",
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "TrendFlow needs camera access to guide and record each shot.",
+          "microphonePermission": "TrendFlow needs microphone access to record synced video clips.",
+          "recordAudioAndroid": true
+        }
+      ],
+      "expo-document-picker",
+      "expo-video"
+    ]
+  }
+}

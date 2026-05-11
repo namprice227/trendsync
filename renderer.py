@@ -79,32 +79,49 @@ def render_final_video(clips_paths: list, skill_dir: str, output_path: str = "fi
     # Apply OpenStoryline-style beat snapping
     cuts = snap_cuts_to_beats(raw_cuts, beats)
 
-    if len(clips_paths) != (len(cuts) - 1 if len(cuts) > 1 else len(cuts)):
+    required_shots = len(cuts) - 1 if len(cuts) > 1 else len(cuts)
+    single_full_take = len(clips_paths) == 1 and required_shots > 1
+    if len(clips_paths) != required_shots and not single_full_take:
         print("Warning: Mismatch between number of recorded clips and required shots.")
 
     print("Assembling video clips...")
     processed_clips = []
 
-    for i, clip_path in enumerate(clips_paths):
+    target_duration = cuts[-1] if cuts else None
+
+    if len(clips_paths) == 1:
+        clip_path = clips_paths[0]
         if not os.path.exists(clip_path):
-            continue
+            raise ValueError(f"Uploaded clip not found: {clip_path}")
 
-        # Determine the required duration for this clip based on cuts
-        if i < len(cuts) - 1:
-            duration = cuts[i+1] - cuts[i]
-        elif len(cuts) > 0 and i == len(cuts) - 1:
-            duration = 3.0
-        else:
-            duration = 3.0
-
-        # Load and trim clip
         try:
             v_clip = VideoFileClip(clip_path)
-            trim_end = min(duration, v_clip.duration)
-            v_clip = v_clip.subclipped(0, trim_end)
-            processed_clips.append(v_clip)
+            duration = min(v_clip.duration, target_duration) if target_duration else v_clip.duration
+            print(f"Single full-take clip detected — preserving {duration:.2f}s")
+            processed_clips.append(v_clip.subclipped(0, duration))
         except Exception as e:
-            print(f"Failed to process clip {clip_path}: {str(e)}")
+            raise ValueError(f"Failed to process uploaded clip: {str(e)}") from e
+    else:
+        for i, clip_path in enumerate(clips_paths):
+            if not os.path.exists(clip_path):
+                continue
+
+            # Determine the required duration for this clip based on cuts.
+            if i < len(cuts) - 1:
+                duration = cuts[i + 1] - cuts[i]
+            elif len(cuts) > 0 and i == len(cuts) - 1:
+                duration = 3.0
+            else:
+                duration = 3.0
+
+            # Load and trim clip
+            try:
+                v_clip = VideoFileClip(clip_path)
+                trim_end = min(duration, v_clip.duration)
+                v_clip = v_clip.subclipped(0, trim_end)
+                processed_clips.append(v_clip)
+            except Exception as e:
+                print(f"Failed to process clip {clip_path}: {str(e)}")
 
     if not processed_clips:
         raise ValueError("No valid clips were provided for rendering.")
