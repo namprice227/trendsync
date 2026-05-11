@@ -401,7 +401,7 @@ function OutputVideo({ source }: { source: string }) {
     instance.loop = false;
   });
 
-  return <VideoView player={player} style={styles.video} allowsFullscreen contentFit="contain" />;
+  return <VideoView player={player} style={styles.video} allowsFullscreen contentFit="contain" surfaceType="textureView" />;
 }
 
 function OutputScreen({ apiUrl, session }: { apiUrl: string; session: TrendSession }) {
