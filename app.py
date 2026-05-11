@@ -38,42 +38,46 @@ app_state = {
 # --- Custom CSS ---
 custom_css = """
 .gradio-container {
-    max-width: 1200px !important;
+    max-width: 1600px !important;
     margin: auto !important;
 }
 .header-title {
-    text-align: center;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-size: 2.5em !important;
+    text-align: left;
+    color: #202124;
+    font-size: 2.15em !important;
     font-weight: 800 !important;
     margin-bottom: 0 !important;
 }
 .header-subtitle {
-    text-align: center;
+    text-align: left;
     color: #666;
     font-size: 1.1em;
     margin-top: 0 !important;
 }
 .step-banner {
-    background: linear-gradient(135deg, #667eea22, #764ba222);
-    border-left: 4px solid #667eea;
+    background: #f7f8fa;
+    border-left: 4px solid #2f6fed;
     padding: 12px 16px;
     border-radius: 8px;
     margin-bottom: 12px;
 }
+.workspace-grid {
+    align-items: flex-start;
+}
+.panel-title h3 {
+    margin-top: 0 !important;
+}
 .next-step-banner {
-    background: linear-gradient(135deg, #00c85322, #00e67622);
-    border-left: 4px solid #00c853;
+    background: #f1f8f4;
+    border-left: 4px solid #16853a;
     padding: 12px 16px;
     border-radius: 8px;
     margin-top: 12px;
     text-align: center;
 }
 .warn-banner {
-    background: linear-gradient(135deg, #ff980022, #ff572222);
-    border-left: 4px solid #ff9800;
+    background: #fff7ed;
+    border-left: 4px solid #f97316;
     padding: 12px 16px;
     border-radius: 8px;
 }
@@ -200,11 +204,9 @@ def process_trend_link(url, progress=gr.Progress()):
 
         results_md += """---
 
-### 📋 Next Steps
+### Production Notes
 
-1. Prepare your outfits according to the style guide
-2. Set up your filming location  
-3. **Go to Step 2: The Studio** to upload your clips
+Use the Studio panel to upload one full take or separate clips. The Output panel can assemble as soon as clips are available.
 """
 
         # Add camera motion summary if available
@@ -232,13 +234,14 @@ def process_trend_link(url, progress=gr.Progress()):
         # Generate script using Few-Shot style transfer
         generated_script = generate_script(style)
         
-        next_step = "✅ **Ready!** Go to **Step 2: The Studio** to start filming."
+        next_step = f"Ready. Reference analyzed with {num_shots} target shot{'s' if num_shots != 1 else ''}. Upload a full take or individual clips in Studio."
+        shot_status = f"Reference target: **{num_shots} shot{'s' if num_shots != 1 else ''}**. A single full-take upload is supported."
         
         progress(1.0, desc="✅ Analysis complete!")
-        return metadata_display, results_md, generated_script, next_step
+        return metadata_display, results_md, generated_script, next_step, shot_status
     except Exception as e:
         error_md = f"### ❌ Error\n\n`{str(e)}`\n\nPlease check the URL and try again."
-        return "", error_md, "", ""
+        return "", error_md, "", "", "Analysis failed."
 
 # --- Tab 2: The Studio ---
 def studio_feedback_loop(frame):
@@ -249,7 +252,7 @@ def studio_feedback_loop(frame):
         return frame, "⏳ Waiting for camera feed...", "Connect your webcam above to begin."
 
     if not app_state["skill_dir"]:
-        return frame, "⚠️ No trend analyzed yet", "Go to **Step 1** first and analyze a TikTok trend."
+        return frame, "No trend analyzed yet", "Analyze a reference trend first, then this live director will compare your framing and motion."
 
     total = app_state["required_shots"]
     current = app_state["current_shot_idx"]
@@ -258,7 +261,7 @@ def studio_feedback_loop(frame):
         return (
             frame,
             f"🎉 All {total} shots complete!",
-            "All shots captured! Go to **Step 3: Final Output** to assemble your video."
+            "All shots captured. Assemble the final video in the Output panel."
         )
 
     if app_state["is_recording"]:
@@ -374,22 +377,22 @@ def studio_feedback_loop(frame):
 def render_project():
     """Handler for Tab 3: Render"""
     if not app_state["skill_dir"]:
-        return None, "⚠️ No trend analyzed. Go to **Step 1** first."
+        return None, "No trend analyzed yet. Analyze a reference trend first."
 
     if not app_state["recorded_clips"]:
-        return None, "⚠️ No clips recorded. Go to **Step 2: The Studio** to film your shots."
+        return None, "No clips uploaded or recorded yet. Add footage in Studio first."
 
     try:
         output_file = render_final_video(app_state["recorded_clips"], app_state["skill_dir"])
         app_state["final_video_path"] = output_file
-        return output_file, "✅ Render complete! Your video is ready. Click **Judge My Video** for AI feedback."
+        return output_file, "Render complete. Your video is ready for review."
     except Exception as e:
         return None, f"❌ Render failed: `{str(e)}`"
 
 def judge_video():
     """Handler for Evaluation"""
     if not app_state.get("final_video_path"):
-        return "⚠️ No final video found. Click **Assemble Final Video** first."
+        return "No final video found. Assemble the video first."
     
     style_profile = None
     if app_state["skill_dir"]:
@@ -410,18 +413,18 @@ def judge_video():
 with gr.Blocks(title="TrendFlow AI — Autonomous TikTok Director") as demo:
     
     # --- Header ---
-    gr.Markdown("# 🎬 TrendFlow AI", elem_classes=["header-title"])
-    gr.Markdown("Autonomous TikTok Director & Editor — Powered by AMD MI300X + Qwen VLM", elem_classes=["header-subtitle"])
+    gr.Markdown("# TrendFlow AI", elem_classes=["header-title"])
+    gr.Markdown("Autonomous TikTok director and editor powered by AMD MI300X + Qwen VLM", elem_classes=["header-subtitle"])
 
-    with gr.Tabs() as tabs:
+    with gr.Row(elem_classes=["workspace-grid"]):
         # ==========================================
-        # TAB 1: TREND ANALYZER
+        # REFERENCE ANALYZER
         # ==========================================
-        with gr.Tab("① Analyze Trend", id="tab1"):
+        with gr.Column(scale=5, min_width=360):
             gr.Markdown("""
 <div class="step-banner">
-<strong>Step 1:</strong> Paste a TikTok or Reel URL. The AI will download it, extract the audio beats, detect scene cuts, 
-and use vision AI to analyze the style — clothing, setting, and camera angles.
+<strong>Reference</strong><br>
+Analyze the source trend once, then keep the results visible while you film and render.
 </div>
 """)
             
@@ -433,60 +436,50 @@ and use vision AI to analyze the style — clothing, setting, and camera angles.
                         lines=1
                     )
                 with gr.Column(scale=1):
-                    analyze_btn = gr.Button("🔍 Analyze Trend", variant="primary", size="lg")
+                    analyze_btn = gr.Button("Analyze Trend", variant="primary", size="lg")
 
             with gr.Row():
                 with gr.Column(scale=2):
-                    results_md = gr.Markdown("### Waiting for analysis...\n\nPaste a URL above and click **Analyze Trend** to begin.")
-                    script_output = gr.Textbox(label="📝 Generated Script & Caption", interactive=False, lines=4)
+                    results_md = gr.Markdown("### Waiting for analysis\n\nPaste a URL above and click **Analyze Trend** to begin.")
+                    script_output = gr.Textbox(label="Generated Script & Caption", interactive=False, lines=4)
                     next_step_md = gr.Markdown("")
                 with gr.Column(scale=1):
                     metadata_output = gr.Code(label="Raw Context (context.json)", language="json", lines=20)
 
-            analyze_btn.click(
-                fn=process_trend_link,
-                inputs=url_input,
-                outputs=[metadata_output, results_md, script_output, next_step_md]
-            )
-
         # ==========================================
-        # TAB 2: THE STUDIO
+        # STUDIO
         # ==========================================
-        with gr.Tab("② The Studio", id="tab2"):
+        with gr.Column(scale=5, min_width=380):
             gr.Markdown("""
 <div class="step-banner">
-<strong>Step 2:</strong> Upload your filmed clips for AI review, or use the webcam for <strong>hybrid real-time directing</strong>. 
-The system uses two feedback loops: <strong>⚡ Fast (CPU)</strong> — pose tracking + camera motion at 10fps, 
-and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 seconds.
+<strong>Studio</strong><br>
+Upload one full take or separate shot clips, with live feedback available beside the final output.
 </div>
 """)
 
             # Shot info
-            shot_info = gr.Markdown("⏳ Analyze a trend in Step 1 first to see shot requirements here.")
+            shot_info = gr.Markdown("Analyze a trend to see shot requirements here.")
 
-            gr.Markdown("### 📤 Upload Your Clips")
-            gr.Markdown("Film your shots on your phone or camera, then upload them here. The AI will review each one.")
+            gr.Markdown("### Upload Clips")
             
             with gr.Row():
                 with gr.Column(scale=2):
                     clip_upload = gr.File(
-                        label="Upload video clips (one per shot)",
+                        label="Video clips",
                         file_count="multiple",
                         file_types=["video"]
                     )
                 with gr.Column(scale=1):
-                    upload_btn = gr.Button("📥 Add Clips & Get AI Review", variant="primary", size="lg")
+                    upload_btn = gr.Button("Add Clips", variant="primary", size="lg")
             
             upload_status = gr.Markdown("")
             ai_review = gr.Markdown("")
             
-            gr.Markdown("---")
-            gr.Markdown("### 📹 Or Use Webcam — Hybrid Director")
-            gr.Markdown("Real-time **⚡ CV feedback** (pose alignment, camera motion) on every frame + **🧠 VLM style check** every 3 seconds.")
+            gr.Markdown("### Live Director")
             
             # B3: Pre-flight check
             with gr.Row():
-                preflight_btn = gr.Button("🔍 Pre-Flight Check (check outfit & lighting first)", variant="secondary")
+                preflight_btn = gr.Button("Pre-Flight Check", variant="secondary")
             preflight_result = gr.Markdown("")
             
             with gr.Row():
@@ -494,12 +487,12 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                     camera_input = gr.Image(
                         sources=["webcam"],
                         streaming=True,
-                        label="Live Camera Feed",
+                        label="Live Camera",
                         height=350
                     )
                 with gr.Column(scale=1):
                     shot_progress = gr.Textbox(
-                        label="Progress",
+                        label="Shot Progress",
                         value="Waiting...",
                         interactive=False
                     )
@@ -511,7 +504,7 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                     return "⚠️ No files uploaded.", ""
                 
                 if not app_state["skill_dir"]:
-                    return "⚠️ Go to **Step 1** first and analyze a trend.", ""
+                    return "Analyze a reference trend before uploading clips.", ""
                 
                 from analyzer import analyze_camera_motion, extract_reference_poses
                 
@@ -587,14 +580,17 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                     review_text = " | ".join(clip_review_parts) if clip_review_parts else "Review failed"
                     reviews.append(f"**Clip {i+1}** (`{os.path.basename(f.name)}`): {review_text}")
                 
-                app_state["current_shot_idx"] = len(files)
+                single_full_take = len(files) == 1 and app_state["required_shots"] > 1
+                app_state["current_shot_idx"] = app_state["required_shots"] if single_full_take else len(files)
                 total = app_state["required_shots"]
                 uploaded = len(files)
                 
-                status = f"✅ **{uploaded} clips uploaded!**"
-                if uploaded < total:
-                    status += f"\n\n⚠️ You need {total} shots but only uploaded {uploaded}."
-                status += "\n\n**→ Go to Step 3 to assemble your final video.**"
+                status = f"**{uploaded} clip{'s' if uploaded != 1 else ''} uploaded.**"
+                if single_full_take:
+                    status += "\n\nSingle full take detected. The renderer will preserve it up to the reference duration instead of trimming it to the first shot."
+                elif uploaded < total:
+                    status += f"\n\nReference has {total} shots; upload more clips or render the available clips."
+                status += "\n\nReady to assemble in Output."
                 
                 review_md = "### 🎥 AI Director Review\n\n" + "\n\n".join(reviews) if reviews else ""
                 return status, review_md
@@ -604,7 +600,7 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
                 if frame is None:
                     return "⚠️ No webcam frame available. Enable your webcam first."
                 if not app_state["skill_dir"]:
-                    return "⚠️ Analyze a trend in Step 1 first."
+                    return "Analyze a reference trend first."
                 
                 checks = []
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -668,29 +664,29 @@ and <strong>🧠 Slow (GPU)</strong> — VLM style/outfit analysis every 3 secon
             )
 
         # ==========================================
-        # TAB 3: FINAL OUTPUT
+        # FINAL OUTPUT
         # ==========================================
-        with gr.Tab("③ Final Output", id="tab3"):
+        with gr.Column(scale=4, min_width=340):
             gr.Markdown("""
 <div class="step-banner">
-<strong>Step 3:</strong> Assemble your recorded shots into a finished video with beat-synced cuts and the original audio. 
-Then let the AI judge your result!
+<strong>Output</strong><br>
+Assemble the current clips and review the final video without leaving the workspace.
 </div>
 """)
 
             with gr.Row():
                 with gr.Column():
-                    render_btn = gr.Button("🎬 Assemble Final Video", variant="primary", size="lg")
-                    render_status = gr.Markdown("Click **Assemble Final Video** to stitch your recorded shots together.")
+                    render_btn = gr.Button("Assemble Final Video", variant="primary", size="lg")
+                    render_status = gr.Markdown("Upload footage, then assemble the final video.")
                     
-            final_video_output = gr.Video(label="🎥 Your Final Video", height=450)
+            final_video_output = gr.Video(label="Final Video", height=450)
             
             gr.Markdown("---")
             
             with gr.Row():
                 with gr.Column():
-                    judge_btn = gr.Button("⭐ Judge My Video", variant="secondary", size="lg")
-                    judge_output = gr.Markdown("After assembling, click **Judge My Video** for an AI score and critique.")
+                    judge_btn = gr.Button("Judge My Video", variant="secondary", size="lg")
+                    judge_output = gr.Markdown("After assembling, run the AI review here.")
 
             render_btn.click(
                 fn=render_project,
@@ -703,12 +699,18 @@ Then let the AI judge your result!
                 outputs=judge_output
             )
 
+            analyze_btn.click(
+                fn=process_trend_link,
+                inputs=url_input,
+                outputs=[metadata_output, results_md, script_output, next_step_md, shot_info]
+            )
+
     # --- Footer ---
     gr.Markdown("""
 ---
 <center>
 
-**TrendFlow AI** — Built for the [AMD Developer Hackathon](https://lablab.ai) | Powered by AMD MI300X + ROCm + vLLM
+**TrendFlow AI** | AMD MI300X + ROCm + vLLM
 
 </center>
 """)

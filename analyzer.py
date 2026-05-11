@@ -666,7 +666,7 @@ def interpolate_pose_gaps(pose_timeline: list, sample_interval: float = 0.1) -> 
         print(f"Pose interpolation: filled {interpolated} gap frames")
     return filled
 
-def analyze_trend(url: str, output_dir: str = "temp"):
+def analyze_trend(url: str, output_dir: str = "temp", trend_name: str = None):
     """
     End-to-end analysis pipeline:
     1. Download video
@@ -721,7 +721,8 @@ def analyze_trend(url: str, output_dir: str = "temp"):
             "depth_profile": depth_profile,
         }
 
-        trend_name = "trend_" + os.path.basename(video_path).split('.')[0]
+        if trend_name is None:
+            trend_name = "trend_" + os.path.basename(video_path).split('.')[0]
         skill_dir = save_skill(trend_name, style, context, reference_poses)
 
         print(f"Trend analysis complete! Skill saved to {skill_dir}")
