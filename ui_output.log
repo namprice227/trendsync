@@ -1,4 +1,0 @@
-[dummy-ui] Python: /home/jules/.pyenv/shims/python3
-[dummy-ui] Analysis endpoint: http://127.0.0.1:8000/v1/chat/completions
-[dummy-ui] Director endpoint: http://127.0.0.1:8001/v1/chat/completions
-[dummy-ui] Starting TrendFlow UI on http://127.0.0.1:7860
