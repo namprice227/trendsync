@@ -4,7 +4,12 @@ recorded_shots/
 .storyline/
 .gradio/
 .conda/
+.venv/
 *.pyc
+Miniconda*.sh
+final_trend.mp4
+trip_sessions/
+trip_sessions_sessions.json
 Depth-Anything-V2/
 FireRed-OpenStoryline/
 mobile/node_modules/
