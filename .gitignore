@@ -1,21 +1,49 @@
-__pycache__/
-temp/
-recorded_shots/
-.storyline/
-.gradio/
+# Local environments and secrets
 .conda/
 .venv/
 .env
 .env.*
 !.env.example
-*.pyc
 Miniconda*.sh
-final_trend.mp4
-trip_sessions/
-trip_sessions_sessions.json
-Depth-Anything-V2/
-FireRed-OpenStoryline/
+Miniconda3-latest-Linux-x86_64.sh
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Frontend dependencies and generated Expo output
 mobile/node_modules/
 mobile/.expo/
-Miniconda3-latest-Linux-x86_64.sh
-*.sh
+mobile/.expo-shared/
+mobile/dist/
+mobile/web-build/
+
+# Runtime media, sessions, and local databases
+temp/
+recorded_shots/
+trip_sessions/
+trip_sessions_sessions.json
+trip_sessions.sqlite3
+*.sqlite
+*.sqlite3
+*.db
+final_trend.mp4
+
+# Local tool state and large external model repos
+.storyline/
+.gradio/
+Depth-Anything-V2/
+FireRed-OpenStoryline/
+
+# OS/editor/log noise
+.DS_Store
+Thumbs.db
+*.log

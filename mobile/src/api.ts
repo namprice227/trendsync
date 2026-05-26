@@ -1,4 +1,4 @@
-import type { TripContext, TripSession } from './types';
+import type { ProjectSummary, RenderOptions, TripContext, TripSession } from './types';
 
 export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '');
@@ -32,6 +32,12 @@ export function mediaUrl(baseUrl: string, path?: string | null): string | null {
 export async function createSession(baseUrl: string): Promise<TripSession> {
   const response = await fetch(joinUrl(baseUrl, '/sessions'), { method: 'POST' });
   return readJson<TripSession>(response);
+}
+
+export async function listSessions(baseUrl: string): Promise<ProjectSummary[]> {
+  const response = await fetch(joinUrl(baseUrl, '/sessions'));
+  const data = await readJson<{ sessions: ProjectSummary[] }>(response);
+  return data.sessions;
 }
 
 export async function getSession(baseUrl: string, sessionId: string): Promise<TripSession> {
@@ -83,7 +89,16 @@ export async function generateStory(baseUrl: string, sessionId: string): Promise
   return readJson<TripSession>(response);
 }
 
-export async function renderTripVideo(baseUrl: string, sessionId: string): Promise<TripSession> {
-  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/render`), { method: 'POST' });
+export async function renderTripVideo(baseUrl: string, sessionId: string, options?: RenderOptions): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/render`), {
+    method: 'POST',
+    headers: options ? { 'Content-Type': 'application/json' } : undefined,
+    body: options ? JSON.stringify(options) : undefined,
+  });
   return readJson<TripSession>(response);
+}
+
+export async function shareSession(baseUrl: string, sessionId: string): Promise<{ share_token: string; share_url: string; session: TripSession }> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/share`), { method: 'POST' });
+  return readJson<{ share_token: string; share_url: string; session: TripSession }>(response);
 }

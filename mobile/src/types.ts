@@ -25,12 +25,48 @@ export type TripContext = {
   llm_model: string;
 };
 
+export type ClipAnalysis = {
+  filename: string;
+  status?: string;
+  duration_seconds?: number;
+  width?: number;
+  height?: number;
+  scene_count?: number;
+  face_count?: number;
+  quality_label?: string;
+  has_audio?: boolean;
+  speech_detected?: boolean;
+  mean_volume_db?: number | null;
+  best_moment_timestamps?: number[];
+  landmark_candidate_timestamps?: number[];
+  named_landmarks?: Array<{
+    name: string;
+    timestamp: number;
+    confidence: number;
+    source: string;
+  }>;
+  semantic_source?: string;
+  semantic_summary?: string;
+  visible_subjects?: string[];
+  locations_or_scenes?: string[];
+  visible_actions?: string[];
+  visual_mood?: string;
+  avoid_reasons?: string[];
+  best_moment_descriptions?: Array<{
+    timestamp: number;
+    description: string;
+  }>;
+  transcript?: string | null;
+  summary?: string;
+};
+
 export type MediaItem = {
   id: string;
   filename: string;
   kind: string;
   url: string;
   size_bytes: number;
+  analysis?: ClipAnalysis;
 };
 
 export type StoryPlan = {
@@ -39,12 +75,59 @@ export type StoryPlan = {
   tone?: string;
   narrative_arc?: string[];
   voiceover_script?: string;
+  voiceover_segments?: Array<{
+    clip_id?: string;
+    clip?: string;
+    start_time?: number;
+    duration?: number;
+    voiceover?: string;
+    caption?: string;
+    purpose?: string;
+  }>;
   edit_notes?: string[];
   clip_plan?: Array<{
+    clip_id?: string;
     clip?: string;
     role?: string;
     suggested_use?: string;
   }>;
+  edit_decisions?: Array<{
+    clip_id?: string;
+    clip?: string;
+    start_time?: number;
+    duration?: number;
+    role?: string;
+    reason?: string;
+    transition?: string;
+    caption?: string;
+    audio_strategy?: string;
+  }>;
+  generation?: {
+    llm_used?: boolean;
+    llm_provider?: string;
+    llm_model?: string;
+    llm_configured?: boolean;
+    fallback_reason?: string | null;
+  };
+};
+
+export type RenderOptions = {
+  aspect_ratio: string;
+  clip_order: string[];
+  favorite_clip_ids: string[];
+  burn_captions: boolean;
+  include_title_card: boolean;
+  include_music_bed: boolean;
+};
+
+export type ProjectSummary = {
+  id: string;
+  destination: string;
+  phase: TripPhase;
+  updated_at: number;
+  media_count: number;
+  final_video_url?: string | null;
+  share_token?: string | null;
 };
 
 export type TripSession = {
@@ -56,13 +139,21 @@ export type TripSession = {
   updated_at: number;
   error?: string | null;
   progress_label: string;
+  progress_percent: number;
+  events: Array<{ at: number; level: string; label: string }>;
   trip_context: TripContext;
   media_items: MediaItem[];
   recorded_clips: string[];
+  clip_analysis: ClipAnalysis[];
   story_plan?: StoryPlan | null;
   script?: string | null;
   final_video_url?: string | null;
+  voiceover_audio_url?: string | null;
   story_json_url?: string | null;
+  edit_decisions_url?: string | null;
+  caption_srt_url?: string | null;
+  caption_vtt_url?: string | null;
+  render_options: RenderOptions;
   llm_provider: string;
   llm_model: string;
 };

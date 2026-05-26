@@ -53,22 +53,60 @@ Use a local `.env` file from the repository root:
 cp .env.example .env
 ```
 
-Edit `.env`, set `TRIPSTORY_LLM_PROVIDER` to `openai`, `gemini`, or `deepseek`, and fill in the matching key. The API loads `.env` on startup. The frontend only selects the provider/model; it does not receive or submit provider API keys.
+Edit `.env`, set `TRIPSTORY_LLM_PROVIDER=deepseek`, fill in `DEEPSEEK_API_KEY`, and fill in `GEMINI_API_KEY` for video-frame understanding. The API loads `.env` on startup. The frontend only selects the provider/model; it does not receive or submit provider API keys.
+
+When story generation succeeds with the configured backend provider, the Plan screen shows `Story brain` as the provider name. If it shows `FALLBACK`, check the warning text on that screen and your `.env` key/provider settings.
+
+LLM calls are serialized server-side to reduce `429 Too Many Requests` errors. You can slow them down further:
+
+```bash
+TRIPSTORY_LLM_MIN_INTERVAL_SECONDS=5
+TRIPSTORY_LLM_MAX_RETRIES=3
+```
 
 Default provider models:
 
 - OpenAI: `gpt-4o-mini`
 - Gemini: `gemini-2.0-flash`
-- DeepSeek: `deepseek-chat`
+- DeepSeek: `deepseek-v4-pro`
 
 You can also configure keys through exported environment variables:
 
 ```bash
-export TRIPSTORY_LLM_PROVIDER="openai"   # openai, gemini, deepseek, local, or custom
-export OPENAI_API_KEY="your-openai-key"
+export TRIPSTORY_LLM_PROVIDER="deepseek"   # openai, gemini, deepseek, local, or custom
+export DEEPSEEK_API_KEY="your-deepseek-key"
+export TRIPSTORY_DEEPSEEK_MODEL="deepseek-v4-pro"
+export TRIPSTORY_DEEPSEEK_THINKING="enabled"
+export TRIPSTORY_DEEPSEEK_REASONING_EFFORT="high"
+export GEMINI_API_KEY="your-gemini-key"
+export TRIPSTORY_VISION_PROVIDER="gemini"
+export TRIPSTORY_ENABLE_VISION_ANALYSIS=1
 ```
 
 Use `GEMINI_API_KEY` for Gemini and `DEEPSEEK_API_KEY` for DeepSeek. Optional model overrides are `TRIPSTORY_OPENAI_MODEL`, `TRIPSTORY_GEMINI_MODEL`, and `TRIPSTORY_DEEPSEEK_MODEL`.
+
+Frame analysis uses Gemini by default when `GEMINI_API_KEY` is present:
+
+```bash
+TRIPSTORY_VISION_PROVIDER=gemini
+TRIPSTORY_VISION_MODEL=gemini-2.0-flash
+TRIPSTORY_VISION_MAX_FRAMES=3
+TRIPSTORY_VISION_MIN_INTERVAL_SECONDS=5
+```
+
+Narration uses server-side OpenAI TTS when `OPENAI_API_KEY` is configured:
+
+```bash
+TRIPSTORY_TTS_PROVIDER=openai
+TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts
+TRIPSTORY_TTS_VOICE=coral
+```
+
+Clip speech transcription is optional and off by default because it sends extracted audio to OpenAI:
+
+```bash
+TRIPSTORY_ENABLE_TRANSCRIPTION=1
+```
 
 To use any other OpenAI-compatible chat completions endpoint:
 
@@ -155,13 +193,15 @@ npm run typecheck
 2. Start the mobile/web app.
 3. Upload at least one video clip.
 4. Save trip context.
-5. Generate a narrative plan.
-6. Render the holiday recap video.
-7. Preview the video and use the generated voiceover script for manual narration or a future TTS step.
+5. Generate a narrative plan with smart edit decisions.
+6. Choose timeline favorites/order and export ratio.
+7. Render the holiday recap video.
+8. Preview the video. If TTS is configured, generated narration is mixed into the render.
 
 ## 8. Known MVP Limits
 
-- The generated voiceover is text only; speech synthesis and audio mixing are not implemented yet.
-- The renderer stitches clips in upload order; it does not yet trim clips to the generated story plan.
-- Sessions persist to JSON, but there is no user account system or multi-user permission model.
+- Auth is token/header based for local MVP use, not a full identity provider.
+- Background work still uses FastAPI background tasks, not a durable distributed queue.
+- Clip intelligence is local and heuristic. It names likely landmarks from trip context and scenic frames, but it does not yet run a true landmark-recognition model.
+- Sessions persist to SQLite with JSON backup compatibility, but there is no full account system or production role model.
 - Long-running generation/rendering uses FastAPI background tasks, not a production queue.

@@ -21,17 +21,28 @@ import {
   createSession,
   generateStory,
   getSession,
+  listSessions,
   mediaUrl,
   normalizeBaseUrl,
   renderTripVideo,
   saveTripContext,
+  shareSession,
   uploadMedia,
 } from './src/api';
 import { colors, radii, shadow } from './src/theme';
-import type { TripContext, TripPhase, TripScreen, TripSession } from './src/types';
+import type { ClipAnalysis, ProjectSummary, RenderOptions, TripContext, TripPhase, TripScreen, TripSession } from './src/types';
 
 const DEFAULT_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8010' : 'http://localhost:8010';
 const busyPhases: TripPhase[] = ['uploading', 'planning', 'rendering'];
+const planningPhases: TripPhase[] = ['planning', 'rendering'];
+const defaultRenderOptions: RenderOptions = {
+  aspect_ratio: 'original',
+  clip_order: [],
+  favorite_clip_ids: [],
+  burn_captions: false,
+  include_title_card: true,
+  include_music_bed: false,
+};
 
 const LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -175,6 +186,11 @@ function StatusStrip({ session }: { session: TripSession }) {
       <View style={styles.statusCopy}>
         <Text style={styles.statusLabel}>{session.progress_label}</Text>
         <Text style={styles.statusAction}>{session.error || session.next_action}</Text>
+        {session.progress_percent ? (
+          <View style={styles.progressTrack}>
+            <View style={[styles.progressFill, { width: `${Math.min(100, Math.max(0, session.progress_percent))}%` }]} />
+          </View>
+        ) : null}
       </View>
     </View>
   );
@@ -186,6 +202,7 @@ function AppShell({
   apiDraft,
   setApiDraft,
   onReconnect,
+  onRestart,
   children,
 }: {
   session: TripSession | null;
@@ -193,6 +210,7 @@ function AppShell({
   apiDraft: string;
   setApiDraft: (value: string) => void;
   onReconnect: () => void;
+  onRestart: () => void;
   children: React.ReactNode;
 }) {
   const { width } = useWindowDimensions();
@@ -227,6 +245,10 @@ function AppShell({
               <Ionicons name="sync" size={16} color={colors.blue} />
             </Pressable>
           </View>
+          <Pressable onPress={onRestart} style={styles.restartButton}>
+            <Ionicons name="add-circle-outline" size={17} color={colors.white} />
+            <Text style={styles.restartText}>New project</Text>
+          </Pressable>
         </View>
         <View style={styles.shellChrome}>
           {session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
@@ -308,16 +330,103 @@ function ProviderPicker({ value, onChange }: { value: string; onChange: (value: 
   );
 }
 
+function formatTimestamp(value: number): string {
+  const minutes = Math.floor(value / 60);
+  const seconds = Math.floor(value % 60);
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+function ClipIntelligence({ clips }: { clips: ClipAnalysis[] }) {
+  if (!clips.length) return null;
+  return (
+    <View style={styles.insightPanel}>
+      <Text style={styles.sectionTitle}>Clip intelligence</Text>
+      {clips.map((clip, index) => (
+        <View key={`${clip.filename}-${index}`} style={styles.insightItem}>
+          <View style={styles.insightHead}>
+            <Text style={styles.insightTitle}>{clip.filename}</Text>
+            <Text style={styles.insightBadge}>{clip.quality_label || 'unknown'}</Text>
+          </View>
+          <Text style={styles.listItem}>{clip.summary || 'Analysis unavailable.'}</Text>
+          {clip.semantic_summary ? <Text style={styles.listItem}>Seen in clip: {clip.semantic_summary}</Text> : null}
+          {clip.locations_or_scenes?.length ? (
+            <Text style={styles.listItem}>Scenes: {clip.locations_or_scenes.join(', ')}</Text>
+          ) : null}
+          {clip.visible_subjects?.length ? (
+            <Text style={styles.listItem}>Subjects: {clip.visible_subjects.join(', ')}</Text>
+          ) : null}
+          {clip.best_moment_descriptions?.length ? (
+            <Text style={styles.listItem}>
+              Smart moments: {clip.best_moment_descriptions.map((moment) => `${formatTimestamp(moment.timestamp)} ${moment.description}`).join(' · ')}
+            </Text>
+          ) : null}
+          {clip.best_moment_timestamps?.length ? (
+            <Text style={styles.listItem}>Best moments: {clip.best_moment_timestamps.map(formatTimestamp).join(', ')}</Text>
+          ) : null}
+          {clip.landmark_candidate_timestamps?.length ? (
+            <Text style={styles.listItem}>Scenic candidates: {clip.landmark_candidate_timestamps.map(formatTimestamp).join(', ')}</Text>
+          ) : null}
+          {clip.named_landmarks?.length ? (
+            <Text style={styles.listItem}>Named places: {clip.named_landmarks.map((landmark) => landmark.name).join(', ')}</Text>
+          ) : null}
+          {clip.transcript ? <Text style={styles.listItem}>Speech: {clip.transcript}</Text> : null}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function ProjectLibrary({
+  projects,
+  activeId,
+  onOpen,
+  onNew,
+}: {
+  projects: ProjectSummary[];
+  activeId: string;
+  onOpen: (sessionId: string) => void;
+  onNew: () => void;
+}) {
+  return (
+    <View style={styles.insightPanel}>
+      <View style={styles.insightHead}>
+        <Text style={styles.sectionTitle}>Projects</Text>
+        <Pressable onPress={onNew} style={styles.iconButton}>
+          <Ionicons name="add" size={17} color={colors.blue} />
+        </Pressable>
+      </View>
+      {projects.slice(0, 5).map((project) => {
+        const active = project.id === activeId;
+        return (
+          <Pressable key={project.id} onPress={() => onOpen(project.id)} style={[styles.projectRow, active && styles.projectRowActive]}>
+            <View style={styles.projectRowCopy}>
+              <Text style={styles.insightTitle}>{project.destination}</Text>
+              <Text style={styles.projectMeta}>{project.media_count} clips · {project.phase.replaceAll('_', ' ')}</Text>
+            </View>
+            {active ? <Ionicons name="checkmark" size={16} color={colors.blue} /> : null}
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 function ContextScreen({
   session,
+  projects,
   onSave,
   onUpload,
   onGenerate,
+  onOpenProject,
+  onNewProject,
 }: {
   session: TripSession;
+  projects: ProjectSummary[];
   onSave: (context: TripContext) => void;
   onUpload: () => void;
   onGenerate: (context: TripContext) => void;
+  onOpenProject: (sessionId: string) => void;
+  onNewProject: () => void;
 }) {
   const { width } = useWindowDimensions();
   const [context, setContext] = useState<TripContext>(session.trip_context);
@@ -337,6 +446,7 @@ function ContextScreen({
     <ScrollView contentContainerStyle={styles.screen}>
       <View style={[styles.contextLayout, desktop && styles.contextLayoutDesktop]}>
         <View style={[styles.studioPanel, desktop && styles.studioPanelDesktop]}>
+          <ProjectLibrary projects={projects} activeId={session.id} onOpen={onOpenProject} onNew={onNewProject} />
           <View style={styles.heroPanel}>
             <Text style={styles.eyebrow}>Trip brief</Text>
             <Text style={styles.heroTitle}>Shape a recap people will actually want to watch.</Text>
@@ -357,6 +467,8 @@ function ContextScreen({
             <Text style={styles.uploadTitle}>Add trip videos</Text>
             <Text style={styles.uploadCopy}>Select one or more clips. The renderer stitches uploaded video in order for this MVP.</Text>
           </Pressable>
+
+          <ClipIntelligence clips={session.clip_analysis || []} />
 
           <View style={styles.heroActions}>
             <PrimaryButton icon="save-outline" label="Save context" onPress={() => onSave(context)} tone="light" />
@@ -413,10 +525,44 @@ function PlanScreen({
 }: {
   session: TripSession;
   onGenerate: () => void;
-  onRender: () => void;
+  onRender: (options: RenderOptions) => void;
 }) {
   const plan = session.story_plan;
   const busy = session.phase === 'planning' || session.phase === 'rendering';
+  const generation = plan?.generation;
+  const narrativeArc = Array.isArray(plan?.narrative_arc) ? plan.narrative_arc : [];
+  const editNotes = Array.isArray(plan?.edit_notes) ? plan.edit_notes : [];
+  const editDecisions = Array.isArray(plan?.edit_decisions) ? plan.edit_decisions : [];
+  const voiceoverSegments = Array.isArray(plan?.voiceover_segments) ? plan.voiceover_segments : [];
+  const [options, setOptions] = useState<RenderOptions>({ ...defaultRenderOptions, ...(session.render_options || {}) });
+
+  useEffect(() => {
+    setOptions({ ...defaultRenderOptions, ...(session.render_options || {}) });
+  }, [session.id]);
+
+  const toggleFavorite = (clipId: string) => {
+    setOptions((current) => {
+      const currentFavorites = new Set(current.favorite_clip_ids || []);
+      if (currentFavorites.has(clipId)) {
+        currentFavorites.delete(clipId);
+      } else {
+        currentFavorites.add(clipId);
+      }
+      return { ...current, favorite_clip_ids: Array.from(currentFavorites) };
+    });
+  };
+
+  const moveClip = (clipId: string, direction: -1 | 1) => {
+    setOptions((current) => {
+      const base = current.clip_order.length ? [...current.clip_order] : session.media_items.map((item) => item.id);
+      const index = base.indexOf(clipId);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= base.length) return current;
+      const next = [...base];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return { ...current, clip_order: next };
+    });
+  };
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
@@ -426,8 +572,26 @@ function PlanScreen({
             <Text style={styles.title}>{plan?.title || 'Narrative plan'}</Text>
             <Text style={styles.muted}>{plan?.tone ? `${plan.tone} tone` : 'Generate a voiceover and edit structure from your trip brief.'}</Text>
           </View>
-          {plan?.language ? <MetricPill icon="language-outline" label="Language" value={plan.language.toUpperCase()} /> : null}
+          {plan?.language ? <MetricPill icon="language-outline" label="Language" value={String(plan.language).toUpperCase()} /> : null}
+          {generation ? (
+            <MetricPill
+              icon={generation.llm_used ? 'sparkles-outline' : 'alert-circle-outline'}
+              label="Story brain"
+              value={generation.llm_used ? `${generation.llm_provider || 'LLM'}`.toUpperCase() : 'FALLBACK'}
+            />
+          ) : null}
         </View>
+        {generation && !generation.llm_used ? (
+          <View style={styles.statusStrip}>
+            <View style={styles.statusIcon}>
+              <Ionicons name="warning-outline" size={16} color={colors.red} />
+            </View>
+            <View style={styles.statusCopy}>
+              <Text style={styles.statusLabel}>LLM was not used</Text>
+              <Text style={styles.statusAction}>{generation.fallback_reason || 'Check backend .env provider settings.'}</Text>
+            </View>
+          </View>
+        ) : null}
         {busy && session.phase === 'planning' ? (
           <View style={styles.waitPanel}>
             <ActivityIndicator color={colors.blue} />
@@ -437,37 +601,106 @@ function PlanScreen({
         {plan?.voiceover_script ? (
           <>
             <Text style={styles.sectionTitle}>Voiceover</Text>
-            <Text style={styles.script}>{plan.voiceover_script}</Text>
+            <Text style={styles.script}>{String(plan.voiceover_script)}</Text>
           </>
         ) : (
           <Text style={styles.muted}>Generate a narrative plan to see the voiceover script.</Text>
         )}
       </View>
 
-      {plan?.narrative_arc?.length ? (
+      {narrativeArc.length ? (
         <View style={styles.panel}>
           <Text style={styles.sectionTitle}>Narrative arc</Text>
-          {plan.narrative_arc.map((item, index) => (
+          {narrativeArc.map((item, index) => (
             <View key={`${item}-${index}`} style={styles.timelineItem}>
               <Text style={styles.timelineNumber}>{index + 1}</Text>
-              <Text style={styles.timelineText}>{item}</Text>
+              <Text style={styles.timelineText}>{String(item)}</Text>
             </View>
           ))}
         </View>
       ) : null}
 
-      {plan?.edit_notes?.length ? (
+      {editNotes.length ? (
         <View style={styles.panel}>
           <Text style={styles.sectionTitle}>Edit notes</Text>
-          {plan.edit_notes.map((item, index) => (
-            <Text key={`${item}-${index}`} style={styles.listItem}>• {item}</Text>
+          {editNotes.map((item, index) => (
+            <Text key={`${item}-${index}`} style={styles.listItem}>• {String(item)}</Text>
           ))}
         </View>
       ) : null}
 
+      {editDecisions.length ? (
+        <View style={styles.panel}>
+          <Text style={styles.sectionTitle}>Smart edit decisions</Text>
+          {editDecisions.map((decision, index) => (
+            <View key={`${decision.clip || 'clip'}-${index}`} style={styles.timelineControl}>
+              <Text style={styles.timelineNumber}>{index + 1}</Text>
+              <View style={styles.projectRowCopy}>
+                <Text style={styles.insightTitle}>{decision.clip || decision.clip_id || 'Selected clip'}</Text>
+                <Text style={styles.projectMeta}>
+                  {formatTimestamp(decision.start_time || 0)} · {Math.round(decision.duration || 0)}s · {decision.transition || 'cut'}
+                </Text>
+                <Text style={styles.listItem}>{decision.reason || decision.role || 'Selected by the smart edit planner.'}</Text>
+                {voiceoverSegments[index]?.voiceover ? (
+                  <Text style={styles.listItem}>Voiceover: {voiceoverSegments[index].voiceover}</Text>
+                ) : null}
+              </View>
+            </View>
+          ))}
+        </View>
+      ) : null}
+
+      <View style={styles.panel}>
+        <Text style={styles.sectionTitle}>Timeline and export</Text>
+        <View style={styles.chipRow}>
+          {['original', 'portrait', 'landscape', 'square'].map((ratio) => {
+            const active = options.aspect_ratio === ratio;
+            return (
+              <Pressable key={ratio} onPress={() => setOptions((current) => ({ ...current, aspect_ratio: ratio }))} style={[styles.chip, active && styles.chipActive]}>
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{ratio}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <Pressable
+          onPress={() => setOptions((current) => ({ ...current, include_title_card: !current.include_title_card }))}
+          style={styles.toggleRow}
+        >
+          <Ionicons name={options.include_title_card ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
+          <Text style={styles.listItem}>Opening title/date card</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setOptions((current) => ({ ...current, burn_captions: !current.burn_captions }))}
+          style={styles.toggleRow}
+        >
+          <Ionicons name={options.burn_captions ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
+          <Text style={styles.listItem}>Generate subtitle files</Text>
+        </Pressable>
+        {session.media_items.map((item, index) => {
+          const favorite = options.favorite_clip_ids.includes(item.id);
+          return (
+            <View key={item.id} style={styles.timelineControl}>
+              <Pressable onPress={() => toggleFavorite(item.id)} style={styles.iconButton}>
+                <Ionicons name={favorite ? 'star' : 'star-outline'} size={17} color={favorite ? colors.blue : colors.muted} />
+              </Pressable>
+              <View style={styles.projectRowCopy}>
+                <Text style={styles.insightTitle}>{item.filename}</Text>
+                <Text style={styles.projectMeta}>{item.analysis?.summary || `Clip ${index + 1}`}</Text>
+              </View>
+              <Pressable onPress={() => moveClip(item.id, -1)} style={styles.iconButton}>
+                <Ionicons name="arrow-up" size={16} color={colors.graphite} />
+              </Pressable>
+              <Pressable onPress={() => moveClip(item.id, 1)} style={styles.iconButton}>
+                <Ionicons name="arrow-down" size={16} color={colors.graphite} />
+              </Pressable>
+            </View>
+          );
+        })}
+      </View>
+
       <View style={styles.actionRow}>
         <PrimaryButton icon="refresh-outline" label="Regenerate" onPress={onGenerate} disabled={busy || session.media_items.length === 0} tone="light" />
-        <PrimaryButton icon="film-outline" label="Render video" onPress={onRender} disabled={busy || !plan || session.recorded_clips.length === 0} />
+        <PrimaryButton icon="film-outline" label="Render video" onPress={() => onRender(options)} disabled={busy || !plan || session.recorded_clips.length === 0} />
       </View>
     </ScrollView>
   );
@@ -481,8 +714,20 @@ function OutputVideo({ source }: { source: string }) {
   return <VideoView player={player} style={styles.video} allowsFullscreen contentFit="contain" />;
 }
 
-function OutputScreen({ apiUrl, session, onRender }: { apiUrl: string; session: TripSession; onRender: () => void }) {
+function OutputScreen({
+  apiUrl,
+  session,
+  onRender,
+  onShare,
+}: {
+  apiUrl: string;
+  session: TripSession;
+  onRender: (options: RenderOptions) => void;
+  onShare: () => void;
+}) {
   const finalUrl = mediaUrl(apiUrl, session.final_video_url);
+  const voiceoverUrl = mediaUrl(apiUrl, session.voiceover_audio_url);
+  const captionUrl = mediaUrl(apiUrl, session.caption_vtt_url || session.caption_srt_url);
   const waiting = session.phase === 'rendering';
 
   return (
@@ -491,7 +736,7 @@ function OutputScreen({ apiUrl, session, onRender }: { apiUrl: string; session: 
         <View style={styles.panelHeading}>
           <View>
             <Text style={styles.title}>Holiday recap</Text>
-            <Text style={styles.muted}>Preview the rendered stitch and reuse the script for narration.</Text>
+            <Text style={styles.muted}>Preview the rendered stitch with AI-generated narration when TTS is configured.</Text>
           </View>
         </View>
         {waiting ? (
@@ -501,7 +746,13 @@ function OutputScreen({ apiUrl, session, onRender }: { apiUrl: string; session: 
           </View>
         ) : null}
         {finalUrl ? <OutputVideo source={finalUrl} /> : <Text style={styles.muted}>Render the video after generating a story plan.</Text>}
-        <PrimaryButton icon="film-outline" label="Render again" onPress={onRender} disabled={waiting || !session.story_plan} tone="light" />
+        {voiceoverUrl ? <Text style={styles.muted}>AI-generated voiceover audio is mixed into this render.</Text> : null}
+        {session.edit_decisions_url ? <Text style={styles.muted}>Smart edit decision JSON saved with the render.</Text> : null}
+        {captionUrl ? <Text style={styles.muted}>Subtitle file saved with the render.</Text> : null}
+        <View style={styles.actionRow}>
+          <PrimaryButton icon="film-outline" label="Render again" onPress={() => onRender(session.render_options || defaultRenderOptions)} disabled={waiting || !session.story_plan} tone="light" />
+          <PrimaryButton icon="share-outline" label="Share project" onPress={onShare} disabled={waiting} tone="light" />
+        </View>
       </View>
 
       {session.script ? (
@@ -518,20 +769,34 @@ export default function App() {
   const [apiDraft, setApiDraft] = useState(DEFAULT_API_URL);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [session, setSession] = useState<TripSession | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  const refreshProjects = useCallback(async (baseUrl: string) => {
+    const items = await listSessions(baseUrl);
+    setProjects(items);
+    return items;
+  }, []);
 
   const connect = useCallback(async () => {
     const nextUrl = normalizeBaseUrl(apiDraft);
     try {
       setError(null);
       setApiUrl(nextUrl);
-      const created = await createSession(nextUrl);
-      setSession(created);
+      const existing = await refreshProjects(nextUrl);
+      if (existing.length) {
+        const opened = await getSession(nextUrl, existing[0].id);
+        setSession(opened);
+      } else {
+        const created = await createSession(nextUrl);
+        setSession(created);
+        await refreshProjects(nextUrl);
+      }
     } catch (connectError) {
       setSession(null);
       setError(connectError instanceof Error ? connectError.message : 'Could not reach TripStory API');
     }
-  }, [apiDraft]);
+  }, [apiDraft, refreshProjects]);
 
   useEffect(() => {
     connect();
@@ -544,12 +809,39 @@ export default function App() {
       try {
         const updated = await getSession(apiUrl, session.id);
         setSession(updated);
+        if (!busyPhases.includes(updated.phase)) {
+          refreshProjects(apiUrl).catch(() => undefined);
+        }
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : 'Lost server connection');
       }
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [apiUrl, session?.id, session?.phase]);
+  }, [apiUrl, refreshProjects, session?.id, session?.phase]);
+
+  const onOpenProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const opened = await getSession(apiUrl, sessionId);
+        setSession(opened);
+      } catch (openError) {
+        setError(openError instanceof Error ? openError.message : 'Could not open project');
+      }
+    },
+    [apiUrl]
+  );
+
+  const onNewProject = useCallback(async () => {
+    try {
+      setError(null);
+      const created = await createSession(apiUrl);
+      setSession(created);
+      await refreshProjects(apiUrl);
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : 'Could not create project');
+    }
+  }, [apiUrl, refreshProjects]);
 
   const onSaveContext = useCallback(
     async (context: TripContext) => {
@@ -558,11 +850,12 @@ export default function App() {
         setError(null);
         const updated = await saveTripContext(apiUrl, session.id, context);
         setSession(updated);
+        await refreshProjects(apiUrl);
       } catch (saveError) {
         setError(saveError instanceof Error ? saveError.message : 'Could not save context');
       }
     },
-    [apiUrl, session]
+    [apiUrl, refreshProjects, session]
   );
 
   const onUpload = useCallback(async () => {
@@ -577,13 +870,14 @@ export default function App() {
       setError(null);
       const updated = await uploadMedia(apiUrl, session.id, result.assets);
       setSession(updated);
+      await refreshProjects(apiUrl);
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : 'Upload failed');
     }
-  }, [apiUrl, session]);
+  }, [apiUrl, refreshProjects, session]);
 
   const onGenerate = useCallback(async () => {
-    if (!session) return;
+    if (!session || planningPhases.includes(session.phase)) return;
     try {
       setError(null);
       const updated = await generateStory(apiUrl, session.id);
@@ -595,7 +889,7 @@ export default function App() {
 
   const onGenerateFromContext = useCallback(
     async (context: TripContext) => {
-      if (!session) return;
+      if (!session || planningPhases.includes(session.phase)) return;
       try {
         setError(null);
         const saved = await saveTripContext(apiUrl, session.id, context);
@@ -609,16 +903,29 @@ export default function App() {
     [apiUrl, session]
   );
 
-  const onRender = useCallback(async () => {
+  const onRender = useCallback(async (options: RenderOptions) => {
     if (!session) return;
     try {
       setError(null);
-      const updated = await renderTripVideo(apiUrl, session.id);
+      const updated = await renderTripVideo(apiUrl, session.id, options);
       setSession(updated);
     } catch (renderError) {
       setError(renderError instanceof Error ? renderError.message : 'Render failed');
     }
   }, [apiUrl, session]);
+
+  const onShare = useCallback(async () => {
+    if (!session) return;
+    try {
+      setError(null);
+      const shared = await shareSession(apiUrl, session.id);
+      setSession(shared.session);
+      setError(`Share link: ${apiUrl}${shared.share_url}`);
+      await refreshProjects(apiUrl);
+    } catch (shareError) {
+      setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+    }
+  }, [apiUrl, refreshProjects, session]);
 
   const content = useMemo(() => {
     if (!session) {
@@ -636,10 +943,20 @@ export default function App() {
       return <PlanScreen session={session} onGenerate={onGenerate} onRender={onRender} />;
     }
     if (session.screen === 'output') {
-      return <OutputScreen apiUrl={apiUrl} session={session} onRender={onRender} />;
+      return <OutputScreen apiUrl={apiUrl} session={session} onRender={onRender} onShare={onShare} />;
     }
-    return <ContextScreen session={session} onSave={onSaveContext} onUpload={onUpload} onGenerate={onGenerateFromContext} />;
-  }, [apiUrl, connect, error, onGenerate, onGenerateFromContext, onRender, onSaveContext, onUpload, session]);
+    return (
+      <ContextScreen
+        session={session}
+        projects={projects}
+        onSave={onSaveContext}
+        onUpload={onUpload}
+        onGenerate={onGenerateFromContext}
+        onOpenProject={onOpenProject}
+        onNewProject={onNewProject}
+      />
+    );
+  }, [apiUrl, connect, error, onGenerate, onGenerateFromContext, onNewProject, onOpenProject, onRender, onSaveContext, onShare, onUpload, projects, session]);
 
   return (
     <AppShell
@@ -648,6 +965,7 @@ export default function App() {
       apiDraft={apiDraft}
       setApiDraft={setApiDraft}
       onReconnect={connect}
+      onRestart={onNewProject}
     >
       {error && session?.phase !== 'error' ? (
         <View style={styles.inlineError}>
@@ -731,6 +1049,22 @@ const styles = StyleSheet.create({
     height: 42,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  restartButton: {
+    minHeight: 42,
+    borderRadius: radii.md,
+    backgroundColor: colors.blue,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 7,
+    paddingHorizontal: 12,
+  },
+  restartText: {
+    color: colors.white,
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '900',
   },
   shellChrome: {
     paddingHorizontal: 22,
@@ -827,6 +1161,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     fontWeight: '600',
+  },
+  progressTrack: {
+    height: 5,
+    marginTop: 8,
+    borderRadius: 999,
+    overflow: 'hidden',
+    backgroundColor: colors.line,
+  },
+  progressFill: {
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: colors.blue,
   },
   screen: {
     width: '100%',
@@ -1168,6 +1514,92 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     fontWeight: '600',
+  },
+  insightPanel: {
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    padding: 14,
+    gap: 10,
+  },
+  insightItem: {
+    borderTopWidth: 1,
+    borderTopColor: colors.line,
+    paddingTop: 10,
+    gap: 5,
+  },
+  insightHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  insightTitle: {
+    flex: 1,
+    color: colors.ink,
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '900',
+  },
+  insightBadge: {
+    color: colors.blue,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '900',
+  },
+  iconButton: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.white,
+  },
+  projectRow: {
+    minHeight: 52,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.white,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  projectRowActive: {
+    borderColor: colors.blue,
+    backgroundColor: '#edf6f7',
+  },
+  projectRowCopy: {
+    flex: 1,
+  },
+  projectMeta: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '700',
+  },
+  toggleRow: {
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  timelineControl: {
+    minHeight: 58,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.white,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   actionRow: {
     flexDirection: 'row',

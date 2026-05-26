@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import random
+import threading
+import time
 from typing import Any
 
 import requests
@@ -27,11 +30,14 @@ PROVIDER_PRESETS = {
     },
     "deepseek": {
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "api_key_env": "DEEPSEEK_API_KEY",
         "model_env": "TRIPSTORY_DEEPSEEK_MODEL",
     },
 }
+
+_chat_lock = threading.Lock()
+_last_request_at = 0.0
 
 
 class LLMProvider:
@@ -52,7 +58,16 @@ class LLMProvider:
     ) -> None:
         raw_provider = provider or os.environ.get("TRIPSTORY_LLM_PROVIDER")
         if not raw_provider:
-            raw_provider = "custom" if os.environ.get("TRIPSTORY_LLM_URL") else "local"
+            if os.environ.get("TRIPSTORY_LLM_URL"):
+                raw_provider = "custom"
+            elif os.environ.get("DEEPSEEK_API_KEY"):
+                raw_provider = "deepseek"
+            elif os.environ.get("GEMINI_API_KEY"):
+                raw_provider = "gemini"
+            elif os.environ.get("OPENAI_API_KEY"):
+                raw_provider = "openai"
+            else:
+                raw_provider = "local"
         self.provider = raw_provider.strip().lower()
         if self.provider == "openai-compatible":
             self.provider = "custom"
@@ -80,6 +95,18 @@ class LLMProvider:
             or "local-fallback"
         )
         self.timeout = timeout or int(os.environ.get("TRIPSTORY_LLM_TIMEOUT", "45"))
+        self.min_interval = float(os.environ.get("TRIPSTORY_LLM_MIN_INTERVAL_SECONDS", "3"))
+        self.max_retries = int(os.environ.get("TRIPSTORY_LLM_MAX_RETRIES", "2"))
+        self.reasoning_effort = (
+            os.environ.get(f"TRIPSTORY_{self.provider.upper()}_REASONING_EFFORT")
+            or os.environ.get("TRIPSTORY_LLM_REASONING_EFFORT")
+            or ""
+        ).strip()
+        self.thinking_type = (
+            os.environ.get(f"TRIPSTORY_{self.provider.upper()}_THINKING")
+            or os.environ.get("TRIPSTORY_LLM_THINKING")
+            or ""
+        ).strip().lower()
 
     @property
     def configured(self) -> bool:
@@ -107,7 +134,41 @@ class LLMProvider:
             "max_tokens": max_tokens,
             "temperature": 0.7,
         }
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.provider == "deepseek" and self.thinking_type:
+            payload["thinking"] = {"type": self.thinking_type}
+        with _chat_lock:
+            self._wait_for_turn()
+            for attempt in range(self.max_retries + 1):
+                response = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
+                self._mark_request()
+                if response.status_code != 429:
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                if attempt >= self.max_retries:
+                    response.raise_for_status()
+                self._sleep_after_429(response, attempt)
+        return None
+
+    def _wait_for_turn(self) -> None:
+        global _last_request_at
+        elapsed = time.monotonic() - _last_request_at
+        wait_seconds = self.min_interval - elapsed
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _mark_request(self) -> None:
+        global _last_request_at
+        _last_request_at = time.monotonic()
+
+    def _sleep_after_429(self, response: requests.Response, attempt: int) -> None:
+        retry_after = response.headers.get("Retry-After")
+        try:
+            wait_seconds = float(retry_after) if retry_after else 0.0
+        except ValueError:
+            wait_seconds = 0.0
+        if wait_seconds <= 0:
+            wait_seconds = min(30.0, (2 ** attempt) * self.min_interval + random.uniform(0.25, 1.25))
+        time.sleep(wait_seconds)
