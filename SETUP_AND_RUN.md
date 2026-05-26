@@ -1,125 +1,87 @@
-# TrendFlow AMD Server Setup And Run
+# TripStory MVP Setup And Run
 
-This file is only for the AMD GPU server path.
+TripStory is the active MVP in this repository. It provides a FastAPI backend and an Expo mobile/web client for turning uploaded trip clips into a narrated holiday recap plan and a simple stitched video.
 
-For dummy/local testing, use [DUMMY_TEST.md](/home/nam/trendsync/DUMMY_TEST.md).
+The older TrendFlow TikTok analysis and AMD/vLLM modules are still in the repository for reference, but they are not part of the current TripStory mobile/API MVP.
 
-## 1. Clone The Repo
+## 1. Miniconda Environment
 
-```bash
-git clone https://github.com/namprice227/trendsync
-cd trendsync
-```
-
-## 2. Set Up Python On The AMD Server
-
-Use the repo setup script:
+Use the repo-local Conda environment from the repository root:
 
 ```bash
-./setup.sh
-```
-
-That creates the Python 3.12 environment at `.conda/trendsync-py312`, installs `ffmpeg`, installs `requirements.txt`, and verifies MediaPipe pose.
-
-Activate the environment:
-
-```bash
+conda env create -p "$PWD/.conda/trendsync-py312" -f environment.yml
 conda activate "$PWD/.conda/trendsync-py312"
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-If `conda activate` is not initialized in the shell:
+This installs Python 3.12, `ffmpeg`, Node.js, and npm through Conda. The Python application dependencies are installed from `requirements.txt` with pip.
+
+If Conda or pip sees user-site packages from outside the environment, isolate the shell before installing or running commands:
 
 ```bash
-source /home/nam/miniconda3/bin/activate "$PWD/.conda/trendsync-py312"
+export PYTHONNOUSERSITE=1
 ```
 
-## 3. Check ROCm
+If Conda tries to write cache files outside the repository in a restricted shell, redirect its caches into `.conda/`:
 
 ```bash
-rocm-smi
+XDG_CACHE_HOME="$PWD/.conda/cache" \
+CONDA_PKGS_DIRS="$PWD/.conda/pkgs" \
+CONDA_ENVS_PATH="$PWD/.conda/envs" \
+conda env create -p "$PWD/.conda/trendsync-py312" -f environment.yml
 ```
 
-You should see the AMD GPU and VRAM usage before starting vLLM.
+### venv Alternative
 
-## 4. Enter The ROCm Container
-
-This guide assumes your running container is named `rocm`:
+Use Python 3.12. From the repository root:
 
 ```bash
-docker exec -it rocm bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## 5. Download The Qwen Model In The Container
+## 2. Optional LLM Endpoint
+
+TripStory works without an LLM server by using a deterministic local fallback.
+
+To use any OpenAI-compatible chat completions endpoint:
 
 ```bash
-huggingface-cli download Qwen/Qwen3.6-35B-A3B
+export TRIPSTORY_LLM_URL="http://localhost:8000/v1"
+export TRIPSTORY_LLM_MODEL="your-model-name"
+export TRIPSTORY_LLM_API_KEY="optional-key"
 ```
 
-## 6. Start vLLM In The Container
+The client automatically appends `/chat/completions` when the base URL does not include it.
 
-Run this inside the `rocm` container:
+## 3. Storage
 
-```bash
-vllm serve Qwen/Qwen3.6-35B-A3B \
-  --tensor-parallel-size 1 \
-  --gpu-memory-utilization 0.60 \
-  --max-model-len 80072 \
-  --served-model-name trend_model
-```
-
-The `\` must be the last character on each continued line. Do not leave trailing spaces after it.
-
-## 7. Verify vLLM From The Host
-
-Open another shell on the AMD server host:
-
-```bash
-curl http://127.0.0.1:8000/v1/models
-```
-
-## 8. Point TrendFlow At vLLM
-
-In the shell where you run TrendFlow:
-
-```bash
-export TRENDFLOW_VLLM_URL="http://127.0.0.1:8000/v1/chat/completions"
-export TRENDFLOW_ANALYSIS_MODEL="trend_model"
-export TRENDFLOW_EVALUATOR_MODEL="trend_model"
-export TRENDFLOW_SCRIPT_MODEL="trend_model"
-export TRENDFLOW_DIRECTOR_VLLM_URL="$TRENDFLOW_VLLM_URL"
-export TRENDFLOW_DIRECTOR_MODEL="$TRENDFLOW_ANALYSIS_MODEL"
-```
-
-## 9. Run The Gradio Web App On The AMD Server
-
-```bash
-conda activate "$PWD/.conda/trendsync-py312"
-export TRENDFLOW_VLLM_URL="http://127.0.0.1:8000/v1/chat/completions"
-export TRENDFLOW_ANALYSIS_MODEL="trend_model"
-export TRENDFLOW_EVALUATOR_MODEL="trend_model"
-export TRENDFLOW_SCRIPT_MODEL="trend_model"
-export TRENDFLOW_DIRECTOR_VLLM_URL="$TRENDFLOW_VLLM_URL"
-export TRENDFLOW_DIRECTOR_MODEL="$TRENDFLOW_ANALYSIS_MODEL"
-MPLCONFIGDIR=/tmp/mpl python app.py
-```
-
-Default web UI:
+By default, uploaded media is stored in:
 
 ```text
-http://<amd-server-ip>:7860
+trip_sessions/
 ```
 
-## 10. Run The Mobile API On The AMD Server
+Session metadata is stored outside the public static media directory:
+
+```text
+trip_sessions_sessions.json
+```
+
+Override these paths when needed:
 
 ```bash
-conda activate "$PWD/.conda/trendsync-py312"
-export TRENDFLOW_VLLM_URL="http://127.0.0.1:8000/v1/chat/completions"
-export TRENDFLOW_ANALYSIS_MODEL="trend_model"
-export TRENDFLOW_EVALUATOR_MODEL="trend_model"
-export TRENDFLOW_SCRIPT_MODEL="trend_model"
-export TRENDFLOW_DIRECTOR_VLLM_URL="$TRENDFLOW_VLLM_URL"
-export TRENDFLOW_DIRECTOR_MODEL="$TRENDFLOW_ANALYSIS_MODEL"
-MPLCONFIGDIR=/tmp/mpl uvicorn api_server:app --host 0.0.0.0 --port 8010
+export TRIPSTORY_MEDIA_DIR="/path/to/media"
+export TRIPSTORY_SESSION_STORE="/path/to/sessions.json"
+```
+
+## 4. Run The API
+
+```bash
+python -m uvicorn api_server:app --host 0.0.0.0 --port 8010
 ```
 
 Health check:
@@ -128,41 +90,54 @@ Health check:
 curl http://127.0.0.1:8010/health
 ```
 
-Default API:
+Expected response:
 
-```text
-http://<amd-server-ip>:8010
+```json
+{"status":"ok","product":"TripStory"}
 ```
 
-## 11. Ports To Open
-
-```text
-7860  Gradio web UI
-8010  FastAPI mobile API
-8000  vLLM server, usually keep private
-```
-
-If possible, expose `7860` and `8010` only to your own IP or private network. Keep `8000` private.
-
-## 12. If vLLM Fails On Memory
-
-Check usage:
+## 5. Run The Mobile/Web App
 
 ```bash
-rocm-smi
+cd mobile
+npm ci
+npm run web -- --clear --port 8081
 ```
 
-Then lower:
+Default API URLs:
+
+- Web/iOS simulator: `http://localhost:8010`
+- Android emulator: `http://10.0.2.2:8010`
+- Physical device: `http://<your-computer-lan-ip>:8010`
+
+## 6. Verify The MVP
+
+Run the backend smoke test from the repository root:
 
 ```bash
---gpu-memory-utilization 0.55
+python -m unittest discover -s tests
 ```
 
-## 13. Useful Endpoints
+Run the mobile typecheck:
 
-```text
-http://127.0.0.1:8000/v1/models
-http://127.0.0.1:8010/health
-http://<amd-server-ip>:7860
-http://<amd-server-ip>:8010
+```bash
+cd mobile
+npm run typecheck
 ```
+
+## 7. MVP Flow
+
+1. Start the API.
+2. Start the mobile/web app.
+3. Upload at least one video clip.
+4. Save trip context.
+5. Generate a narrative plan.
+6. Render the holiday recap video.
+7. Preview the video and use the generated voiceover script for manual narration or a future TTS step.
+
+## 8. Known MVP Limits
+
+- The generated voiceover is text only; speech synthesis and audio mixing are not implemented yet.
+- The renderer stitches clips in upload order; it does not yet trim clips to the generated story plan.
+- Sessions persist to JSON, but there is no user account system or multi-user permission model.
+- Long-running generation/rendering uses FastAPI background tasks, not a production queue.

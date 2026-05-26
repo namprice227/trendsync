@@ -1,8 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
-import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import * as DocumentPicker from 'expo-document-picker';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -14,35 +13,54 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
 
 import {
   createSession,
+  generateStory,
   getSession,
   mediaUrl,
   normalizeBaseUrl,
-  sendPreflightFrame,
-  startAnalysis,
-  uploadClip,
+  renderTripVideo,
+  saveTripContext,
+  uploadMedia,
 } from './src/api';
 import { colors, radii, shadow } from './src/theme';
-import type { TrendPhase, TrendScreen, TrendSession } from './src/types';
+import type { TripContext, TripPhase, TripScreen, TripSession } from './src/types';
 
 const DEFAULT_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8010' : 'http://localhost:8010';
+const busyPhases: TripPhase[] = ['uploading', 'planning', 'rendering'];
 
-const busyPhases: TrendPhase[] = ['analyzing', 'uploading', 'rendering_ready', 'rendering', 'evaluating'];
-const studioPhases: TrendPhase[] = ['ready_to_film', 'needs_adjustment', 'ready_to_record'];
+const LANGUAGES = [
+  { code: 'en', label: 'English' },
+  { code: 'vi', label: 'Vietnamese' },
+  { code: 'fr', label: 'French' },
+  { code: 'es', label: 'Spanish' },
+  { code: 'ja', label: 'Japanese' },
+  { code: 'ko', label: 'Korean' },
+  { code: 'zh', label: 'Chinese' },
+];
 
-function formatValue(value?: string | string[] | number | null): string {
-  if (Array.isArray(value)) return value.join(', ');
-  if (value === undefined || value === null || value === '') return 'Pending';
-  return String(value);
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const tripContextFields: Array<{
+  key: keyof TripContext;
+  label: string;
+  placeholder: string;
+  multiline?: boolean;
+  wide?: boolean;
+}> = [
+  { key: 'destination', label: 'Destination', placeholder: 'Kyoto, Da Nang, Iceland...' },
+  { key: 'duration', label: 'Trip length', placeholder: '5 days, long weekend, 2 weeks...' },
+  { key: 'travel_dates', label: 'Travel dates', placeholder: 'April 2026, summer break...' },
+  { key: 'companions', label: 'People', placeholder: 'Solo, family, partner, friends...' },
+  { key: 'places_visited', label: 'Places visited', placeholder: 'Old town, beach, mountain pass, night market...', multiline: true, wide: true },
+  { key: 'highlights', label: 'Best moments', placeholder: 'Food, sunset, funny moment, surprise stop...', multiline: true, wide: true },
+  { key: 'mood', label: 'Tone', placeholder: 'Warm, funny, reflective, cinematic...' },
+  { key: 'audience', label: 'Audience', placeholder: 'Friends, family, Instagram, private archive...' },
+  { key: 'notes', label: 'Extra notes', placeholder: 'Anything to avoid, inside jokes, must-use clips...', multiline: true, wide: true },
+  { key: 'llm_model', label: 'Model override', placeholder: 'Optional model name from your provider' },
+];
 
 function PrimaryButton({
   icon,
@@ -75,11 +93,32 @@ function PrimaryButton({
   );
 }
 
-function PhaseRail({ screen, phase }: { screen: TrendScreen; phase: TrendPhase }) {
-  const steps: { key: TrendScreen; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
-    { key: 'analyze', label: 'Analyze', icon: 'link-outline' },
-    { key: 'studio', label: 'Film', icon: 'videocam-outline' },
-    { key: 'output', label: 'Finish', icon: 'checkmark-circle-outline' },
+function MetricPill({
+  icon,
+  label,
+  value,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  label: string;
+  value: string;
+}) {
+  return (
+    <View style={styles.metricPill}>
+      <Ionicons name={icon} size={16} color={colors.blue} />
+      <View style={styles.metricTextWrap}>
+        <Text style={styles.metricValue}>{value}</Text>
+        <Text style={styles.metricLabel}>{label}</Text>
+      </View>
+    </View>
+  );
+}
+
+function PhaseRail({ screen, phase }: { screen: TripScreen; phase: TripPhase }) {
+  const steps: { key: TripScreen; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
+    { key: 'context', label: 'Context', icon: 'chatbubble-ellipses-outline' },
+    { key: 'upload', label: 'Media', icon: 'cloud-upload-outline' },
+    { key: 'plan', label: 'Story', icon: 'sparkles-outline' },
+    { key: 'output', label: 'Video', icon: 'film-outline' },
   ];
   const activeIndex = steps.findIndex((step) => step.key === screen);
 
@@ -101,20 +140,29 @@ function PhaseRail({ screen, phase }: { screen: TrendScreen; phase: TrendPhase }
   );
 }
 
-function StatusStrip({ session }: { session: TrendSession }) {
+function StatusStrip({ session }: { session: TripSession }) {
   const toneStyle =
     session.phase === 'error'
       ? styles.statusError
       : session.phase === 'complete'
         ? styles.statusDone
-        : session.phase === 'needs_adjustment'
-          ? styles.statusWarn
-          : styles.statusInfo;
+        : session.phase === 'ready_to_render'
+          ? styles.statusInfo
+          : styles.statusNeutral;
 
   return (
     <View style={[styles.statusStrip, toneStyle]}>
-      <Text style={styles.statusLabel}>{session.progress_label}</Text>
-      <Text style={styles.statusAction}>{session.error || session.next_action}</Text>
+      <View style={styles.statusIcon}>
+        <Ionicons
+          name={session.phase === 'complete' ? 'checkmark' : session.phase === 'error' ? 'warning-outline' : 'pulse-outline'}
+          size={16}
+          color={session.phase === 'error' ? colors.red : session.phase === 'complete' ? colors.green : colors.blue}
+        />
+      </View>
+      <View style={styles.statusCopy}>
+        <Text style={styles.statusLabel}>{session.progress_label}</Text>
+        <Text style={styles.statusAction}>{session.error || session.next_action}</Text>
+      </View>
     </View>
   );
 }
@@ -127,21 +175,29 @@ function AppShell({
   onReconnect,
   children,
 }: {
-  session: TrendSession | null;
+  session: TripSession | null;
   apiUrl: string;
   apiDraft: string;
   setApiDraft: (value: string) => void;
   onReconnect: () => void;
   children: React.ReactNode;
 }) {
+  const { width } = useWindowDimensions();
+  const compact = width < 760;
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="dark-content" />
       <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.brand}>TrendFlow</Text>
-            <Text style={styles.brandSub}>AI Director</Text>
+        <View style={[styles.header, compact && styles.headerCompact]}>
+          <View style={styles.brandLockup}>
+            <View style={styles.brandMark}>
+              <Ionicons name="film-outline" size={18} color={colors.white} />
+            </View>
+            <View>
+              <Text style={styles.brand}>TripStory</Text>
+              <Text style={styles.brandSub}>Holiday narrative studio</Text>
+            </View>
           </View>
           <View style={styles.serverBox}>
             <TextInput
@@ -159,240 +215,212 @@ function AppShell({
             </Pressable>
           </View>
         </View>
-        {session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
-        {session ? <StatusStrip session={session} /> : null}
+        <View style={styles.shellChrome}>
+          {session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
+          {session ? <StatusStrip session={session} /> : null}
+        </View>
         {children}
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
-function AnalyzeScreen({
-  session,
-  onAnalyze,
+function Field({
+  label,
+  value,
+  onChangeText,
+  placeholder,
+  multiline,
+  wide,
 }: {
-  session: TrendSession;
-  onAnalyze: (url: string) => void;
+  label: string;
+  value: string;
+  onChangeText: (value: string) => void;
+  placeholder: string;
+  multiline?: boolean;
+  wide?: boolean;
 }) {
-  const [url, setUrl] = useState('');
-  const isBusy = session.phase === 'analyzing';
+  return (
+    <View style={[styles.field, wide ? styles.fieldWide : styles.fieldHalf]}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <TextInput
+        value={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor={colors.muted}
+        multiline={multiline}
+        style={[styles.input, multiline && styles.inputTall]}
+      />
+    </View>
+  );
+}
+
+function LanguagePicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <View style={styles.chipRow}>
+      {LANGUAGES.map((language) => {
+        const active = value === language.code;
+        return (
+          <Pressable key={language.code} onPress={() => onChange(language.code)} style={[styles.chip, active && styles.chipActive]}>
+            <Text style={[styles.chipText, active && styles.chipTextActive]}>{language.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function ContextScreen({
+  session,
+  onSave,
+  onUpload,
+  onGenerate,
+}: {
+  session: TripSession;
+  onSave: (context: TripContext) => void;
+  onUpload: () => void;
+  onGenerate: (context: TripContext) => void;
+}) {
+  const { width } = useWindowDimensions();
+  const [context, setContext] = useState<TripContext>(session.trip_context);
+  const hasMedia = session.media_items.length > 0;
+  const canGenerate = hasMedia && context.destination.trim().length > 0 && session.phase !== 'planning';
+  const desktop = width >= 920;
+
+  useEffect(() => {
+    setContext(session.trip_context);
+  }, [session.trip_context]);
+
+  const update = (key: keyof TripContext, value: string) => {
+    setContext((current) => ({ ...current, [key]: value }));
+  };
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
-      <View style={styles.panel}>
-        <Text style={styles.title}>Reference trend</Text>
-        <TextInput
-          value={url}
-          onChangeText={setUrl}
-          editable={!isBusy}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          placeholder="https://www.tiktok.com/@user/video/..."
-          placeholderTextColor={colors.muted}
-          style={styles.urlInput}
-        />
-        <PrimaryButton
-          icon={isBusy ? 'hourglass-outline' : 'sparkles-outline'}
-          label={isBusy ? 'Analyzing' : 'Analyze Trend'}
-          onPress={() => onAnalyze(url)}
-          disabled={isBusy || url.trim().length < 6}
-        />
-      </View>
+      <View style={[styles.contextLayout, desktop && styles.contextLayoutDesktop]}>
+        <View style={[styles.studioPanel, desktop && styles.studioPanelDesktop]}>
+          <View style={styles.heroPanel}>
+            <Text style={styles.eyebrow}>Trip brief</Text>
+            <Text style={styles.heroTitle}>Shape a recap people will actually want to watch.</Text>
+            <Text style={styles.heroCopy}>
+              Add the memory cues, upload the raw clips, then generate a story plan with voiceover and edit notes.
+            </Text>
+          </View>
 
-      {isBusy ? (
-        <View style={styles.waitPanel}>
-          <ActivityIndicator color={colors.blue} />
-          <Text style={styles.waitText}>Extracting beats, cuts, motion, pose, and style.</Text>
+          <View style={styles.metricsGrid}>
+            <MetricPill icon="videocam-outline" label="Uploaded clips" value={`${session.media_items.length}`} />
+            <MetricPill icon="language-outline" label="Voiceover" value={context.language.toUpperCase()} />
+          </View>
+
+          <Pressable onPress={onUpload} style={({ pressed }) => [styles.uploadZone, pressed && styles.uploadZonePressed]}>
+            <View style={styles.uploadIcon}>
+              <Ionicons name="cloud-upload-outline" size={28} color={colors.blue} />
+            </View>
+            <Text style={styles.uploadTitle}>Add trip videos</Text>
+            <Text style={styles.uploadCopy}>Select one or more clips. The renderer stitches uploaded video in order for this MVP.</Text>
+          </Pressable>
+
+          <View style={styles.heroActions}>
+            <PrimaryButton icon="save-outline" label="Save context" onPress={() => onSave(context)} tone="light" />
+            <PrimaryButton icon="sparkles-outline" label="Generate plan" onPress={() => onGenerate(context)} disabled={!canGenerate} />
+          </View>
+          {!hasMedia ? <Text style={styles.muted}>Upload at least one video before generating the story.</Text> : null}
         </View>
-      ) : null}
+
+        <View style={[styles.panel, styles.formPanel]}>
+          <View style={styles.panelHeading}>
+            <View>
+              <Text style={styles.title}>Story inputs</Text>
+              <Text style={styles.muted}>Keep it specific. Names, places, and tiny moments make the generated script feel personal.</Text>
+            </View>
+          </View>
+          <View style={styles.formGrid}>
+            {tripContextFields.map((field) => (
+              <Field
+                key={field.key}
+                label={field.label}
+                value={context[field.key]}
+                onChangeText={(value) => update(field.key, value)}
+                placeholder={field.placeholder}
+                multiline={field.multiline}
+                wide={field.wide}
+              />
+            ))}
+            <View style={styles.fieldWide}>
+              <Text style={styles.fieldLabel}>Voiceover language</Text>
+              <LanguagePicker value={context.language} onChange={(value) => update('language', value)} />
+            </View>
+          </View>
+        </View>
+      </View>
     </ScrollView>
   );
 }
 
-function FieldRow({ label, value }: { label: string; value?: string | string[] | number | null }) {
-  return (
-    <View style={styles.fieldRow}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      <Text style={styles.fieldValue}>{formatValue(value)}</Text>
-    </View>
-  );
-}
-
-function StudioScreen({
-  apiUrl,
+function PlanScreen({
   session,
-  setSession,
-  setError,
+  onGenerate,
+  onRender,
 }: {
-  apiUrl: string;
-  session: TrendSession;
-  setSession: (session: TrendSession) => void;
-  setError: (message: string | null) => void;
+  session: TripSession;
+  onGenerate: () => void;
+  onRender: () => void;
 }) {
-  const cameraRef = useRef<any>(null);
-  const preflightBusyRef = useRef(false);
-  const recordingKeysRef = useRef(new Set<string>());
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
-  const [micPermission, requestMicPermission] = useMicrophonePermissions();
-  const [cameraReady, setCameraReady] = useState(false);
-  const [facing, setFacing] = useState<'front' | 'back'>('front');
-  const [cameraMode, setCameraMode] = useState<'picture' | 'video'>('picture');
-  const [countdown, setCountdown] = useState<number | null>(null);
-  const [recording, setRecording] = useState(false);
-  const [localStatus, setLocalStatus] = useState<string | null>(null);
-
-  const permissionsGranted = Boolean(cameraPermission?.granted && micPermission?.granted);
-  const canGuide = studioPhases.includes(session.phase) && session.phase !== 'ready_to_record';
-
-  const requestPermissions = useCallback(async () => {
-    await requestCameraPermission();
-    await requestMicPermission();
-  }, [requestCameraPermission, requestMicPermission]);
-
-  const runPreflight = useCallback(async () => {
-    if (!cameraRef.current || preflightBusyRef.current || recording || countdown !== null || cameraMode !== 'picture') {
-      return;
-    }
-    preflightBusyRef.current = true;
-    try {
-      setLocalStatus('Checking frame');
-      const picture = await cameraRef.current.takePictureAsync({
-        base64: true,
-        quality: 0.36,
-        skipProcessing: true,
-      });
-      if (picture?.base64) {
-        const updated = await sendPreflightFrame(apiUrl, session.id, picture.base64);
-        setSession(updated);
-      }
-    } catch (error) {
-      setError(error instanceof Error ? error.message : 'Pre-flight failed');
-    } finally {
-      preflightBusyRef.current = false;
-      setLocalStatus(null);
-    }
-  }, [apiUrl, cameraMode, countdown, recording, session.id, setError, setSession]);
-
-  const startAutoRecord = useCallback(async () => {
-    const key = `${session.id}:${session.current_shot_idx}`;
-    if (recordingKeysRef.current.has(key) || !cameraRef.current) return;
-    recordingKeysRef.current.add(key);
-    try {
-      setCameraMode('video');
-      await delay(450);
-      for (let value = 3; value > 0; value -= 1) {
-        setCountdown(value);
-        await delay(850);
-      }
-      setCountdown(null);
-      setRecording(true);
-      setLocalStatus(`Recording shot ${session.current_shot_idx + 1}`);
-      const result = await cameraRef.current.recordAsync({
-        maxDuration: Math.max(1, Math.ceil(session.current_shot_duration)),
-      });
-      if (!result?.uri) {
-        throw new Error('Camera did not return a recorded clip.');
-      }
-      setLocalStatus('Uploading clip');
-      const updated = await uploadClip(apiUrl, session.id, result.uri, { fullTake: false });
-      setSession(updated);
-    } catch (error) {
-      recordingKeysRef.current.delete(key);
-      setError(error instanceof Error ? error.message : 'Recording failed');
-    } finally {
-      setRecording(false);
-      setCountdown(null);
-      setCameraMode('picture');
-      setLocalStatus(null);
-    }
-  }, [apiUrl, session.current_shot_duration, session.current_shot_idx, session.id, setError, setSession]);
-
-  const pickFullTake = useCallback(async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      type: 'video/*',
-      copyToCacheDirectory: true,
-      multiple: false,
-    });
-    if (result.canceled || !result.assets?.[0]) return;
-    try {
-      setLocalStatus('Uploading full take');
-      const updated = await uploadClip(apiUrl, session.id, result.assets[0].uri, { fullTake: true });
-      setSession(updated);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : 'Upload failed');
-    } finally {
-      setLocalStatus(null);
-    }
-  }, [apiUrl, session.id, setError, setSession]);
-
-  useEffect(() => {
-    if (!permissionsGranted || !cameraReady || !canGuide || recording || countdown !== null) return;
-    runPreflight();
-    const timer = setInterval(runPreflight, 3600);
-    return () => clearInterval(timer);
-  }, [canGuide, cameraReady, countdown, permissionsGranted, recording, runPreflight]);
-
-  useEffect(() => {
-    if (session.phase === 'ready_to_record' && permissionsGranted && cameraReady && !recording) {
-      startAutoRecord();
-    }
-  }, [cameraReady, permissionsGranted, recording, session.phase, startAutoRecord]);
-
-  if (!permissionsGranted) {
-    return (
-      <View style={styles.screen}>
-        <View style={styles.panel}>
-          <Text style={styles.title}>Studio access</Text>
-          <PrimaryButton icon="camera-outline" label="Enable Camera + Mic" onPress={requestPermissions} />
-        </View>
-      </View>
-    );
-  }
+  const plan = session.story_plan;
+  const busy = session.phase === 'planning' || session.phase === 'rendering';
 
   return (
-    <View style={styles.studioRoot}>
-      <CameraView
-        ref={cameraRef}
-        style={styles.camera}
-        facing={facing}
-        mode={cameraMode}
-        mirror={facing === 'front'}
-        mute={false}
-        videoQuality="720p"
-        onCameraReady={() => setCameraReady(true)}
-      />
-      <View style={styles.cameraTopBar}>
-        <View>
-          <Text style={styles.cameraMeta}>
-            Shot {Math.min(session.current_shot_idx + 1, session.required_shots)} / {session.required_shots || 1}
-          </Text>
-          <Text style={styles.cameraTitle}>{localStatus || session.progress_label}</Text>
+    <ScrollView contentContainerStyle={styles.screen}>
+      <View style={styles.panel}>
+        <View style={styles.panelHeading}>
+          <View>
+            <Text style={styles.title}>{plan?.title || 'Narrative plan'}</Text>
+            <Text style={styles.muted}>{plan?.tone ? `${plan.tone} tone` : 'Generate a voiceover and edit structure from your trip brief.'}</Text>
+          </View>
+          {plan?.language ? <MetricPill icon="language-outline" label="Language" value={plan.language.toUpperCase()} /> : null}
         </View>
-        <Pressable onPress={() => setFacing((current) => (current === 'front' ? 'back' : 'front'))} style={styles.roundIconButton}>
-          <Ionicons name="camera-reverse-outline" size={20} color={colors.white} />
-        </Pressable>
+        {busy && session.phase === 'planning' ? (
+          <View style={styles.waitPanel}>
+            <ActivityIndicator color={colors.blue} />
+            <Text style={styles.waitText}>Writing voiceover and edit notes.</Text>
+          </View>
+        ) : null}
+        {plan?.voiceover_script ? (
+          <>
+            <Text style={styles.sectionTitle}>Voiceover</Text>
+            <Text style={styles.script}>{plan.voiceover_script}</Text>
+          </>
+        ) : (
+          <Text style={styles.muted}>Generate a narrative plan to see the voiceover script.</Text>
+        )}
       </View>
 
-      {countdown !== null ? (
-        <View style={styles.countdownBadge}>
-          <Text style={styles.countdownText}>{countdown}</Text>
+      {plan?.narrative_arc?.length ? (
+        <View style={styles.panel}>
+          <Text style={styles.sectionTitle}>Narrative arc</Text>
+          {plan.narrative_arc.map((item, index) => (
+            <View key={`${item}-${index}`} style={styles.timelineItem}>
+              <Text style={styles.timelineNumber}>{index + 1}</Text>
+              <Text style={styles.timelineText}>{item}</Text>
+            </View>
+          ))}
         </View>
       ) : null}
 
-      <View style={styles.directorPanel}>
-        {localStatus === 'Checking frame' ? <ActivityIndicator color={colors.white} /> : null}
-        <Text style={styles.directorLabel}>{session.director_feedback || 'Aligning frame'}</Text>
-        {session.feedback.slice(0, 3).map((item) => (
-          <Text key={item} style={styles.directorHint}>
-            {item}
-          </Text>
-        ))}
-        <View style={styles.cameraActions}>
-          <PrimaryButton icon="cloud-upload-outline" label="Full Take" onPress={pickFullTake} tone="light" disabled={recording} />
+      {plan?.edit_notes?.length ? (
+        <View style={styles.panel}>
+          <Text style={styles.sectionTitle}>Edit notes</Text>
+          {plan.edit_notes.map((item, index) => (
+            <Text key={`${item}-${index}`} style={styles.listItem}>• {item}</Text>
+          ))}
         </View>
+      ) : null}
+
+      <View style={styles.actionRow}>
+        <PrimaryButton icon="refresh-outline" label="Regenerate" onPress={onGenerate} disabled={busy || session.media_items.length === 0} tone="light" />
+        <PrimaryButton icon="film-outline" label="Render video" onPress={onRender} disabled={busy || !plan || session.recorded_clips.length === 0} />
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -404,50 +432,43 @@ function OutputVideo({ source }: { source: string }) {
   return <VideoView player={player} style={styles.video} allowsFullscreen contentFit="contain" />;
 }
 
-function OutputScreen({ apiUrl, session }: { apiUrl: string; session: TrendSession }) {
+function OutputScreen({ apiUrl, session, onRender }: { apiUrl: string; session: TripSession; onRender: () => void }) {
   const finalUrl = mediaUrl(apiUrl, session.final_video_url);
-  const waiting = session.phase === 'rendering' || session.phase === 'evaluating' || session.phase === 'rendering_ready';
+  const waiting = session.phase === 'rendering';
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
       <View style={styles.panel}>
-        <Text style={styles.title}>Final cut</Text>
+        <View style={styles.panelHeading}>
+          <View>
+            <Text style={styles.title}>Holiday recap</Text>
+            <Text style={styles.muted}>Preview the rendered stitch and reuse the script for narration.</Text>
+          </View>
+        </View>
         {waiting ? (
-          <View style={styles.waitPanelCompact}>
+          <View style={styles.waitPanel}>
             <ActivityIndicator color={colors.blue} />
-            <Text style={styles.waitText}>{session.progress_label}</Text>
+            <Text style={styles.waitText}>Rendering uploaded clips.</Text>
           </View>
         ) : null}
-        {finalUrl ? <OutputVideo source={finalUrl} /> : null}
+        {finalUrl ? <OutputVideo source={finalUrl} /> : <Text style={styles.muted}>Render the video after generating a story plan.</Text>}
+        <PrimaryButton icon="film-outline" label="Render again" onPress={onRender} disabled={waiting || !session.story_plan} tone="light" />
       </View>
 
-      {session.evaluation ? (
+      {session.script ? (
         <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>AI Judge</Text>
-          <Text style={styles.evaluation}>{session.evaluation}</Text>
+          <Text style={styles.sectionTitle}>Voiceover script</Text>
+          <Text style={styles.script}>{session.script}</Text>
         </View>
       ) : null}
     </ScrollView>
   );
 }
 
-function SummaryDrawer({ session }: { session: TrendSession }) {
-  if (!session.style && !session.context_summary) return null;
-  return (
-    <View style={styles.summary}>
-      <FieldRow label="Shots" value={session.context_summary?.shots ?? session.required_shots} />
-      <FieldRow label="BPM" value={session.context_summary?.bpm ? Math.round(session.context_summary.bpm) : null} />
-      <FieldRow label="Wear" value={session.style?.clothing} />
-      <FieldRow label="Place" value={session.style?.setting} />
-      <FieldRow label="Frame" value={session.style?.camera_angle} />
-    </View>
-  );
-}
-
 export default function App() {
   const [apiDraft, setApiDraft] = useState(DEFAULT_API_URL);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
-  const [session, setSession] = useState<TrendSession | null>(null);
+  const [session, setSession] = useState<TripSession | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const connect = useCallback(async () => {
@@ -459,7 +480,7 @@ export default function App() {
       setSession(created);
     } catch (connectError) {
       setSession(null);
-      setError(connectError instanceof Error ? connectError.message : 'Could not reach TrendFlow API');
+      setError(connectError instanceof Error ? connectError.message : 'Could not reach TripStory API');
     }
   }, [apiDraft]);
 
@@ -469,7 +490,7 @@ export default function App() {
 
   useEffect(() => {
     if (!session) return;
-    const intervalMs = busyPhases.includes(session.phase) ? 1800 : 4200;
+    const intervalMs = busyPhases.includes(session.phase) ? 1500 : 4500;
     const timer = setInterval(async () => {
       try {
         const updated = await getSession(apiUrl, session.id);
@@ -481,19 +502,74 @@ export default function App() {
     return () => clearInterval(timer);
   }, [apiUrl, session?.id, session?.phase]);
 
-  const onAnalyze = useCallback(
-    async (url: string) => {
+  const onSaveContext = useCallback(
+    async (context: TripContext) => {
       if (!session) return;
       try {
         setError(null);
-        const updated = await startAnalysis(apiUrl, session.id, url.trim());
+        const updated = await saveTripContext(apiUrl, session.id, context);
         setSession(updated);
-      } catch (analyzeError) {
-        setError(analyzeError instanceof Error ? analyzeError.message : 'Analysis failed');
+      } catch (saveError) {
+        setError(saveError instanceof Error ? saveError.message : 'Could not save context');
       }
     },
     [apiUrl, session]
   );
+
+  const onUpload = useCallback(async () => {
+    if (!session) return;
+    const result = await DocumentPicker.getDocumentAsync({
+      type: 'video/*',
+      copyToCacheDirectory: true,
+      multiple: true,
+    });
+    if (result.canceled || !result.assets?.length) return;
+    try {
+      setError(null);
+      const updated = await uploadMedia(apiUrl, session.id, result.assets);
+      setSession(updated);
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : 'Upload failed');
+    }
+  }, [apiUrl, session]);
+
+  const onGenerate = useCallback(async () => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await generateStory(apiUrl, session.id);
+      setSession(updated);
+    } catch (generateError) {
+      setError(generateError instanceof Error ? generateError.message : 'Story generation failed');
+    }
+  }, [apiUrl, session]);
+
+  const onGenerateFromContext = useCallback(
+    async (context: TripContext) => {
+      if (!session) return;
+      try {
+        setError(null);
+        const saved = await saveTripContext(apiUrl, session.id, context);
+        setSession(saved);
+        const updated = await generateStory(apiUrl, saved.id);
+        setSession(updated);
+      } catch (generateError) {
+        setError(generateError instanceof Error ? generateError.message : 'Story generation failed');
+      }
+    },
+    [apiUrl, session]
+  );
+
+  const onRender = useCallback(async () => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await renderTripVideo(apiUrl, session.id);
+      setSession(updated);
+    } catch (renderError) {
+      setError(renderError instanceof Error ? renderError.message : 'Render failed');
+    }
+  }, [apiUrl, session]);
 
   const content = useMemo(() => {
     if (!session) {
@@ -501,20 +577,20 @@ export default function App() {
         <View style={styles.screen}>
           <View style={styles.panel}>
             <Text style={styles.title}>Connect server</Text>
-            <Text style={styles.muted}>{error || 'TrendFlow API is not connected.'}</Text>
+            <Text style={styles.muted}>{error || 'TripStory API is not connected.'}</Text>
             <PrimaryButton icon="sync" label="Reconnect" onPress={connect} />
           </View>
         </View>
       );
     }
-    if (session.screen === 'studio') {
-      return <StudioScreen apiUrl={apiUrl} session={session} setSession={setSession} setError={setError} />;
+    if (session.screen === 'plan') {
+      return <PlanScreen session={session} onGenerate={onGenerate} onRender={onRender} />;
     }
     if (session.screen === 'output') {
-      return <OutputScreen apiUrl={apiUrl} session={session} />;
+      return <OutputScreen apiUrl={apiUrl} session={session} onRender={onRender} />;
     }
-    return <AnalyzeScreen session={session} onAnalyze={onAnalyze} />;
-  }, [apiUrl, connect, error, onAnalyze, session]);
+    return <ContextScreen session={session} onSave={onSaveContext} onUpload={onUpload} onGenerate={onGenerateFromContext} />;
+  }, [apiUrl, connect, error, onGenerate, onGenerateFromContext, onRender, onSaveContext, onUpload, session]);
 
   return (
     <AppShell
@@ -545,19 +621,36 @@ const styles = StyleSheet.create({
     backgroundColor: colors.paper,
   },
   header: {
-    paddingHorizontal: 18,
-    paddingTop: 12,
-    paddingBottom: 10,
+    paddingHorizontal: 22,
+    paddingTop: 14,
+    paddingBottom: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    gap: 12,
+    gap: 16,
+  },
+  headerCompact: {
+    alignItems: 'stretch',
+    flexDirection: 'column',
+  },
+  brandLockup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  brandMark: {
+    width: 38,
+    height: 38,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.ink,
   },
   brand: {
     color: colors.ink,
     fontSize: 24,
     lineHeight: 29,
-    fontWeight: '800',
+    fontWeight: '900',
   },
   brandSub: {
     color: colors.muted,
@@ -567,34 +660,42 @@ const styles = StyleSheet.create({
   },
   serverBox: {
     flex: 1,
-    maxWidth: 220,
+    maxWidth: 340,
+    minWidth: 220,
     flexDirection: 'row',
     alignItems: 'center',
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: radii.md,
-    backgroundColor: colors.white,
+    backgroundColor: colors.surface,
   },
   serverInput: {
     flex: 1,
-    height: 36,
-    paddingHorizontal: 10,
+    height: 42,
+    paddingHorizontal: 12,
     color: colors.ink,
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '600',
   },
   serverButton: {
-    width: 36,
-    height: 36,
+    width: 42,
+    height: 42,
     alignItems: 'center',
     justifyContent: 'center',
   },
+  shellChrome: {
+    paddingHorizontal: 22,
+    gap: 10,
+  },
   phaseRail: {
-    marginHorizontal: 18,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 8,
+    paddingVertical: 10,
+    borderRadius: radii.md,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.line,
   },
   phaseItem: {
     flex: 1,
@@ -604,7 +705,7 @@ const styles = StyleSheet.create({
   phaseIcon: {
     width: 28,
     height: 28,
-    borderRadius: radii.round,
+    borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
     alignItems: 'center',
@@ -629,28 +730,41 @@ const styles = StyleSheet.create({
     color: colors.ink,
   },
   statusStrip: {
-    marginHorizontal: 18,
     marginBottom: 10,
     borderRadius: radii.md,
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 12,
     borderWidth: 1,
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'center',
+  },
+  statusNeutral: {
+    backgroundColor: colors.surface,
+    borderColor: colors.line,
   },
   statusInfo: {
-    backgroundColor: '#eef4ff',
-    borderColor: '#c9dafd',
-  },
-  statusWarn: {
-    backgroundColor: '#fff7ed',
-    borderColor: '#fed7aa',
+    backgroundColor: '#edf6f7',
+    borderColor: '#c8dcdf',
   },
   statusDone: {
-    backgroundColor: '#ecfdf3',
-    borderColor: '#bbf7d0',
+    backgroundColor: '#edf6ef',
+    borderColor: '#c9dfce',
   },
   statusError: {
-    backgroundColor: '#fff1f2',
-    borderColor: '#fecdd3',
+    backgroundColor: '#fff2ee',
+    borderColor: '#f0c5ba',
+  },
+  statusIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.white,
+  },
+  statusCopy: {
+    flex: 1,
   },
   statusLabel: {
     color: colors.ink,
@@ -666,29 +780,157 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   screen: {
-    padding: 18,
-    gap: 14,
+    width: '100%',
+    maxWidth: 1180,
+    alignSelf: 'center',
+    paddingHorizontal: 22,
+    paddingTop: 8,
+    paddingBottom: 32,
+    gap: 16,
   },
-  panel: {
-    backgroundColor: colors.white,
+  contextLayout: {
+    gap: 16,
+  },
+  contextLayoutDesktop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  studioPanel: {
+    gap: 12,
+  },
+  studioPanelDesktop: {
+    width: 350,
+    flexShrink: 0,
+  },
+  heroPanel: {
+    minHeight: 230,
+    backgroundColor: colors.ink,
     borderRadius: radii.md,
+    padding: 20,
+    gap: 14,
+    justifyContent: 'flex-end',
+    overflow: 'hidden',
+  },
+  eyebrow: {
+    color: '#a9d8dc',
+    fontSize: 11,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+    letterSpacing: 0,
+  },
+  heroTitle: {
+    color: colors.white,
+    fontSize: 30,
+    lineHeight: 35,
+    fontWeight: '900',
+  },
+  heroCopy: {
+    color: '#dce8df',
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: '600',
+  },
+  heroActions: {
+    flexDirection: 'row',
+    gap: 10,
+    flexWrap: 'wrap',
+  },
+  metricsGrid: {
+    flexDirection: 'row',
+    gap: 10,
+    flexWrap: 'wrap',
+  },
+  metricPill: {
+    minHeight: 56,
+    flexGrow: 1,
+    flexBasis: 150,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
     borderWidth: 1,
     borderColor: colors.line,
-    padding: 14,
-    gap: 12,
-    ...shadow,
+    borderRadius: radii.md,
+    paddingHorizontal: 12,
+    backgroundColor: colors.surface,
   },
-  title: {
-    color: colors.ink,
-    fontSize: 20,
-    lineHeight: 25,
-    fontWeight: '800',
+  metricTextWrap: {
+    flex: 1,
   },
-  sectionTitle: {
+  metricValue: {
     color: colors.ink,
     fontSize: 15,
     lineHeight: 19,
-    fontWeight: '800',
+    fontWeight: '900',
+  },
+  metricLabel: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '700',
+  },
+  uploadZone: {
+    minHeight: 178,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.mist,
+    padding: 18,
+    justifyContent: 'center',
+    gap: 10,
+  },
+  uploadZonePressed: {
+    transform: [{ scale: 0.995 }],
+  },
+  uploadIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.white,
+  },
+  uploadTitle: {
+    color: colors.ink,
+    fontSize: 19,
+    lineHeight: 24,
+    fontWeight: '900',
+  },
+  uploadCopy: {
+    color: colors.graphite,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: '600',
+  },
+  panel: {
+    backgroundColor: colors.surface,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    padding: 18,
+    gap: 14,
+    ...shadow,
+  },
+  formPanel: {
+    flex: 1,
+  },
+  panelHeading: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 14,
+    flexWrap: 'wrap',
+  },
+  title: {
+    color: colors.ink,
+    fontSize: 23,
+    lineHeight: 29,
+    fontWeight: '900',
+  },
+  sectionTitle: {
+    color: colors.ink,
+    fontSize: 16,
+    lineHeight: 21,
+    fontWeight: '900',
   },
   muted: {
     color: colors.muted,
@@ -696,16 +938,70 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     fontWeight: '600',
   },
-  urlInput: {
+  formGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  field: {
+    minWidth: 220,
+    gap: 6,
+  },
+  fieldHalf: {
+    flexGrow: 1,
+    flexBasis: 260,
+  },
+  fieldWide: {
+    width: '100%',
+    gap: 6,
+  },
+  fieldLabel: {
+    color: colors.graphite,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '900',
+  },
+  input: {
     minHeight: 48,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
     paddingHorizontal: 12,
+    paddingVertical: 10,
     color: colors.ink,
     fontSize: 14,
     fontWeight: '700',
-    backgroundColor: colors.paper,
+    backgroundColor: colors.white,
+  },
+  inputTall: {
+    minHeight: 104,
+    textAlignVertical: 'top',
+  },
+  chipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  chip: {
+    minHeight: 38,
+    justifyContent: 'center',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.white,
+    paddingHorizontal: 12,
+  },
+  chipActive: {
+    backgroundColor: colors.blue,
+    borderColor: colors.blue,
+  },
+  chipText: {
+    color: colors.graphite,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  chipTextActive: {
+    color: colors.white,
   },
   button: {
     minHeight: 48,
@@ -716,6 +1012,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
     paddingHorizontal: 14,
+    flexGrow: 0,
   },
   buttonLight: {
     backgroundColor: colors.white,
@@ -735,13 +1032,13 @@ const styles = StyleSheet.create({
     color: colors.white,
     fontSize: 14,
     lineHeight: 18,
-    fontWeight: '800',
+    fontWeight: '900',
   },
   buttonTextLight: {
     color: colors.ink,
   },
   waitPanel: {
-    backgroundColor: colors.white,
+    backgroundColor: colors.mist,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
@@ -749,164 +1046,73 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  waitPanelCompact: {
-    minHeight: 86,
-    borderRadius: radii.md,
-    backgroundColor: colors.paper,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-  },
   waitText: {
-    color: colors.muted,
+    color: colors.graphite,
     fontSize: 13,
     lineHeight: 18,
     fontWeight: '700',
-    textAlign: 'center',
   },
-  studioRoot: {
-    flex: 1,
-    backgroundColor: colors.camera,
-  },
-  camera: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  cameraTopBar: {
-    position: 'absolute',
-    top: 12,
-    left: 14,
-    right: 14,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: colors.cameraPanel,
-    borderRadius: radii.md,
-    padding: 10,
-  },
-  cameraMeta: {
-    color: '#a8b3c7',
-    fontSize: 11,
-    lineHeight: 15,
-    fontWeight: '800',
-  },
-  cameraTitle: {
-    color: colors.white,
-    fontSize: 16,
-    lineHeight: 21,
-    fontWeight: '800',
-  },
-  roundIconButton: {
-    width: 42,
-    height: 42,
-    borderRadius: radii.round,
-    backgroundColor: 'rgba(255,255,255,0.14)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  countdownBadge: {
-    position: 'absolute',
-    alignSelf: 'center',
-    top: '37%',
-    width: 116,
-    height: 116,
-    borderRadius: radii.round,
-    backgroundColor: 'rgba(35,100,232,0.86)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  countdownText: {
-    color: colors.white,
-    fontSize: 62,
-    lineHeight: 72,
-    fontWeight: '900',
-  },
-  directorPanel: {
-    position: 'absolute',
-    left: 14,
-    right: 14,
-    bottom: 14,
-    backgroundColor: colors.cameraPanel,
-    borderRadius: radii.md,
-    padding: 12,
-    gap: 7,
-  },
-  directorLabel: {
-    color: colors.white,
-    fontSize: 18,
+  script: {
+    color: colors.graphite,
+    fontSize: 15,
     lineHeight: 23,
+    fontWeight: '600',
+  },
+  listItem: {
+    color: colors.graphite,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: '600',
+  },
+  actionRow: {
+    flexDirection: 'row',
+    gap: 10,
+    flexWrap: 'wrap',
+  },
+  timelineItem: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'flex-start',
+  },
+  timelineNumber: {
+    width: 28,
+    height: 28,
+    borderRadius: radii.md,
+    overflow: 'hidden',
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    color: colors.white,
+    backgroundColor: colors.blue,
+    fontSize: 12,
+    lineHeight: 28,
     fontWeight: '900',
   },
-  directorHint: {
-    color: '#d7deea',
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: '700',
-  },
-  cameraActions: {
-    marginTop: 8,
-    flexDirection: 'row',
-  },
-  fieldRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 12,
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: '#e8ebf1',
-  },
-  fieldLabel: {
-    width: 68,
-    color: colors.muted,
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: '800',
-  },
-  fieldValue: {
+  timelineText: {
     flex: 1,
-    color: colors.ink,
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: '700',
-    textAlign: 'right',
-  },
-  summary: {
-    position: 'absolute',
-    left: 18,
-    right: 18,
-    bottom: 18,
-    backgroundColor: colors.white,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    maxHeight: 190,
+    color: colors.graphite,
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: '600',
   },
   video: {
     width: '100%',
     aspectRatio: 9 / 16,
     borderRadius: radii.md,
     backgroundColor: colors.camera,
-  },
-  evaluation: {
-    color: colors.graphite,
-    fontSize: 13,
-    lineHeight: 19,
-    fontWeight: '600',
+    overflow: 'hidden',
   },
   inlineError: {
-    marginHorizontal: 18,
-    marginBottom: 8,
+    marginHorizontal: 22,
+    marginBottom: 10,
     borderRadius: radii.md,
-    backgroundColor: '#fff1f2',
     borderWidth: 1,
-    borderColor: '#fecdd3',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    borderColor: '#f0c5ba',
+    backgroundColor: '#fff2ee',
+    paddingHorizontal: 12,
+    paddingVertical: 9,
     flexDirection: 'row',
+    gap: 8,
     alignItems: 'center',
-    gap: 7,
   },
   inlineErrorText: {
     flex: 1,

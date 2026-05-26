@@ -1,12 +1,12 @@
 {
-  "name": "trendflow-mobile",
+  "name": "tripstory-mobile",
   "version": "0.1.0",
   "private": true,
-  "main": "App.tsx",
+  "main": "node_modules/expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
-    "web": "expo start --web",
+    "web": "EXPO_NO_CACHE=1 expo start --web",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -1,0 +1,10 @@
+name: trendsync
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - ffmpeg
+  - nodejs=20
+variables:
+  PYTHONNOUSERSITE: "1"

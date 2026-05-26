@@ -1,57 +1,68 @@
-export type TrendPhase =
-  | 'awaiting_reference'
-  | 'analyzing'
-  | 'ready_to_film'
-  | 'needs_adjustment'
-  | 'ready_to_record'
+export type TripPhase =
+  | 'collecting_context'
   | 'uploading'
-  | 'rendering_ready'
+  | 'ready_to_plan'
+  | 'planning'
+  | 'ready_to_render'
   | 'rendering'
-  | 'evaluating'
   | 'complete'
   | 'error';
 
-export type TrendScreen = 'analyze' | 'studio' | 'output';
+export type TripScreen = 'context' | 'upload' | 'plan' | 'output';
 
-export type StyleProfile = {
-  video_type?: string;
-  narrative?: string;
-  clothing?: string | string[];
-  setting?: string | string[];
-  camera_angle?: string | string[];
-  key_transition?: string;
-  recreation_tips?: string;
+export type TripContext = {
+  destination: string;
+  duration: string;
+  places_visited: string;
+  travel_dates: string;
+  companions: string;
+  highlights: string;
+  mood: string;
+  audience: string;
+  language: string;
+  notes: string;
+  llm_provider: string;
+  llm_model: string;
 };
 
-export type ContextSummary = {
-  bpm?: number;
-  shots: number;
-  duration?: number;
-  beats: number;
-  beat_synced_cuts: number;
-  total_cuts: number;
-  camera_motion: Record<string, number>;
-};
-
-export type TrendSession = {
+export type MediaItem = {
   id: string;
-  phase: TrendPhase;
-  screen: TrendScreen;
+  filename: string;
+  kind: string;
+  url: string;
+  size_bytes: number;
+};
+
+export type StoryPlan = {
+  title?: string;
+  language?: string;
+  tone?: string;
+  narrative_arc?: string[];
+  voiceover_script?: string;
+  edit_notes?: string[];
+  clip_plan?: Array<{
+    clip?: string;
+    role?: string;
+    suggested_use?: string;
+  }>;
+};
+
+export type TripSession = {
+  id: string;
+  phase: TripPhase;
+  screen: TripScreen;
   next_action: string;
   created_at: number;
   updated_at: number;
   error?: string | null;
   progress_label: string;
-  style?: StyleProfile | null;
-  context_summary?: ContextSummary | null;
-  script?: string | null;
-  skill_dir?: string | null;
-  required_shots: number;
-  current_shot_idx: number;
-  current_shot_duration: number;
+  trip_context: TripContext;
+  media_items: MediaItem[];
   recorded_clips: string[];
-  feedback: string[];
-  director_feedback: string;
+  story_plan?: StoryPlan | null;
+  script?: string | null;
   final_video_url?: string | null;
-  evaluation?: string | null;
+  story_json_url?: string | null;
+  llm_provider: string;
+  llm_model: string;
 };

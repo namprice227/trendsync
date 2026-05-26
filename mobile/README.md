@@ -1,21 +1,28 @@
-# TrendFlow Mobile
+# TripStory Mobile
 
-Expo client for the guided TrendFlow workflow.
+Expo client for creating narrated holiday recap videos from uploaded trip clips.
 
 ## Run
 
-Start the Python API from the repository root:
+Start from the repository root with the Conda environment active:
 
 ```bash
-venv/bin/uvicorn api_server:app --host 0.0.0.0 --port 8010
+conda activate "$PWD/.conda/trendsync-py312"
+export PYTHONNOUSERSITE=1
 ```
 
-Then install and run the mobile app:
+Start the Python API:
+
+```bash
+python -m uvicorn api_server:app --host 0.0.0.0 --port 8010
+```
+
+Then install the locked mobile dependencies and run the mobile app:
 
 ```bash
 cd mobile
-npm install
-npm run start
+npm ci
+npm run web -- --clear --port 8081
 ```
 
 Android emulator default API URL:
@@ -32,11 +39,29 @@ http://<your-computer-lan-ip>:8010
 
 ## Flow
 
-The app does not expose manual workflow tabs. It follows the server session phase:
+The app follows the server session phase:
 
 ```text
-awaiting_reference -> analyzing -> ready_to_film -> needs_adjustment
--> ready_to_record -> uploading -> rendering -> evaluating -> complete
+collecting_context -> uploading -> ready_to_plan -> planning
+-> ready_to_render -> rendering -> complete
 ```
 
-When analysis finishes, the UI moves into Studio. When pre-flight returns `ready_to_record`, the app counts down, records the shot, uploads it, and either continues to the next shot or moves into Output for render and evaluation.
+Users upload trip clips, answer travel-context questions, generate a multilingual voiceover plan, and render a simple recap video.
+
+## Current Scope
+
+Implemented:
+
+- API connection and session creation.
+- Video file upload through Expo DocumentPicker.
+- Trip context form with destination, dates, companions, highlights, tone, audience, language, notes, and model override.
+- Narrative plan display with voiceover, narrative arc, and edit notes.
+- Render request and video preview through Expo Video.
+
+Not implemented yet:
+
+- Login, project history, or persistent mobile project library.
+- Native camera capture inside the TripStory flow.
+- Clip reordering, favorite markers, trimming, timeline editing, or aspect-ratio/export controls.
+- TTS voice selection, generated narration playback, subtitles, music, or share/download actions.
+- Offline mode, resumable uploads, and detailed render-progress percentages.

@@ -1,4 +1,4 @@
-import type { TrendSession } from './types';
+import type { TripContext, TripSession } from './types';
 
 export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '');
@@ -24,59 +24,57 @@ export function mediaUrl(baseUrl: string, path?: string | null): string | null {
   return joinUrl(baseUrl, path);
 }
 
-export async function createSession(baseUrl: string): Promise<TrendSession> {
+export async function createSession(baseUrl: string): Promise<TripSession> {
   const response = await fetch(joinUrl(baseUrl, '/sessions'), { method: 'POST' });
-  return readJson<TrendSession>(response);
+  return readJson<TripSession>(response);
 }
 
-export async function getSession(baseUrl: string, sessionId: string): Promise<TrendSession> {
+export async function getSession(baseUrl: string, sessionId: string): Promise<TripSession> {
   const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}`));
-  return readJson<TrendSession>(response);
+  return readJson<TripSession>(response);
 }
 
-export async function startAnalysis(baseUrl: string, sessionId: string, url: string): Promise<TrendSession> {
-  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/analyze`), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
-  });
-  return readJson<TrendSession>(response);
-}
-
-export async function sendPreflightFrame(
+export async function saveTripContext(
   baseUrl: string,
   sessionId: string,
-  imageBase64: string
-): Promise<TrendSession> {
-  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/preflight-frame`), {
+  context: TripContext
+): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/context`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_base64: imageBase64 }),
+    body: JSON.stringify(context),
   });
-  return readJson<TrendSession>(response);
+  return readJson<TripSession>(response);
 }
 
-export async function uploadClip(
+export async function uploadMedia(
   baseUrl: string,
   sessionId: string,
-  clipUri: string,
-  options?: { fullTake?: boolean }
-): Promise<TrendSession> {
+  assets: Array<{ uri: string; name?: string | null; mimeType?: string | null }>
+): Promise<TripSession> {
   const form = new FormData();
-  form.append('files', {
-    uri: clipUri,
-    name: options?.fullTake ? 'full_take.mp4' : 'shot.mp4',
-    type: 'video/mp4',
-  } as any);
+  for (const asset of assets) {
+    form.append('files', {
+      uri: asset.uri,
+      name: asset.name || 'trip_clip.mp4',
+      type: asset.mimeType || 'video/mp4',
+    } as any);
+  }
 
-  const fullTake = options?.fullTake ? 'true' : 'false';
-  const response = await fetch(
-    joinUrl(baseUrl, `/sessions/${sessionId}/clips?auto_render=true&full_take=${fullTake}`),
-    {
-      method: 'POST',
-      body: form,
-      headers: { Accept: 'application/json' },
-    }
-  );
-  return readJson<TrendSession>(response);
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/media`), {
+    method: 'POST',
+    body: form,
+    headers: { Accept: 'application/json' },
+  });
+  return readJson<TripSession>(response);
+}
+
+export async function generateStory(baseUrl: string, sessionId: string): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/generate-story`), { method: 'POST' });
+  return readJson<TripSession>(response);
+}
+
+export async function renderTripVideo(baseUrl: string, sessionId: string): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/render`), { method: 'POST' });
+  return readJson<TripSession>(response);
 }
