@@ -5,6 +5,9 @@ recorded_shots/
 .gradio/
 .conda/
 .venv/
+.env
+.env.*
+!.env.example
 *.pyc
 Miniconda*.sh
 final_trend.mp4

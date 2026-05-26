@@ -15,7 +15,7 @@ The new product flow is:
 3. Generate a multilingual narrative arc, edit notes, and voiceover script.
 4. Render a simple final recap video from the uploaded clips.
 
-The LLM layer is vendor-neutral. By default the app works with a deterministic fallback, but you can connect any OpenAI-compatible chat completions endpoint.
+The LLM layer is vendor-neutral. By default the app works with a deterministic fallback, and the backend can use OpenAI, Gemini, or DeepSeek from server-side environment variables.
 
 ---
 
@@ -73,6 +73,29 @@ python -m uvicorn api_server:app --host 0.0.0.0 --port 8010
 Optional LLM configuration:
 
 ```bash
+cp .env.example .env
+```
+
+Edit `.env`, set `TRIPSTORY_LLM_PROVIDER` to `openai`, `gemini`, or `deepseek`, and fill in the matching key. The API loads `.env` on startup. The frontend never receives or submits provider API keys.
+
+Default models:
+
+- OpenAI: `gpt-4o-mini`
+- Gemini: `gemini-2.0-flash`
+- DeepSeek: `deepseek-chat`
+
+You can also export the variables directly instead of using `.env`:
+
+```bash
+export TRIPSTORY_LLM_PROVIDER="openai"   # openai, gemini, deepseek, local, or custom
+export OPENAI_API_KEY="your-openai-key"
+```
+
+Provider-specific key variables are `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DEEPSEEK_API_KEY`. Provider-specific model overrides are `TRIPSTORY_OPENAI_MODEL`, `TRIPSTORY_GEMINI_MODEL`, and `TRIPSTORY_DEEPSEEK_MODEL`.
+
+For a custom OpenAI-compatible endpoint:
+
+```bash
 export TRIPSTORY_LLM_URL="http://localhost:8000/v1"
 export TRIPSTORY_LLM_MODEL="your-model-name"
 export TRIPSTORY_LLM_API_KEY="optional-key"
@@ -101,7 +124,7 @@ TripStory renders a simple stitched recap video and saves the generated story pl
 
 - FastAPI session API with health check, session creation, context save, media upload, story generation, and render endpoints.
 - Expo mobile app for connecting to the API, uploading video files, entering trip context, choosing voiceover language, generating a story plan, and previewing the rendered output.
-- Vendor-neutral OpenAI-compatible LLM client with a deterministic local fallback when no LLM endpoint is configured.
+- Vendor-neutral LLM client with OpenAI, Gemini, DeepSeek, custom OpenAI-compatible endpoints, and a deterministic local fallback when no API key or endpoint is configured.
 - Multilingual story-plan generation contract with title, language, tone, narrative arc, voiceover script, edit notes, and clip plan.
 - Basic video rendering that concatenates uploaded video clips with `ffmpeg` when available and writes the story plan as JSON beside the final video.
 - File-backed session persistence so API restarts can recover existing MVP projects.

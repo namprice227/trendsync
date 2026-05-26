@@ -14,6 +14,16 @@ class TripStoryApiTest(unittest.TestCase):
         self.session_store = Path(self.temp_dir.name) / "sessions.json"
         os.environ["TRIPSTORY_MEDIA_DIR"] = str(self.media_root)
         os.environ["TRIPSTORY_SESSION_STORE"] = str(self.session_store)
+        for key in (
+            "TRIPSTORY_LLM_PROVIDER",
+            "TRIPSTORY_LLM_URL",
+            "TRIPSTORY_LLM_API_KEY",
+            "TRIPSTORY_LLM_MODEL",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ):
+            os.environ.pop(key, None)
 
         import api_server
 
@@ -39,7 +49,7 @@ class TripStoryApiTest(unittest.TestCase):
             "audience": "friends and family",
             "language": "en",
             "notes": "",
-            "llm_provider": "openai-compatible",
+            "llm_provider": "local",
             "llm_model": "",
         }
         self.api_server._update_session(session_id, trip_context=context, phase="collecting_context")
@@ -81,6 +91,45 @@ class TripStoryApiTest(unittest.TestCase):
         reloaded = importlib.reload(self.api_server)
         persisted = reloaded._public_session(session_id)
         self.assertEqual(persisted["phase"], "complete")
+
+    def test_trip_context_does_not_accept_or_expose_api_keys(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        request = self.api_server.TripContextRequest(
+            destination="Paris",
+            llm_provider="openai",
+            llm_model="gpt-4o-mini",
+        )
+
+        updated = self.api_server.save_context(session_id, request)
+
+        self.assertEqual(updated["trip_context"]["llm_provider"], "openai")
+        self.assertNotIn("llm_api_key", updated["trip_context"])
+        public = self.api_server._public_session(session_id)
+        self.assertNotIn("llm_api_key", public["trip_context"])
+
+    def test_provider_presets_configure_openai_compatible_endpoints(self) -> None:
+        from llm_provider import LLMProvider
+
+        cases = [
+            ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
+            ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash"),
+            ("deepseek", "https://api.deepseek.com", "deepseek-chat"),
+        ]
+
+        for provider_name, base_url, model in cases:
+            with self.subTest(provider=provider_name):
+                env_key = f"{provider_name.upper()}_API_KEY"
+                if provider_name == "gemini":
+                    env_key = "GEMINI_API_KEY"
+                os.environ[env_key] = "test-key"
+                provider = LLMProvider(provider=provider_name)
+                self.assertTrue(provider.configured)
+                self.assertEqual(provider.base_url, base_url)
+                self.assertEqual(provider.model, model)
+                os.environ.pop(env_key, None)
+
+        self.assertFalse(LLMProvider(provider="local").configured)
 
 
 if __name__ == "__main__":

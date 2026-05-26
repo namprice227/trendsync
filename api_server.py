@@ -18,6 +18,31 @@ from llm_provider import LLMProvider
 from trip_renderer import render_trip_video
 from trip_story import generate_trip_story
 
+
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        print(f"[api_server] Could not load {path}: {exc}")
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 MEDIA_ROOT = Path(os.environ.get("TRIPSTORY_MEDIA_DIR", "trip_sessions"))
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 SESSION_STORE = Path(os.environ.get("TRIPSTORY_SESSION_STORE", str(MEDIA_ROOT.with_name(f"{MEDIA_ROOT.name}_sessions.json"))))
@@ -62,7 +87,7 @@ class TripContextRequest(BaseModel):
     audience: str = Field("friends and family", max_length=200)
     language: str = Field("en", max_length=40)
     notes: str = Field("", max_length=1500)
-    llm_provider: str = Field("openai-compatible", max_length=80)
+    llm_provider: str = Field("local", max_length=80)
     llm_model: str = Field("", max_length=200)
 
 
@@ -82,7 +107,7 @@ def _default_context() -> dict[str, str]:
         "audience": "friends and family",
         "language": "en",
         "notes": "",
-        "llm_provider": "openai-compatible",
+        "llm_provider": "local",
         "llm_model": "",
     }
 
@@ -105,7 +130,7 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
         "script": None,
         "final_video_url": None,
         "story_json_url": None,
-        "llm_provider": "openai-compatible",
+        "llm_provider": "local",
         "llm_model": os.environ.get("TRIPSTORY_LLM_MODEL", "local-fallback"),
     }
 
@@ -115,6 +140,7 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     session.update(raw)
     context = _default_context()
     context.update(raw.get("trip_context") or {})
+    context.pop("llm_api_key", None)
     session["trip_context"] = context
     session["media_items"] = list(raw.get("media_items") or [])
     session["recorded_clips"] = list(raw.get("recorded_clips") or [])
@@ -175,6 +201,9 @@ def _public_session(session_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Session not found")
         public = dict(session)
         public["screen"] = PHASE_SCREENS.get(public["phase"], "context")
+        context = dict(public.get("trip_context") or {})
+        context.pop("llm_api_key", None)
+        public["trip_context"] = context
         return public
 
 
@@ -208,7 +237,10 @@ def _generate_story_background(session_id: str) -> None:
             raise ValueError("Upload at least one clip or video before generating the story.")
 
         context = dict(session.get("trip_context") or {})
-        provider = LLMProvider(model=context.get("llm_model") or None)
+        provider = LLMProvider(
+            provider=context.get("llm_provider") or "local",
+            model=context.get("llm_model") or None,
+        )
         plan = generate_trip_story(context, media_items, provider)
         _update_session(
             session_id,
@@ -218,7 +250,7 @@ def _generate_story_background(session_id: str) -> None:
             story_plan=plan,
             script=plan.get("voiceover_script"),
             llm_model=provider.model,
-            llm_provider=context.get("llm_provider") or "openai-compatible",
+            llm_provider=provider.provider,
         )
     except Exception as exc:
         _update_session(
@@ -303,7 +335,7 @@ def save_context(session_id: str, request: TripContextRequest) -> dict[str, Any]
         progress_label="Trip context saved",
         next_action=next_action,
         trip_context=context,
-        llm_provider=context.get("llm_provider") or "openai-compatible",
+        llm_provider=context.get("llm_provider") or "local",
         llm_model=context.get("llm_model") or os.environ.get("TRIPSTORY_LLM_MODEL", "local-fallback"),
         error=None,
     )

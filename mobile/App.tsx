@@ -43,6 +43,20 @@ const LANGUAGES = [
   { code: 'zh', label: 'Chinese' },
 ];
 
+const LLM_PROVIDERS = [
+  { code: 'local', label: 'Local', detail: 'No backend key' },
+  { code: 'openai', label: 'OpenAI', detail: 'OPENAI_API_KEY' },
+  { code: 'gemini', label: 'Gemini', detail: 'GEMINI_API_KEY' },
+  { code: 'deepseek', label: 'DeepSeek', detail: 'DEEPSEEK_API_KEY' },
+];
+
+const providerModelPlaceholders: Record<string, string> = {
+  local: 'Uses the built-in fallback',
+  openai: 'Optional, default: gpt-4o-mini',
+  gemini: 'Optional, default: gemini-2.0-flash',
+  deepseek: 'Optional, default: deepseek-chat',
+};
+
 const tripContextFields: Array<{
   key: keyof TripContext;
   label: string;
@@ -59,7 +73,6 @@ const tripContextFields: Array<{
   { key: 'mood', label: 'Tone', placeholder: 'Warm, funny, reflective, cinematic...' },
   { key: 'audience', label: 'Audience', placeholder: 'Friends, family, Instagram, private archive...' },
   { key: 'notes', label: 'Extra notes', placeholder: 'Anything to avoid, inside jokes, must-use clips...', multiline: true, wide: true },
-  { key: 'llm_model', label: 'Model override', placeholder: 'Optional model name from your provider' },
 ];
 
 function PrimaryButton({
@@ -270,6 +283,31 @@ function LanguagePicker({ value, onChange }: { value: string; onChange: (value: 
   );
 }
 
+function ProviderPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <View style={styles.providerGrid}>
+      {LLM_PROVIDERS.map((provider) => {
+        const active = value === provider.code;
+        return (
+          <Pressable
+            key={provider.code}
+            onPress={() => onChange(provider.code)}
+            style={[styles.providerCard, active && styles.providerCardActive]}
+          >
+            <View style={[styles.providerIcon, active && styles.providerIconActive]}>
+              <Ionicons name={active ? 'checkmark' : 'key-outline'} size={15} color={active ? colors.white : colors.blue} />
+            </View>
+            <View style={styles.providerCopy}>
+              <Text style={[styles.providerName, active && styles.providerNameActive]}>{provider.label}</Text>
+              <Text style={[styles.providerDetail, active && styles.providerDetailActive]}>{provider.detail}</Text>
+            </View>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 function ContextScreen({
   session,
   onSave,
@@ -289,7 +327,7 @@ function ContextScreen({
 
   useEffect(() => {
     setContext(session.trip_context);
-  }, [session.trip_context]);
+  }, [session.id]);
 
   const update = (key: keyof TripContext, value: string) => {
     setContext((current) => ({ ...current, [key]: value }));
@@ -350,6 +388,17 @@ function ContextScreen({
               <Text style={styles.fieldLabel}>Voiceover language</Text>
               <LanguagePicker value={context.language} onChange={(value) => update('language', value)} />
             </View>
+            <View style={styles.fieldWide}>
+              <Text style={styles.fieldLabel}>AI provider</Text>
+              <ProviderPicker value={context.llm_provider || 'local'} onChange={(value) => update('llm_provider', value)} />
+            </View>
+            <Field
+              label="Model override"
+              value={context.llm_model}
+              onChangeText={(value) => update('llm_model', value)}
+              placeholder={providerModelPlaceholders[context.llm_provider] || 'Optional model name from your provider'}
+              wide
+            />
           </View>
         </View>
       </View>
@@ -1002,6 +1051,62 @@ const styles = StyleSheet.create({
   },
   chipTextActive: {
     color: colors.white,
+  },
+  providerGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  providerCard: {
+    minHeight: 66,
+    flexGrow: 1,
+    flexBasis: 160,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.white,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  providerCardActive: {
+    borderColor: colors.blue,
+    backgroundColor: '#edf6f7',
+  },
+  providerIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.mist,
+  },
+  providerIconActive: {
+    backgroundColor: colors.blue,
+  },
+  providerCopy: {
+    flex: 1,
+  },
+  providerName: {
+    color: colors.ink,
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '900',
+  },
+  providerNameActive: {
+    color: colors.ink,
+  },
+  providerDetail: {
+    marginTop: 2,
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '700',
+  },
+  providerDetailActive: {
+    color: colors.graphite,
   },
   button: {
     minHeight: 48,

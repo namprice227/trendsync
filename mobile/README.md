@@ -48,13 +48,24 @@ collecting_context -> uploading -> ready_to_plan -> planning
 
 Users upload trip clips, answer travel-context questions, generate a multilingual voiceover plan, and render a simple recap video.
 
+## AI Providers
+
+The story form has provider cards for:
+
+- Local fallback: no backend key.
+- OpenAI: uses `OPENAI_API_KEY` from the API server environment.
+- Gemini: uses `GEMINI_API_KEY` from the API server environment.
+- DeepSeek: uses `DEEPSEEK_API_KEY` from the API server environment.
+
+Provider keys are configured in the backend `.env` file. The frontend does not expose or submit API keys.
+
 ## Current Scope
 
 Implemented:
 
 - API connection and session creation.
 - Video file upload through Expo DocumentPicker.
-- Trip context form with destination, dates, companions, highlights, tone, audience, language, notes, and model override.
+- Trip context form with destination, dates, companions, highlights, tone, audience, language, notes, AI provider, and model override.
 - Narrative plan display with voiceover, narrative arc, and edit notes.
 - Render request and video preview through Expo Video.
 

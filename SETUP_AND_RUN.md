@@ -43,13 +43,37 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## 2. Optional LLM Endpoint
+## 2. Optional LLM Providers
 
 TripStory works without an LLM server by using a deterministic local fallback.
 
-To use any OpenAI-compatible chat completions endpoint:
+Use a local `.env` file from the repository root:
 
 ```bash
+cp .env.example .env
+```
+
+Edit `.env`, set `TRIPSTORY_LLM_PROVIDER` to `openai`, `gemini`, or `deepseek`, and fill in the matching key. The API loads `.env` on startup. The frontend only selects the provider/model; it does not receive or submit provider API keys.
+
+Default provider models:
+
+- OpenAI: `gpt-4o-mini`
+- Gemini: `gemini-2.0-flash`
+- DeepSeek: `deepseek-chat`
+
+You can also configure keys through exported environment variables:
+
+```bash
+export TRIPSTORY_LLM_PROVIDER="openai"   # openai, gemini, deepseek, local, or custom
+export OPENAI_API_KEY="your-openai-key"
+```
+
+Use `GEMINI_API_KEY` for Gemini and `DEEPSEEK_API_KEY` for DeepSeek. Optional model overrides are `TRIPSTORY_OPENAI_MODEL`, `TRIPSTORY_GEMINI_MODEL`, and `TRIPSTORY_DEEPSEEK_MODEL`.
+
+To use any other OpenAI-compatible chat completions endpoint:
+
+```bash
+export TRIPSTORY_LLM_PROVIDER="custom"
 export TRIPSTORY_LLM_URL="http://localhost:8000/v1"
 export TRIPSTORY_LLM_MODEL="your-model-name"
 export TRIPSTORY_LLM_API_KEY="optional-key"
