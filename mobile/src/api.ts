@@ -45,6 +45,25 @@ export async function getSession(baseUrl: string, sessionId: string): Promise<Tr
   return readJson<TripSession>(response);
 }
 
+export async function updateProjectMetadata(baseUrl: string, sessionId: string, metadata: { title?: string | null }): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/metadata`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(metadata),
+  });
+  return readJson<TripSession>(response);
+}
+
+export async function duplicateSession(baseUrl: string, sessionId: string): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/duplicate`), { method: 'POST' });
+  return readJson<TripSession>(response);
+}
+
+export async function deleteSession(baseUrl: string, sessionId: string): Promise<{ status: string }> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}`), { method: 'DELETE' });
+  return readJson<{ status: string }>(response);
+}
+
 export async function saveTripContext(
   baseUrl: string,
   sessionId: string,
@@ -94,6 +113,19 @@ export async function renderTripVideo(baseUrl: string, sessionId: string, option
     method: 'POST',
     headers: options ? { 'Content-Type': 'application/json' } : undefined,
     body: options ? JSON.stringify(options) : undefined,
+  });
+  return readJson<TripSession>(response);
+}
+
+export async function updateVoiceoverSegments(
+  baseUrl: string,
+  sessionId: string,
+  segments: Array<{ segment_id: string; voiceover: string; caption?: string }>
+): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/voiceover-segments`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ segments }),
   });
   return readJson<TripSession>(response);
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import sqlite3
@@ -304,6 +305,20 @@ class RenderRequest(BaseModel):
     include_music_bed: bool = False
 
 
+class ProjectMetadataRequest(BaseModel):
+    title: str | None = Field(None, max_length=200)
+
+
+class VoiceoverSegmentUpdate(BaseModel):
+    segment_id: str = Field(..., min_length=1, max_length=80)
+    voiceover: str = Field(..., min_length=1, max_length=500)
+    caption: str | None = Field(None, max_length=180)
+
+
+class VoiceoverSegmentsPatchRequest(BaseModel):
+    segments: list[VoiceoverSegmentUpdate] = Field(..., min_length=1, max_length=100)
+
+
 def _now() -> float:
     return round(time.time(), 3)
 
@@ -343,6 +358,7 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
         "updated_at": now,
         "owner_id": "local",
         "share_token": None,
+        "metadata": {"title": ""},
         "error": None,
         "progress_label": "Planning a holiday recap",
         "progress_percent": 0,
@@ -374,6 +390,14 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     context.update(raw.get("trip_context") or {})
     context.pop("llm_api_key", None)
     session["trip_context"] = context
+    metadata = {"title": ""}
+    raw_metadata = raw.get("metadata") or {}
+    if isinstance(raw_metadata, dict):
+        metadata.update(raw_metadata)
+    legacy_title = raw.get("project_title")
+    title = metadata.get("title") or legacy_title or ""
+    metadata["title"] = " ".join(str(title).split())[:200]
+    session["metadata"] = metadata
     session["media_items"] = list(raw.get("media_items") or [])
     session["recorded_clips"] = list(raw.get("recorded_clips") or [])
     session["clip_analysis"] = list(raw.get("clip_analysis") or [])
@@ -507,6 +531,17 @@ def _safe_name(name: str, fallback: str) -> str:
 
 def _public_url(session_id: str, path: str | Path) -> str:
     return f"/files/{session_id}/{Path(path).name}"
+
+
+def _project_destination(session: dict[str, Any]) -> str:
+    destination = str((session.get("trip_context") or {}).get("destination") or "").strip()
+    return destination or "Untitled trip"
+
+
+def _project_title(session: dict[str, Any]) -> str:
+    metadata = session.get("metadata") or {}
+    title = str(metadata.get("title") or "").strip() if isinstance(metadata, dict) else ""
+    return title or _project_destination(session)
 
 
 def _row_to_job(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
@@ -752,6 +787,75 @@ def _update_session(session_id: str, **updates: Any) -> dict[str, Any]:
         return dict(session)
 
 
+def _stable_segment_id(index: int) -> str:
+    return f"seg_{index + 1:03d}"
+
+
+def _clean_segment_text(value: Any, field: str, max_length: int) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"{field} cannot be empty.")
+    if len(text) > max_length:
+        raise HTTPException(status_code=422, detail=f"{field} must be {max_length} characters or fewer.")
+    return text
+
+
+def _ensure_story_segment_ids(story_plan: dict[str, Any]) -> dict[str, Any]:
+    plan = dict(story_plan)
+    edit_decisions = [
+        dict(item)
+        for item in (plan.get("edit_decisions") or [])
+        if isinstance(item, dict)
+    ]
+    voiceover_segments = [
+        dict(item)
+        for item in (plan.get("voiceover_segments") or [])
+        if isinstance(item, dict)
+    ]
+
+    for index, decision in enumerate(edit_decisions):
+        decision["segment_id"] = str(decision.get("segment_id") or _stable_segment_id(index))
+        decision["window_id"] = str(decision.get("window_id") or "")
+
+    segments_by_id = {
+        str(segment.get("segment_id")): segment
+        for segment in voiceover_segments
+        if segment.get("segment_id")
+    }
+    aligned_segments: list[dict[str, Any]] = []
+    for index, decision in enumerate(edit_decisions):
+        segment_id = str(decision.get("segment_id") or _stable_segment_id(index))
+        segment = segments_by_id.get(segment_id)
+        if segment is None and index < len(voiceover_segments):
+            segment = voiceover_segments[index]
+        segment = dict(segment or {})
+        segment["segment_id"] = segment_id
+        segment["clip_id"] = segment.get("clip_id") or decision.get("clip_id")
+        segment["clip"] = segment.get("clip") or decision.get("clip")
+        segment["window_id"] = segment.get("window_id") or decision.get("window_id") or ""
+        segment["start_time"] = decision.get("start_time", segment.get("start_time", 0.0))
+        segment["duration"] = decision.get("duration", segment.get("duration", 0.0))
+        segment["voiceover"] = segment.get("voiceover") or segment.get("caption") or decision.get("caption") or ""
+        segment["caption"] = segment.get("caption") or decision.get("caption") or segment.get("voiceover") or ""
+        segment["purpose"] = segment.get("purpose") or decision.get("role") or "story beat"
+        aligned_segments.append(segment)
+
+    if not edit_decisions:
+        for index, segment in enumerate(voiceover_segments):
+            segment["segment_id"] = str(segment.get("segment_id") or _stable_segment_id(index))
+            segment["window_id"] = str(segment.get("window_id") or "")
+            aligned_segments.append(segment)
+
+    plan["edit_decisions"] = edit_decisions
+    plan["voiceover_segments"] = aligned_segments or voiceover_segments
+    plan["voiceover_script"] = " ".join(
+        str(segment.get("voiceover") or "").strip()
+        for segment in plan["voiceover_segments"]
+        if str(segment.get("voiceover") or "").strip()
+    ).strip() or str(plan.get("voiceover_script") or "")
+    return plan
+
+
 def _ensure_owner(session: dict[str, Any], owner_id: str) -> None:
     if (session.get("owner_id") or "local") != owner_id:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -771,6 +875,105 @@ def _create_session(owner_id: str = "local") -> dict[str, Any]:
     _session_dir(session_id)
     log_event(logger, 20, "session_created", session_id=session_id, owner_id=owner_id)
     return _public_session(session_id)
+
+
+def _rewrite_duplicate_asset_refs(value: Any, source_id: str, duplicate_id: str, source_dir: Path, duplicate_dir: Path) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_duplicate_asset_refs(item, source_id, duplicate_id, source_dir, duplicate_dir)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _rewrite_duplicate_asset_refs(item, source_id, duplicate_id, source_dir, duplicate_dir)
+            for item in value
+        ]
+    if not isinstance(value, str):
+        return value
+
+    rewritten = value.replace(f"/files/{source_id}/", f"/files/{duplicate_id}/")
+    source_prefix = str(source_dir)
+    if rewritten == source_prefix:
+        return str(duplicate_dir)
+    if rewritten.startswith(source_prefix + os.sep):
+        return str(duplicate_dir) + rewritten[len(source_prefix):]
+    return rewritten
+
+
+def _duplicate_phase(source: dict[str, Any], duplicate: dict[str, Any]) -> str:
+    if source.get("phase") == "complete" and duplicate.get("final_video_url"):
+        return "complete"
+    if duplicate.get("story_plan"):
+        return "ready_to_render"
+    if duplicate.get("media_items") and (duplicate.get("trip_context") or {}).get("destination"):
+        return "ready_to_plan"
+    return "collecting_context"
+
+
+def _duplicate_session(source_session_id: str, owner_id: str) -> dict[str, Any]:
+    source = _public_session(source_session_id)
+    _ensure_owner(source, owner_id)
+    duplicate = _default_session()
+    duplicate_id = duplicate["id"]
+    now = _now()
+    render_options = RenderRequest().model_dump()
+    render_options.update(source.get("render_options") or {})
+    source_dir = MEDIA_ROOT / source_session_id
+    duplicate_dir = MEDIA_ROOT / duplicate_id
+    if source_dir.exists():
+        shutil.copytree(source_dir, duplicate_dir, dirs_exist_ok=True)
+    else:
+        duplicate_dir.mkdir(parents=True, exist_ok=True)
+
+    source_title = _project_title(source)
+    duplicate_title = f"{source_title} copy"[:200]
+    duplicate.update(
+        owner_id=owner_id,
+        created_at=now,
+        updated_at=now,
+        metadata={"title": duplicate_title},
+        trip_context=copy.deepcopy(source.get("trip_context") or _default_context()),
+        media_items=_rewrite_duplicate_asset_refs(
+            copy.deepcopy(source.get("media_items") or []),
+            source_session_id,
+            duplicate_id,
+            source_dir,
+            duplicate_dir,
+        ),
+        recorded_clips=_rewrite_duplicate_asset_refs(
+            copy.deepcopy(source.get("recorded_clips") or []),
+            source_session_id,
+            duplicate_id,
+            source_dir,
+            duplicate_dir,
+        ),
+        clip_analysis=copy.deepcopy(source.get("clip_analysis") or []),
+        story_plan=copy.deepcopy(source.get("story_plan")),
+        script=source.get("script"),
+        final_video_url=_rewrite_duplicate_asset_refs(source.get("final_video_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        voiceover_audio_url=_rewrite_duplicate_asset_refs(source.get("voiceover_audio_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        story_json_url=_rewrite_duplicate_asset_refs(source.get("story_json_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        edit_decisions_url=_rewrite_duplicate_asset_refs(source.get("edit_decisions_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        caption_srt_url=_rewrite_duplicate_asset_refs(source.get("caption_srt_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        caption_vtt_url=_rewrite_duplicate_asset_refs(source.get("caption_vtt_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        render_options=copy.deepcopy(render_options),
+        llm_provider=source.get("llm_provider") or (source.get("trip_context") or {}).get("llm_provider") or "local",
+        llm_model=source.get("llm_model") or (source.get("trip_context") or {}).get("llm_model") or "",
+        share_token=None,
+        error=None,
+        progress_percent=100 if source.get("story_plan") else 0,
+        progress_label="Project duplicated",
+        next_action="Open the duplicate to continue editing or render a new recap.",
+        events=[{"at": now, "level": "info", "label": f"Duplicated from {source_session_id}"}],
+    )
+    duplicate["phase"] = _duplicate_phase(source, duplicate)
+    duplicate["screen"] = PHASE_SCREENS.get(duplicate["phase"], "context")
+
+    with _lock:
+        _sessions[duplicate_id] = duplicate
+        _save_sessions_locked()
+    log_event(logger, 20, "session_duplicated", session_id=duplicate_id, source_session_id=source_session_id, owner_id=owner_id)
+    return _public_session(duplicate_id)
 
 
 def _vision_requested() -> bool:
@@ -824,6 +1027,7 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
 
         _job_progress(job_id, session_id, "analyzing", "Analyzing trip brief and clip intelligence", 35)
         context = dict(session.get("trip_context") or {})
+        render_options = dict(session.get("render_options") or RenderRequest().model_dump())
         media_items = _ensure_current_clip_analysis(session_id, media_items, context)
         selected_provider = (context.get("llm_provider") or "").strip().lower()
         provider_name = selected_provider if selected_provider and selected_provider != "local" else None
@@ -848,7 +1052,7 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
         else:
             _job_progress(job_id, session_id, "planning", f"Using local fallback because {provider.provider} is not configured", 45)
             _event(session_id, f"Using local fallback because {provider.provider} is not configured", 45, level="warning")
-        plan = generate_trip_story(context, media_items, provider)
+        plan = generate_trip_story(context, media_items, provider, render_options=render_options)
         generation = plan.get("generation") or {}
         _event(
             session_id,
@@ -917,6 +1121,7 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
             raise ValueError("Upload at least one video before rendering.")
         if not story_plan:
             raise ValueError("Generate a narrative plan before rendering.")
+        story_plan = _ensure_story_segment_ids(story_plan)
 
         session_dir = _session_dir(session_id)
         output_path = session_dir / "holiday_recap.mp4"
@@ -929,6 +1134,24 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
         captions_vtt_path = session_dir / "captions.vtt"
         edit_decisions_path = session_dir / "edit_decisions.json"
         render_options = dict(session.get("render_options") or {})
+        generation = story_plan.get("generation") or {}
+        try:
+            planned_target = float(generation.get("target_duration_seconds") or 0)
+        except (TypeError, ValueError):
+            planned_target = 0.0
+        try:
+            selected_target = float(render_options.get("target_duration_seconds") or 0)
+        except (TypeError, ValueError):
+            selected_target = 0.0
+        if planned_target != selected_target:
+            _job_progress(job_id, session_id, "planning", "Adapting voiceover to selected duration", 18)
+            context = dict(session.get("trip_context") or {})
+            selected_provider = (context.get("llm_provider") or "").strip().lower()
+            provider_name = selected_provider if selected_provider and selected_provider != "local" else None
+            provider = LLMProvider(provider=provider_name, model=context.get("llm_model") or None)
+            media_items_for_plan = _ensure_current_clip_analysis(session_id, list(session.get("media_items") or []), context)
+            story_plan = generate_trip_story(context, media_items_for_plan, provider, render_options=render_options)
+            _update_session(session_id, story_plan=story_plan, script=story_plan.get("voiceover_script"))
         timeline_decisions = story_plan.get("edit_decisions") or []
         log_event(
             logger,
@@ -1062,7 +1285,8 @@ def list_sessions(auth: dict[str, str] = Depends(_auth_context)) -> dict[str, An
         "sessions": [
             {
                 "id": session["id"],
-                "destination": session.get("trip_context", {}).get("destination") or "Untitled trip",
+                "title": _project_title(session),
+                "destination": _project_destination(session),
                 "phase": session["phase"],
                 "updated_at": session["updated_at"],
                 "media_count": len(session.get("media_items") or []),
@@ -1084,6 +1308,26 @@ def get_session(session_id: str, auth: dict[str, str] = Depends(_auth_context)) 
     session = _public_session(session_id)
     _ensure_owner(session, _owner_from_auth(auth))
     return session
+
+
+@app.patch("/sessions/{session_id}/metadata")
+def update_session_metadata(
+    session_id: str,
+    request: ProjectMetadataRequest,
+    auth: dict[str, str] = Depends(_auth_context),
+) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    metadata = dict(session.get("metadata") or {})
+    if request.title is not None:
+        metadata["title"] = " ".join(request.title.split()).strip()
+    updated = _update_session(session_id, metadata=metadata, error=None)
+    return _public_session(updated["id"])
+
+
+@app.post("/sessions/{session_id}/duplicate")
+def duplicate_session(session_id: str, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
+    return _duplicate_session(session_id, _owner_from_auth(auth))
 
 
 @app.post("/sessions/{session_id}/context")
@@ -1199,6 +1443,95 @@ def generate_story(
     return _public_session(session_id)
 
 
+@app.patch("/sessions/{session_id}/voiceover-segments")
+def update_voiceover_segments(
+    session_id: str,
+    request: VoiceoverSegmentsPatchRequest,
+    auth: dict[str, str] = Depends(_auth_context),
+) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    if session.get("phase") in {"planning", "rendering"}:
+        raise HTTPException(status_code=409, detail="Wait for the current job to finish before editing voiceover segments.")
+    story_plan = session.get("story_plan")
+    if not isinstance(story_plan, dict):
+        raise HTTPException(status_code=409, detail="Generate a narrative plan before editing voiceover segments.")
+
+    plan = _ensure_story_segment_ids(story_plan)
+    existing_ids = {
+        str(segment.get("segment_id"))
+        for segment in plan.get("voiceover_segments") or []
+        if segment.get("segment_id")
+    }
+    updates = {item.segment_id: item for item in request.segments}
+    unknown_ids = sorted(set(updates) - existing_ids)
+    if unknown_ids:
+        raise HTTPException(status_code=422, detail=f"Unknown segment_id: {', '.join(unknown_ids)}")
+
+    edited_segments: list[dict[str, Any]] = []
+    for segment in plan.get("voiceover_segments") or []:
+        next_segment = dict(segment)
+        update = updates.get(str(next_segment.get("segment_id") or ""))
+        if update:
+            next_segment["voiceover"] = _clean_segment_text(update.voiceover, "voiceover", 500)
+            if update.caption is not None:
+                next_segment["caption"] = _clean_segment_text(update.caption, "caption", 180)
+        edited_segments.append(next_segment)
+
+    edited_by_id = {
+        str(segment.get("segment_id")): segment
+        for segment in edited_segments
+        if segment.get("segment_id")
+    }
+    edited_decisions: list[dict[str, Any]] = []
+    for decision in plan.get("edit_decisions") or []:
+        next_decision = dict(decision)
+        segment = edited_by_id.get(str(next_decision.get("segment_id") or ""))
+        if segment and segment.get("caption"):
+            next_decision["caption"] = segment.get("caption")
+        edited_decisions.append(next_decision)
+
+    plan["voiceover_segments"] = edited_segments
+    plan["edit_decisions"] = edited_decisions
+    plan["voiceover_script"] = " ".join(
+        str(segment.get("voiceover") or "").strip()
+        for segment in edited_segments
+        if str(segment.get("voiceover") or "").strip()
+    ).strip()
+
+    stale_render = bool(session.get("final_video_url")) or session.get("phase") == "complete"
+    session_updates: dict[str, Any] = {
+        "story_plan": plan,
+        "script": plan["voiceover_script"],
+        "progress_label": "Narrative ready",
+        "next_action": "Review the edited segment scripts and render the recap video.",
+        "error": None,
+        "progress_percent": 100,
+    }
+    if stale_render:
+        session_updates.update(
+            phase="ready_to_render",
+            final_video_url=None,
+            voiceover_audio_url=None,
+            story_json_url=None,
+            edit_decisions_url=None,
+            caption_srt_url=None,
+            caption_vtt_url=None,
+        )
+    updated = _update_session(session_id, **session_updates)
+    log_event(
+        logger,
+        20,
+        "voiceover_segments_updated",
+        session_id=session_id,
+        segment_count=len(request.segments),
+        stale_render=stale_render,
+        stage="story_review",
+        outcome="success",
+    )
+    return _public_session(updated["id"])
+
+
 @app.post("/sessions/{session_id}/render")
 def render_session(
     session_id: str,
@@ -1259,12 +1592,12 @@ def delete_session(session_id: str, auth: dict[str, str] = Depends(_auth_context
     _ensure_owner(session, _owner_from_auth(auth))
     with _lock:
         _sessions.pop(session_id, None)
-        _save_sessions_locked()
         if SESSION_DB.exists():
             with _connect_db() as conn:
                 conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
                 conn.execute("DELETE FROM jobs WHERE session_id = ?", (session_id,))
                 conn.commit()
+        _save_sessions_locked()
     shutil.rmtree(MEDIA_ROOT / session_id, ignore_errors=True)
     return {"status": "deleted"}
 

@@ -39,6 +39,24 @@ export type ClipAnalysis = {
   mean_volume_db?: number | null;
   best_moment_timestamps?: number[];
   landmark_candidate_timestamps?: number[];
+  smart_windows?: Array<{
+    window_id: string;
+    start_time: number;
+    duration: number;
+    score: number;
+    frame_timestamps: number[];
+    visual_evidence?: string;
+    semantic_source?: string;
+    visible_subjects?: string[];
+    locations_or_scenes?: string[];
+    visible_actions?: string[];
+    visual_mood?: string;
+    avoid_reasons?: string[];
+    best_moment_description?: {
+      timestamp: number;
+      description: string;
+    };
+  }>;
   named_landmarks?: Array<{
     name: string;
     timestamp: number;
@@ -76,8 +94,10 @@ export type StoryPlan = {
   narrative_arc?: string[];
   voiceover_script?: string;
   voiceover_segments?: Array<{
+    segment_id?: string;
     clip_id?: string;
     clip?: string;
+    window_id?: string;
     start_time?: number;
     duration?: number;
     voiceover?: string;
@@ -92,8 +112,10 @@ export type StoryPlan = {
     suggested_use?: string;
   }>;
   edit_decisions?: Array<{
+    segment_id?: string;
     clip_id?: string;
     clip?: string;
+    window_id?: string;
     start_time?: number;
     duration?: number;
     role?: string;
@@ -137,6 +159,7 @@ export type JobSummary = {
 
 export type ProjectSummary = {
   id: string;
+  title?: string;
   destination: string;
   phase: TripPhase;
   updated_at: number;
@@ -157,6 +180,9 @@ export type TripSession = {
   progress_percent: number;
   events: Array<{ at: number; level: string; label: string }>;
   active_job?: JobSummary | null;
+  metadata?: {
+    title?: string;
+  };
   trip_context: TripContext;
   media_items: MediaItem[];
   recorded_clips: string[];

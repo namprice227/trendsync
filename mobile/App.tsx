@@ -19,6 +19,8 @@ import {
 
 import {
   createSession,
+  deleteSession,
+  duplicateSession,
   generateStory,
   getSession,
   listSessions,
@@ -27,10 +29,12 @@ import {
   renderTripVideo,
   saveTripContext,
   shareSession,
+  updateProjectMetadata,
+  updateVoiceoverSegments,
   uploadMedia,
 } from './src/api';
 import { colors, radii, shadow } from './src/theme';
-import type { ClipAnalysis, ProjectSummary, RenderOptions, TripContext, TripPhase, TripScreen, TripSession } from './src/types';
+import type { ClipAnalysis, MediaItem, ProjectSummary, RenderOptions, TripContext, TripPhase, TripScreen, TripSession } from './src/types';
 
 const DEFAULT_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8010' : 'http://localhost:8010';
 const busyPhases: TripPhase[] = ['uploading', 'planning', 'rendering'];
@@ -46,6 +50,25 @@ const defaultRenderOptions: RenderOptions = {
 };
 
 const VIDEO_LENGTH_PRESETS = [15, 30, 45, 60, 90];
+type AppView = 'dashboard' | 'project';
+type ProjectFilter = 'all' | 'drafting' | 'ready' | 'rendering' | 'complete' | 'error';
+type ProjectSort = 'recent' | 'name' | 'status';
+type ProjectAction = 'rename' | 'duplicate' | 'share' | 'delete';
+
+const projectFilters: Array<{ key: ProjectFilter; label: string }> = [
+  { key: 'all', label: 'All' },
+  { key: 'drafting', label: 'Drafting' },
+  { key: 'ready', label: 'Ready' },
+  { key: 'rendering', label: 'Rendering' },
+  { key: 'complete', label: 'Complete' },
+  { key: 'error', label: 'Error' },
+];
+
+const projectSorts: Array<{ key: ProjectSort; label: string }> = [
+  { key: 'recent', label: 'Recent' },
+  { key: 'name', label: 'Name' },
+  { key: 'status', label: 'Status' },
+];
 
 const LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -243,19 +266,25 @@ function StatusStrip({ session }: { session: TripSession }) {
 
 function AppShell({
   session,
+  showProjectChrome,
   apiUrl,
   apiDraft,
   setApiDraft,
   onReconnect,
   onRestart,
+  creatingProject,
+  onBackToDashboard,
   children,
 }: {
   session: TripSession | null;
+  showProjectChrome: boolean;
   apiUrl: string;
   apiDraft: string;
   setApiDraft: (value: string) => void;
   onReconnect: () => void;
   onRestart: () => void;
+  creatingProject: boolean;
+  onBackToDashboard: () => void;
   children: React.ReactNode;
 }) {
   const { width } = useWindowDimensions();
@@ -275,6 +304,12 @@ function AppShell({
               <Text style={styles.brandSub}>Holiday narrative studio</Text>
             </View>
           </View>
+          {showProjectChrome ? (
+            <Pressable onPress={onBackToDashboard} style={styles.backButton}>
+              <Ionicons name="arrow-back" size={16} color={colors.graphite} />
+              <Text style={styles.backText}>Dashboard</Text>
+            </Pressable>
+          ) : null}
           <View style={styles.serverBox}>
             <TextInput
               value={apiDraft}
@@ -290,14 +325,14 @@ function AppShell({
               <Ionicons name="sync" size={16} color={colors.blue} />
             </Pressable>
           </View>
-          <Pressable onPress={onRestart} style={styles.restartButton}>
-            <Ionicons name="add-circle-outline" size={17} color={colors.white} />
-            <Text style={styles.restartText}>New project</Text>
+          <Pressable onPress={onRestart} disabled={creatingProject} style={[styles.restartButton, creatingProject && styles.buttonDisabled]}>
+            <Ionicons name={creatingProject ? 'hourglass-outline' : 'add-circle-outline'} size={17} color={colors.white} />
+            <Text style={styles.restartText}>{creatingProject ? 'Creating' : 'New project'}</Text>
           </Pressable>
         </View>
         <View style={styles.shellChrome}>
-          {session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
-          {session ? <StatusStrip session={session} /> : null}
+          {showProjectChrome && session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
+          {showProjectChrome && session ? <StatusStrip session={session} /> : null}
         </View>
         {children}
       </KeyboardAvoidingView>
@@ -381,6 +416,24 @@ function formatTimestamp(value: number): string {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
+function fallbackSegmentId(index: number): string {
+  return `seg_${String(index + 1).padStart(3, '0')}`;
+}
+
+function segmentForDecision(
+  segments: NonNullable<TripSession['story_plan']>['voiceover_segments'] | undefined,
+  decision: NonNullable<NonNullable<TripSession['story_plan']>['edit_decisions']>[number],
+  index: number
+) {
+  const segmentId = decision.segment_id || fallbackSegmentId(index);
+  return segments?.find((segment) => segment.segment_id === segmentId) || segments?.[index] || null;
+}
+
+function windowForDecision(mediaItems: MediaItem[], decision: NonNullable<NonNullable<TripSession['story_plan']>['edit_decisions']>[number]) {
+  const item = mediaItems.find((media) => media.id === decision.clip_id || media.filename === decision.clip);
+  return item?.analysis?.smart_windows?.find((window) => window.window_id === decision.window_id) || null;
+}
+
 function ClipIntelligence({ clips }: { clips: ClipAnalysis[] }) {
   if (!clips.length) return null;
   return (
@@ -418,63 +471,357 @@ function ClipIntelligence({ clips }: { clips: ClipAnalysis[] }) {
   );
 }
 
-function ProjectLibrary({
-  projects,
-  activeId,
-  onOpen,
-  onNew,
+function projectTitle(project: ProjectSummary): string {
+  return (project.title || project.destination || 'Untitled trip').trim();
+}
+
+function sessionTitle(session: TripSession): string {
+  return (session.metadata?.title || session.trip_context.destination || 'Untitled trip').trim();
+}
+
+function phaseLabel(phase: TripPhase): string {
+  return phase.replaceAll('_', ' ');
+}
+
+function phaseFilter(phase: TripPhase): ProjectFilter {
+  if (phase === 'complete') return 'complete';
+  if (phase === 'error') return 'error';
+  if (phase === 'planning' || phase === 'rendering') return 'rendering';
+  if (phase === 'ready_to_plan' || phase === 'ready_to_render') return 'ready';
+  return 'drafting';
+}
+
+function phaseTone(phase: TripPhase): 'neutral' | 'info' | 'success' | 'warning' {
+  if (phase === 'complete') return 'success';
+  if (phase === 'error') return 'warning';
+  if (phase === 'ready_to_plan' || phase === 'ready_to_render' || phase === 'planning' || phase === 'rendering') return 'info';
+  return 'neutral';
+}
+
+function formatUpdatedAt(value: number): string {
+  const timestamp = value < 10000000000 ? value * 1000 : value;
+  const elapsed = Math.max(0, Date.now() - timestamp);
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (elapsed < minute) return 'Just now';
+  if (elapsed < hour) return `${Math.floor(elapsed / minute)}m ago`;
+  if (elapsed < day) return `${Math.floor(elapsed / hour)}h ago`;
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(timestamp));
+}
+
+function ProjectActionButton({
+  icon,
+  label,
+  onPress,
+  disabled,
+  busy,
+  danger,
 }: {
-  projects: ProjectSummary[];
-  activeId: string;
-  onOpen: (sessionId: string) => void;
-  onNew: () => void;
+  icon: keyof typeof Ionicons.glyphMap;
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+  busy?: boolean;
+  danger?: boolean;
 }) {
   return (
-    <View style={styles.insightPanel}>
-      <View style={styles.insightHead}>
-        <SectionHeader icon="albums-outline" title="Projects" meta={`${projects.length} saved`} />
-        <Pressable onPress={onNew} style={styles.iconButton}>
-          <Ionicons name="add" size={17} color={colors.blue} />
-        </Pressable>
-      </View>
-      {!projects.length ? (
-        <View style={styles.emptyState}>
-          <Ionicons name="folder-open-outline" size={22} color={colors.subtle} />
-          <Text style={styles.emptyText}>No saved projects yet.</Text>
+    <Pressable
+      accessibilityLabel={label}
+      onPress={onPress}
+      disabled={disabled || busy}
+      style={({ pressed }) => [
+        styles.projectActionButton,
+        danger && styles.projectActionDanger,
+        (disabled || busy) && styles.projectActionDisabled,
+        pressed && !disabled && !busy && styles.buttonPressed,
+      ]}
+    >
+      {busy ? <ActivityIndicator size="small" color={danger ? colors.red : colors.blue} /> : <Ionicons name={icon} size={16} color={danger ? colors.red : colors.graphite} />}
+    </Pressable>
+  );
+}
+
+function DashboardScreen({
+  projects,
+  loading,
+  creating,
+  onOpen,
+  onNew,
+  onRename,
+  onDuplicate,
+  onDelete,
+  onShare,
+}: {
+  projects: ProjectSummary[];
+  loading: boolean;
+  creating: boolean;
+  onOpen: (sessionId: string) => void;
+  onNew: () => void;
+  onRename: (sessionId: string, title: string) => Promise<void>;
+  onDuplicate: (sessionId: string) => Promise<TripSession>;
+  onDelete: (sessionId: string) => Promise<void>;
+  onShare: (sessionId: string) => Promise<string>;
+}) {
+  const { width } = useWindowDimensions();
+  const compact = width < 860;
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<ProjectFilter>('all');
+  const [sort, setSort] = useState<ProjectSort>('recent');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [action, setAction] = useState<{ id: string; type: ProjectAction } | null>(null);
+
+  const visibleProjects = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    const statusOrder: Record<TripPhase, number> = {
+      collecting_context: 0,
+      uploading: 0,
+      ready_to_plan: 1,
+      ready_to_render: 1,
+      planning: 2,
+      rendering: 2,
+      complete: 3,
+      error: 4,
+    };
+    return [...projects]
+      .filter((project) => {
+        if (filter !== 'all' && phaseFilter(project.phase) !== filter) return false;
+        if (!normalizedQuery) return true;
+        return `${projectTitle(project)} ${project.destination}`.toLowerCase().includes(normalizedQuery);
+      })
+      .sort((left, right) => {
+        if (sort === 'name') return projectTitle(left).localeCompare(projectTitle(right));
+        if (sort === 'status') return statusOrder[left.phase] - statusOrder[right.phase] || right.updated_at - left.updated_at;
+        return right.updated_at - left.updated_at;
+      });
+  }, [filter, projects, query, sort]);
+
+  const busy = Boolean(action) || creating;
+
+  const startRename = (project: ProjectSummary) => {
+    setNotice(null);
+    setConfirmDeleteId(null);
+    setRenamingId(project.id);
+    setRenameDraft(projectTitle(project));
+  };
+
+  const commitRename = async (project: ProjectSummary) => {
+    const nextTitle = renameDraft.trim();
+    if (!nextTitle || nextTitle === projectTitle(project)) {
+      setRenamingId(null);
+      return;
+    }
+    setAction({ id: project.id, type: 'rename' });
+    try {
+      await onRename(project.id, nextTitle);
+      setRenamingId(null);
+      setNotice(`Renamed to ${nextTitle}`);
+    } catch (renameError) {
+      setNotice(renameError instanceof Error ? renameError.message : 'Rename failed');
+    } finally {
+      setAction(null);
+    }
+  };
+
+  const duplicateProject = async (project: ProjectSummary) => {
+    setAction({ id: project.id, type: 'duplicate' });
+    setNotice(null);
+    try {
+      const duplicate = await onDuplicate(project.id);
+      setNotice(`Duplicated as ${sessionTitle(duplicate)}`);
+    } catch (duplicateError) {
+      setNotice(duplicateError instanceof Error ? duplicateError.message : 'Duplicate failed');
+    } finally {
+      setAction(null);
+    }
+  };
+
+  const deleteProject = async (project: ProjectSummary) => {
+    setAction({ id: project.id, type: 'delete' });
+    setNotice(null);
+    try {
+      await onDelete(project.id);
+      setConfirmDeleteId(null);
+      setNotice(`${projectTitle(project)} deleted`);
+    } catch (deleteError) {
+      setNotice(deleteError instanceof Error ? deleteError.message : 'Delete failed');
+    } finally {
+      setAction(null);
+    }
+  };
+
+  const shareProject = async (project: ProjectSummary) => {
+    setAction({ id: project.id, type: 'share' });
+    setNotice(null);
+    try {
+      const url = await onShare(project.id);
+      setNotice(`Share link: ${url}`);
+    } catch (shareError) {
+      setNotice(shareError instanceof Error ? shareError.message : 'Share failed');
+    } finally {
+      setAction(null);
+    }
+  };
+
+  return (
+    <ScrollView contentContainerStyle={styles.dashboardScreen}>
+      <View style={styles.dashboardBand}>
+        <View style={[styles.dashboardHeader, compact && styles.dashboardHeaderCompact]}>
+          <SectionHeader icon="albums-outline" title="Projects" meta={`${projects.length} saved`} />
+          <PrimaryButton icon={creating ? 'hourglass-outline' : 'add-circle-outline'} label={creating ? 'Creating' : 'New project'} onPress={onNew} disabled={busy} />
         </View>
-      ) : null}
-      {projects.slice(0, 5).map((project) => {
-        const active = project.id === activeId;
-        return (
-          <Pressable key={project.id} onPress={() => onOpen(project.id)} style={[styles.projectRow, active && styles.projectRowActive]}>
-            <View style={styles.projectRowCopy}>
-              <Text style={styles.insightTitle}>{project.destination}</Text>
-              <Text style={styles.projectMeta}>{project.media_count} clips · {project.phase.replaceAll('_', ' ')}</Text>
-            </View>
-            {active ? <Ionicons name="checkmark" size={16} color={colors.blue} /> : null}
-          </Pressable>
-        );
-      })}
-    </View>
+
+        <View style={[styles.dashboardToolbar, compact && styles.dashboardToolbarCompact]}>
+          <View style={styles.searchBox}>
+            <Ionicons name="search-outline" size={16} color={colors.muted} />
+            <TextInput
+              value={query}
+              onChangeText={setQuery}
+              placeholder="Search destination or title"
+              placeholderTextColor={colors.muted}
+              style={styles.searchInput}
+            />
+          </View>
+          <View style={styles.segmentGroup}>
+            {projectFilters.map((item) => {
+              const active = filter === item.key;
+              return (
+                <Pressable key={item.key} onPress={() => setFilter(item.key)} style={[styles.segmentChip, active && styles.segmentChipActive]}>
+                  <Text style={[styles.segmentText, active && styles.segmentTextActive]}>{item.label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <View style={styles.segmentGroup}>
+            {projectSorts.map((item) => {
+              const active = sort === item.key;
+              return (
+                <Pressable key={item.key} onPress={() => setSort(item.key)} style={[styles.segmentChip, active && styles.segmentChipActive]}>
+                  <Text style={[styles.segmentText, active && styles.segmentTextActive]}>{item.label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+
+        {notice ? (
+          <View style={styles.dashboardNotice}>
+            <Ionicons name="information-circle-outline" size={16} color={colors.blue} />
+            <Text style={styles.dashboardNoticeText}>{notice}</Text>
+          </View>
+        ) : null}
+
+        {loading && !projects.length ? (
+          <View style={styles.projectList}>
+            {[0, 1, 2].map((item) => (
+              <View key={item} style={styles.projectSkeletonRow}>
+                <View style={styles.skeletonTitle} />
+                <View style={styles.skeletonMeta} />
+              </View>
+            ))}
+          </View>
+        ) : null}
+
+        {!loading && !projects.length ? (
+          <View style={styles.dashboardEmpty}>
+            <Ionicons name="folder-open-outline" size={28} color={colors.subtle} />
+            <Text style={styles.emptyText}>No projects yet. Create a project to start a TripStory workflow.</Text>
+          </View>
+        ) : null}
+
+        {!loading && projects.length > 0 && !visibleProjects.length ? (
+          <View style={styles.dashboardEmpty}>
+            <Ionicons name="funnel-outline" size={24} color={colors.subtle} />
+            <Text style={styles.emptyText}>No projects match the current search and filters.</Text>
+          </View>
+        ) : null}
+
+        {visibleProjects.length ? (
+          <View style={styles.projectList}>
+            {visibleProjects.map((project) => {
+              const title = projectTitle(project);
+              const rowAction = (type: ProjectAction) => action?.id === project.id && action.type === type;
+              return (
+                <View key={project.id} style={[styles.dashboardProjectRow, compact && styles.dashboardProjectRowCompact]}>
+                  <View style={styles.dashboardProjectMain}>
+                    {renamingId === project.id ? (
+                      <View style={styles.renameRow}>
+                        <TextInput
+                          value={renameDraft}
+                          onChangeText={setRenameDraft}
+                          autoFocus
+                          onSubmitEditing={() => commitRename(project)}
+                          placeholder="Project title"
+                          placeholderTextColor={colors.muted}
+                          style={[styles.input, styles.renameInput]}
+                        />
+                        <ProjectActionButton icon="checkmark" label="Save rename" onPress={() => commitRename(project)} busy={rowAction('rename')} disabled={busy && !rowAction('rename')} />
+                        <ProjectActionButton icon="close" label="Cancel rename" onPress={() => setRenamingId(null)} disabled={busy} />
+                      </View>
+                    ) : (
+                      <Pressable onPress={() => onOpen(project.id)} disabled={busy} style={styles.projectOpenTarget}>
+                        <Text style={styles.dashboardProjectTitle}>{title}</Text>
+                        <Text style={styles.dashboardProjectSubtitle}>{project.destination}</Text>
+                      </Pressable>
+                    )}
+                  </View>
+
+                  <View style={styles.projectFacts}>
+                    <Tag label={phaseLabel(project.phase)} tone={phaseTone(project.phase)} />
+                    <View style={styles.projectFact}>
+                      <Ionicons name="videocam-outline" size={14} color={colors.muted} />
+                      <Text style={styles.projectFactText}>{project.media_count}</Text>
+                    </View>
+                    <Tag label={project.final_video_url ? 'Render ready' : 'No render'} tone={project.final_video_url ? 'success' : 'neutral'} />
+                    <Tag label={project.share_token ? 'Shared' : 'Private'} tone={project.share_token ? 'info' : 'neutral'} />
+                    <View style={styles.projectFact}>
+                      <Ionicons name="time-outline" size={14} color={colors.muted} />
+                      <Text style={styles.projectFactText}>{formatUpdatedAt(project.updated_at)}</Text>
+                    </View>
+                  </View>
+
+                  {confirmDeleteId === project.id ? (
+                    <View style={styles.deleteConfirmRow}>
+                      <Text style={styles.deleteConfirmText}>Delete permanently?</Text>
+                      <Pressable onPress={() => setConfirmDeleteId(null)} disabled={busy} style={styles.confirmButton}>
+                        <Text style={styles.confirmButtonText}>Cancel</Text>
+                      </Pressable>
+                      <Pressable onPress={() => deleteProject(project)} disabled={busy} style={[styles.confirmButton, styles.confirmButtonDanger]}>
+                        {rowAction('delete') ? <ActivityIndicator size="small" color={colors.white} /> : <Text style={[styles.confirmButtonText, styles.confirmButtonTextDanger]}>Delete</Text>}
+                      </Pressable>
+                    </View>
+                  ) : (
+                    <View style={styles.projectActions}>
+                      <ProjectActionButton icon="open-outline" label="Open project" onPress={() => onOpen(project.id)} disabled={busy} />
+                      <ProjectActionButton icon="create-outline" label="Rename project" onPress={() => startRename(project)} disabled={busy} />
+                      <ProjectActionButton icon="copy-outline" label="Duplicate project" onPress={() => duplicateProject(project)} busy={rowAction('duplicate')} disabled={busy && !rowAction('duplicate')} />
+                      <ProjectActionButton icon="share-outline" label="Share project" onPress={() => shareProject(project)} busy={rowAction('share')} disabled={busy && !rowAction('share')} />
+                      <ProjectActionButton icon="trash-outline" label="Delete project" onPress={() => setConfirmDeleteId(project.id)} disabled={busy} danger />
+                    </View>
+                  )}
+                </View>
+              );
+            })}
+          </View>
+        ) : null}
+      </View>
+    </ScrollView>
   );
 }
 
 function ContextScreen({
   session,
-  projects,
   onSave,
   onUpload,
   onGenerate,
-  onOpenProject,
-  onNewProject,
 }: {
   session: TripSession;
-  projects: ProjectSummary[];
   onSave: (context: TripContext) => void;
   onUpload: () => void;
   onGenerate: (context: TripContext) => void;
-  onOpenProject: (sessionId: string) => void;
-  onNewProject: () => void;
 }) {
   const { width } = useWindowDimensions();
   const [context, setContext] = useState<TripContext>(session.trip_context);
@@ -494,13 +841,12 @@ function ContextScreen({
     <ScrollView contentContainerStyle={styles.screen}>
       <View style={[styles.contextLayout, desktop && styles.contextLayoutDesktop]}>
         <View style={[styles.studioPanel, desktop && styles.studioPanelDesktop]}>
-          <ProjectLibrary projects={projects} activeId={session.id} onOpen={onOpenProject} onNew={onNewProject} />
           <View style={styles.heroPanel}>
             <View style={styles.heroTopline}>
               <Text style={styles.eyebrow}>Current project</Text>
               <Tag label={session.phase.replaceAll('_', ' ')} tone={session.phase === 'complete' ? 'success' : session.phase === 'error' ? 'warning' : 'info'} />
             </View>
-            <Text style={styles.heroTitle}>{context.destination || 'Untitled trip'}</Text>
+            <Text style={styles.heroTitle}>{sessionTitle(session)}</Text>
             <Text style={styles.heroCopy}>{context.highlights || context.places_visited || 'Add a destination, moments, and clips to build the edit.'}</Text>
           </View>
 
@@ -568,10 +914,12 @@ function PlanScreen({
   session,
   onGenerate,
   onRender,
+  onSaveVoiceoverSegments,
 }: {
   session: TripSession;
   onGenerate: () => void;
   onRender: (options: RenderOptions) => void;
+  onSaveVoiceoverSegments: (segments: Array<{ segment_id: string; voiceover: string; caption?: string }>) => Promise<void>;
 }) {
   const { width } = useWindowDimensions();
   const plan = session.story_plan;
@@ -582,11 +930,26 @@ function PlanScreen({
   const editDecisions = Array.isArray(plan?.edit_decisions) ? plan.edit_decisions : [];
   const voiceoverSegments = Array.isArray(plan?.voiceover_segments) ? plan.voiceover_segments : [];
   const [options, setOptions] = useState<RenderOptions>({ ...defaultRenderOptions, ...(session.render_options || {}) });
+  const [scriptDrafts, setScriptDrafts] = useState<Record<string, { voiceover: string; caption: string }>>({});
+  const [savingScripts, setSavingScripts] = useState(false);
   const desktop = width >= 920;
 
   useEffect(() => {
     setOptions({ ...defaultRenderOptions, ...(session.render_options || {}) });
   }, [session.id]);
+
+  useEffect(() => {
+    const nextDrafts: Record<string, { voiceover: string; caption: string }> = {};
+    editDecisions.forEach((decision, index) => {
+      const segment = segmentForDecision(voiceoverSegments, decision, index);
+      const segmentId = decision.segment_id || segment?.segment_id || fallbackSegmentId(index);
+      nextDrafts[segmentId] = {
+        voiceover: String(segment?.voiceover || ''),
+        caption: String(segment?.caption || decision.caption || ''),
+      };
+    });
+    setScriptDrafts(nextDrafts);
+  }, [session.id, plan?.voiceover_script, editDecisions.length, voiceoverSegments.length]);
 
   const toggleFavorite = (clipId: string) => {
     setOptions((current) => {
@@ -610,6 +973,44 @@ function PlanScreen({
       [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
       return { ...current, clip_order: next };
     });
+  };
+
+  const segmentRows = editDecisions.map((decision, index) => {
+    const segment = segmentForDecision(voiceoverSegments, decision, index);
+    const selectedWindow = windowForDecision(session.media_items, decision);
+    const segmentId = decision.segment_id || segment?.segment_id || fallbackSegmentId(index);
+    const draft = scriptDrafts[segmentId] || {
+      voiceover: String(segment?.voiceover || ''),
+      caption: String(segment?.caption || decision.caption || ''),
+    };
+    return { decision, segment, selectedWindow, segmentId, draft, index };
+  });
+
+  const hasScriptChanges = segmentRows.some(({ segment, decision, draft }) => {
+    const sourceVoiceover = String(segment?.voiceover || '');
+    const sourceCaption = String(segment?.caption || decision.caption || '');
+    return draft.voiceover !== sourceVoiceover || draft.caption !== sourceCaption;
+  });
+
+  const saveScriptEdits = async () => {
+    const payload = segmentRows
+      .filter(({ segment, decision, draft }) => {
+        const sourceVoiceover = String(segment?.voiceover || '');
+        const sourceCaption = String(segment?.caption || decision.caption || '');
+        return draft.voiceover !== sourceVoiceover || draft.caption !== sourceCaption;
+      })
+      .map(({ segmentId, draft, segment, decision }) => ({
+        segment_id: segmentId,
+        voiceover: draft.voiceover.trim(),
+        caption: (draft.caption.trim() || String(segment?.caption || decision.caption || draft.voiceover).trim()).slice(0, 180),
+      }));
+    if (!payload.length) return;
+    setSavingScripts(true);
+    try {
+      await onSaveVoiceoverSegments(payload);
+    } finally {
+      setSavingScripts(false);
+    }
   };
 
   return (
@@ -648,17 +1049,12 @@ function PlanScreen({
                 <Text style={styles.waitText}>Writing voiceover and edit notes.</Text>
               </View>
             ) : null}
-            {plan?.voiceover_script ? (
-              <>
-                <SectionHeader icon="mic-outline" title="Voiceover" meta={`${String(plan.voiceover_script).length} chars`} />
-                <Text style={styles.script}>{String(plan.voiceover_script)}</Text>
-              </>
-            ) : (
+            {!plan && !busy ? (
               <View style={styles.emptyState}>
                 <Ionicons name="document-text-outline" size={22} color={colors.subtle} />
                 <Text style={styles.emptyText}>No voiceover script yet.</Text>
               </View>
-            )}
+            ) : null}
           </View>
 
           {narrativeArc.length ? (
@@ -752,19 +1148,53 @@ function PlanScreen({
 
       {editDecisions.length ? (
         <View style={styles.panel}>
-          <SectionHeader icon="cut-outline" title="Smart edit decisions" meta={`${editDecisions.length} segments`} />
-          {editDecisions.map((decision, index) => (
-            <View key={`${decision.clip || 'clip'}-${index}`} style={styles.timelineControl}>
+          <View style={styles.panelHeading}>
+            <SectionHeader icon="cut-outline" title="Smart edit decisions" meta={`${editDecisions.length} segments`} />
+            <PrimaryButton
+              icon={savingScripts ? 'hourglass-outline' : 'save-outline'}
+              label={savingScripts ? 'Saving' : 'Save script edits'}
+              onPress={saveScriptEdits}
+              disabled={busy || savingScripts || !hasScriptChanges}
+              tone="light"
+            />
+          </View>
+          {segmentRows.map(({ decision, selectedWindow, segmentId, draft, index }) => (
+            <View key={`${segmentId}-${decision.clip || 'clip'}-${index}`} style={styles.segmentEditor}>
               <Text style={styles.timelineNumber}>{index + 1}</Text>
-              <View style={styles.projectRowCopy}>
+              <View style={styles.segmentEditorBody}>
                 <Text style={styles.insightTitle}>{decision.clip || decision.clip_id || 'Selected clip'}</Text>
                 <Text style={styles.projectMeta}>
-                  {formatTimestamp(decision.start_time || 0)} · {Math.round(decision.duration || 0)}s · {decision.transition || 'cut'}
+                  {decision.window_id || selectedWindow?.window_id || 'window'} · {formatTimestamp(decision.start_time || 0)} · {Math.round(decision.duration || 0)}s · {decision.transition || 'cut'}
                 </Text>
-                <Text style={styles.listItem}>{decision.reason || decision.role || 'Selected by the smart edit planner.'}</Text>
-                {voiceoverSegments[index]?.voiceover ? (
-                  <Text style={styles.listItem}>Voiceover: {voiceoverSegments[index].voiceover}</Text>
-                ) : null}
+                <Text style={styles.listItem}>
+                  {selectedWindow?.visual_evidence || decision.reason || decision.role || 'Selected by the smart edit planner.'}
+                </Text>
+                {decision.reason && selectedWindow?.visual_evidence ? <Text style={styles.projectMeta}>{decision.reason}</Text> : null}
+                <TextInput
+                  value={draft.voiceover}
+                  onChangeText={(value) =>
+                    setScriptDrafts((current) => ({
+                      ...current,
+                      [segmentId]: { ...(current[segmentId] || draft), voiceover: value },
+                    }))
+                  }
+                  multiline
+                  placeholder="Write this segment's narration"
+                  placeholderTextColor={colors.muted}
+                  style={[styles.input, styles.segmentVoiceInput]}
+                />
+                <TextInput
+                  value={draft.caption}
+                  onChangeText={(value) =>
+                    setScriptDrafts((current) => ({
+                      ...current,
+                      [segmentId]: { ...(current[segmentId] || draft), caption: value },
+                    }))
+                  }
+                  placeholder="Caption"
+                  placeholderTextColor={colors.muted}
+                  style={[styles.input, styles.segmentCaptionInput]}
+                />
               </View>
             </View>
           ))}
@@ -773,7 +1203,7 @@ function PlanScreen({
 
       <View style={styles.actionRow}>
         <PrimaryButton icon="refresh-outline" label="Regenerate" onPress={onGenerate} disabled={busy || session.media_items.length === 0} tone="light" />
-        <PrimaryButton icon="film-outline" label="Render video" onPress={() => onRender(options)} disabled={busy || !plan || session.recorded_clips.length === 0} />
+        <PrimaryButton icon="film-outline" label="Render video" onPress={() => onRender(options)} disabled={busy || savingScripts || hasScriptChanges || !plan || session.recorded_clips.length === 0} />
       </View>
     </ScrollView>
   );
@@ -841,9 +1271,12 @@ function OutputScreen({
 export default function App() {
   const [apiDraft, setApiDraft] = useState(DEFAULT_API_URL);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
+  const [view, setView] = useState<AppView>('dashboard');
   const [session, setSession] = useState<TripSession | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [creatingProject, setCreatingProject] = useState(false);
 
   const refreshProjects = useCallback(async (baseUrl: string) => {
     const items = await listSessions(baseUrl);
@@ -853,30 +1286,29 @@ export default function App() {
 
   const connect = useCallback(async () => {
     const nextUrl = normalizeBaseUrl(apiDraft);
+    setLoadingProjects(true);
     try {
       setError(null);
       setApiUrl(nextUrl);
-      const existing = await refreshProjects(nextUrl);
-      if (existing.length) {
-        const opened = await getSession(nextUrl, existing[0].id);
-        setSession(opened);
-      } else {
-        const created = await createSession(nextUrl);
-        setSession(created);
-        await refreshProjects(nextUrl);
-      }
+      await refreshProjects(nextUrl);
+      setSession(null);
+      setView('dashboard');
     } catch (connectError) {
       setSession(null);
+      setProjects([]);
+      setView('dashboard');
       setError(connectError instanceof Error ? connectError.message : 'Could not reach TripStory API');
+    } finally {
+      setLoadingProjects(false);
     }
   }, [apiDraft, refreshProjects]);
 
   useEffect(() => {
     connect();
-  }, []);
+  }, [connect]);
 
   useEffect(() => {
-    if (!session) return;
+    if (!session || view !== 'project') return;
     const intervalMs = busyPhases.includes(session.phase) ? 1500 : 4500;
     const timer = setInterval(async () => {
       try {
@@ -890,7 +1322,7 @@ export default function App() {
       }
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [apiUrl, refreshProjects, session?.id, session?.phase]);
+  }, [apiUrl, refreshProjects, session?.id, session?.phase, view]);
 
   const onOpenProject = useCallback(
     async (sessionId: string) => {
@@ -898,6 +1330,7 @@ export default function App() {
         setError(null);
         const opened = await getSession(apiUrl, sessionId);
         setSession(opened);
+        setView('project');
       } catch (openError) {
         setError(openError instanceof Error ? openError.message : 'Could not open project');
       }
@@ -906,15 +1339,92 @@ export default function App() {
   );
 
   const onNewProject = useCallback(async () => {
+    setCreatingProject(true);
     try {
       setError(null);
       const created = await createSession(apiUrl);
       setSession(created);
+      setView('project');
       await refreshProjects(apiUrl);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : 'Could not create project');
+    } finally {
+      setCreatingProject(false);
     }
   }, [apiUrl, refreshProjects]);
+
+  const onBackToDashboard = useCallback(() => {
+    setView('dashboard');
+    refreshProjects(apiUrl).catch(() => undefined);
+  }, [apiUrl, refreshProjects]);
+
+  const onRenameProject = useCallback(
+    async (sessionId: string, title: string) => {
+      try {
+        setError(null);
+        const updated = await updateProjectMetadata(apiUrl, sessionId, { title });
+        if (session?.id === sessionId) {
+          setSession(updated);
+        }
+        await refreshProjects(apiUrl);
+      } catch (renameError) {
+        setError(renameError instanceof Error ? renameError.message : 'Could not rename project');
+        throw renameError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
+
+  const onDuplicateProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const duplicate = await duplicateSession(apiUrl, sessionId);
+        await refreshProjects(apiUrl);
+        return duplicate;
+      } catch (duplicateError) {
+        setError(duplicateError instanceof Error ? duplicateError.message : 'Could not duplicate project');
+        throw duplicateError;
+      }
+    },
+    [apiUrl, refreshProjects]
+  );
+
+  const onDeleteProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        await deleteSession(apiUrl, sessionId);
+        await refreshProjects(apiUrl);
+        if (session?.id === sessionId) {
+          setSession(null);
+          setView('dashboard');
+        }
+      } catch (deleteError) {
+        setError(deleteError instanceof Error ? deleteError.message : 'Could not delete project');
+        throw deleteError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
+
+  const onShareProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const shared = await shareSession(apiUrl, sessionId);
+        if (session?.id === sessionId) {
+          setSession(shared.session);
+        }
+        await refreshProjects(apiUrl);
+        return `${apiUrl}${shared.share_url}`;
+      } catch (shareError) {
+        setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+        throw shareError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
 
   const onSaveContext = useCallback(
     async (context: TripContext) => {
@@ -987,20 +1497,45 @@ export default function App() {
     }
   }, [apiUrl, session]);
 
-  const onShare = useCallback(async () => {
+  const onSaveVoiceoverSegments = useCallback(async (segments: Array<{ segment_id: string; voiceover: string; caption?: string }>) => {
     if (!session) return;
     try {
       setError(null);
-      const shared = await shareSession(apiUrl, session.id);
-      setSession(shared.session);
-      setError(`Share link: ${apiUrl}${shared.share_url}`);
+      const updated = await updateVoiceoverSegments(apiUrl, session.id, segments);
+      setSession(updated);
       await refreshProjects(apiUrl);
-    } catch (shareError) {
-      setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save segment scripts');
+      throw saveError;
     }
   }, [apiUrl, refreshProjects, session]);
 
+  const onShare = useCallback(async () => {
+    if (!session) return;
+    try {
+      const url = await onShareProject(session.id);
+      setError(`Share link: ${url}`);
+    } catch (shareError) {
+      setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+    }
+  }, [onShareProject, session]);
+
   const content = useMemo(() => {
+    if (view === 'dashboard' && (!error || projects.length || loadingProjects)) {
+      return (
+        <DashboardScreen
+          projects={projects}
+          loading={loadingProjects}
+          creating={creatingProject}
+          onOpen={onOpenProject}
+          onNew={onNewProject}
+          onRename={onRenameProject}
+          onDuplicate={onDuplicateProject}
+          onDelete={onDeleteProject}
+          onShare={onShareProject}
+        />
+      );
+    }
     if (!session) {
       return (
         <View style={styles.screen}>
@@ -1013,7 +1548,7 @@ export default function App() {
       );
     }
     if (session.screen === 'plan') {
-      return <PlanScreen session={session} onGenerate={onGenerate} onRender={onRender} />;
+      return <PlanScreen session={session} onGenerate={onGenerate} onRender={onRender} onSaveVoiceoverSegments={onSaveVoiceoverSegments} />;
     }
     if (session.screen === 'output') {
       return <OutputScreen apiUrl={apiUrl} session={session} onRender={onRender} onShare={onShare} />;
@@ -1021,24 +1556,46 @@ export default function App() {
     return (
       <ContextScreen
         session={session}
-        projects={projects}
         onSave={onSaveContext}
         onUpload={onUpload}
         onGenerate={onGenerateFromContext}
-        onOpenProject={onOpenProject}
-        onNewProject={onNewProject}
       />
     );
-  }, [apiUrl, connect, error, onGenerate, onGenerateFromContext, onNewProject, onOpenProject, onRender, onSaveContext, onShare, onUpload, projects, session]);
+  }, [
+    apiUrl,
+    connect,
+    creatingProject,
+    error,
+    loadingProjects,
+    onDeleteProject,
+    onDuplicateProject,
+    onGenerate,
+    onGenerateFromContext,
+    onNewProject,
+    onOpenProject,
+    onRenameProject,
+    onRender,
+    onSaveContext,
+    onSaveVoiceoverSegments,
+    onShare,
+    onShareProject,
+    onUpload,
+    projects,
+    session,
+    view,
+  ]);
 
   return (
     <AppShell
       session={session}
+      showProjectChrome={view === 'project' && Boolean(session)}
       apiUrl={apiUrl}
       apiDraft={apiDraft}
       setApiDraft={setApiDraft}
       onReconnect={connect}
       onRestart={onNewProject}
+      creatingProject={creatingProject}
+      onBackToDashboard={onBackToDashboard}
     >
       {error && session?.phase !== 'error' ? (
         <View style={styles.inlineError}>
@@ -1080,6 +1637,24 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
+  },
+  backButton: {
+    minHeight: 38,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 7,
+    paddingHorizontal: 11,
+  },
+  backText: {
+    color: colors.graphite,
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '900',
   },
   brandMark: {
     width: 38,
@@ -1260,6 +1835,283 @@ const styles = StyleSheet.create({
     paddingTop: 14,
     paddingBottom: 32,
     gap: 16,
+  },
+  dashboardScreen: {
+    width: '100%',
+    alignSelf: 'center',
+    paddingHorizontal: 22,
+    paddingTop: 14,
+    paddingBottom: 34,
+  },
+  dashboardBand: {
+    width: '100%',
+    maxWidth: 1180,
+    alignSelf: 'center',
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    padding: 16,
+    gap: 14,
+  },
+  dashboardHeader: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 14,
+  },
+  dashboardHeaderCompact: {
+    alignItems: 'stretch',
+    flexDirection: 'column',
+  },
+  dashboardToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flexWrap: 'wrap',
+  },
+  dashboardToolbarCompact: {
+    alignItems: 'stretch',
+  },
+  searchBox: {
+    minHeight: 42,
+    minWidth: 240,
+    flexGrow: 1,
+    flexBasis: 280,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+  },
+  searchInput: {
+    flex: 1,
+    minHeight: 40,
+    color: colors.ink,
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '700',
+  },
+  segmentGroup: {
+    minHeight: 42,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    padding: 3,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 3,
+  },
+  segmentChip: {
+    minHeight: 34,
+    borderRadius: radii.sm,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  segmentChipActive: {
+    backgroundColor: colors.blue,
+  },
+  segmentText: {
+    color: colors.graphite,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '900',
+  },
+  segmentTextActive: {
+    color: colors.white,
+  },
+  dashboardNotice: {
+    minHeight: 40,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: '#c4dde2',
+    backgroundColor: colors.blueSoft,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  dashboardNoticeText: {
+    flex: 1,
+    color: colors.blueDark,
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '800',
+  },
+  projectList: {
+    gap: 8,
+  },
+  projectSkeletonRow: {
+    minHeight: 74,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    padding: 14,
+    gap: 10,
+  },
+  skeletonTitle: {
+    width: '42%',
+    height: 14,
+    borderRadius: radii.sm,
+    backgroundColor: colors.mist,
+  },
+  skeletonMeta: {
+    width: '68%',
+    height: 12,
+    borderRadius: radii.sm,
+    backgroundColor: colors.mist,
+  },
+  dashboardEmpty: {
+    minHeight: 146,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    padding: 18,
+  },
+  dashboardProjectRow: {
+    minHeight: 76,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  dashboardProjectRowCompact: {
+    alignItems: 'stretch',
+    flexDirection: 'column',
+  },
+  dashboardProjectMain: {
+    flex: 1.2,
+    minWidth: 220,
+  },
+  projectOpenTarget: {
+    minHeight: 48,
+    justifyContent: 'center',
+    gap: 3,
+  },
+  dashboardProjectTitle: {
+    color: colors.ink,
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: '900',
+  },
+  dashboardProjectSubtitle: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '700',
+  },
+  renameRow: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  renameInput: {
+    flex: 1,
+    minHeight: 42,
+  },
+  projectFacts: {
+    flex: 1,
+    minWidth: 260,
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 7,
+  },
+  projectFact: {
+    minHeight: 26,
+    borderRadius: radii.round,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    paddingHorizontal: 9,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  projectFactText: {
+    color: colors.graphite,
+    fontSize: 11,
+    lineHeight: 14,
+    fontWeight: '800',
+  },
+  projectActions: {
+    minWidth: 196,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 6,
+  },
+  projectActionButton: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+  },
+  projectActionDanger: {
+    borderColor: '#ebc2ba',
+    backgroundColor: colors.redSoft,
+  },
+  projectActionDisabled: {
+    opacity: 0.48,
+  },
+  deleteConfirmRow: {
+    minWidth: 260,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  deleteConfirmText: {
+    color: colors.red,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '900',
+  },
+  confirmButton: {
+    minHeight: 34,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  confirmButtonDanger: {
+    minWidth: 72,
+    borderColor: colors.red,
+    backgroundColor: colors.red,
+  },
+  confirmButtonText: {
+    color: colors.graphite,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '900',
+  },
+  confirmButtonTextDanger: {
+    color: colors.white,
   },
   contextLayout: {
     gap: 16,
@@ -1756,6 +2608,31 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+  },
+  segmentEditor: {
+    minHeight: 58,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  segmentEditorBody: {
+    flex: 1,
+    gap: 8,
+  },
+  segmentVoiceInput: {
+    minHeight: 86,
+    textAlignVertical: 'top',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  segmentCaptionInput: {
+    minHeight: 42,
   },
   actionRow: {
     flexDirection: 'row',

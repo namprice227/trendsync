@@ -175,6 +175,7 @@ def _sample_visuals(path: Path, duration: float) -> dict[str, Any]:
     prev_hist = None
     scored_frames: list[tuple[float, float]] = []
     landmark_candidates: list[tuple[float, float]] = []
+    frame_records: list[dict[str, Any]] = []
 
     index = 0
     sampled = 0
@@ -204,6 +205,17 @@ def _sample_visuals(path: Path, duration: float) -> dict[str, Any]:
         motion.append(motion_score)
         quality_score = _quality_score(bright, blur_score, motion_score, len(faces))
         scored_frames.append((quality_score, timestamp))
+        frame_records.append(
+            {
+                "timestamp": round(timestamp, 2),
+                "score": quality_score,
+                "brightness": round(bright, 2),
+                "sharpness": round(blur_score, 2),
+                "motion": round(motion_score, 2),
+                "face_count": int(len(faces)),
+                "scene_change": scene_delta > 0.55,
+            }
+        )
         if blur_score > 140 and 55 <= bright <= 205 and not len(faces):
             landmark_candidates.append((quality_score, timestamp))
 
@@ -229,6 +241,7 @@ def _sample_visuals(path: Path, duration: float) -> dict[str, Any]:
         "best_moment_timestamps": [round(timestamp, 2) for _, timestamp in scored_frames[:5]],
         "landmark_candidate_timestamps": [round(timestamp, 2) for _, timestamp in landmark_candidates[:5]],
         "quality_label": _quality_label(avg_brightness, avg_sharpness),
+        "smart_windows": _build_smart_windows(frame_records, duration, scene_timestamps),
     }
 
 
@@ -255,6 +268,107 @@ def _quality_label(brightness: float | None, sharpness: float | None) -> str:
     if sharpness > 160:
         return "strong"
     return "usable"
+
+
+def _bounded_window_duration(duration: float, requested: float | None = None) -> float:
+    base = requested if requested is not None else _float(os.environ.get("TRIPSTORY_SMART_WINDOW_SECONDS")) or 5.5
+    base = max(2.0, min(8.0, float(base)))
+    if duration > 0:
+        base = min(base, max(1.0, duration))
+    return round(base, 2)
+
+
+def _records_in_range(records: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if start <= _float(record.get("timestamp")) <= end
+    ]
+
+
+def _nearest_records(records: list[dict[str, Any]], center: float, limit: int = 3) -> list[dict[str, Any]]:
+    return sorted(records, key=lambda record: abs(_float(record.get("timestamp")) - center))[:limit]
+
+
+def _window_frame_timestamps(records: list[dict[str, Any]], start: float, duration: float, center: float) -> list[float]:
+    end = start + duration
+    candidates = _records_in_range(records, start, end) or _nearest_records(records, center, 3)
+    candidates = sorted(candidates, key=lambda record: (abs(_float(record.get("timestamp")) - center), -_float(record.get("score"))))
+    timestamps = sorted({_float(record.get("timestamp")) for record in candidates[:3]})
+    return [round(timestamp, 2) for timestamp in timestamps]
+
+
+def _window_metric_evidence(records: list[dict[str, Any]], start: float, duration: float) -> str:
+    window_records = _records_in_range(records, start, start + duration)
+    if not window_records:
+        return "usable travel moment selected from the OpenCV scan"
+    brightness = _avg([_float(record.get("brightness")) for record in window_records])
+    sharpness = _avg([_float(record.get("sharpness")) for record in window_records])
+    motion = _avg([_float(record.get("motion")) for record in window_records])
+    face_hits = sum(int(_float(record.get("face_count"))) for record in window_records)
+    quality = _quality_label(brightness, sharpness)
+    cues = []
+    if quality in {"dark", "overexposed", "soft or shaky"}:
+        cues.append(f"{quality} avoid window")
+    elif quality == "strong":
+        cues.append("sharp, well-exposed travel window")
+    else:
+        cues.append("usable travel window")
+    if face_hits:
+        cues.append("faces or people visible")
+    if motion is not None and motion >= 24:
+        cues.append("active motion")
+    elif motion is not None and motion <= 8:
+        cues.append("steady framing")
+    if any(record.get("scene_change") for record in window_records):
+        cues.append("near a scene change")
+    return "; ".join(cues[:4])
+
+
+def _candidate_score_for_timestamp(records: list[dict[str, Any]], timestamp: float, boost: float = 0.0) -> float:
+    if not records:
+        return round(0.25 + boost, 4)
+    nearest = min(records, key=lambda record: abs(_float(record.get("timestamp")) - timestamp))
+    return round(min(1.0, _float(nearest.get("score")) + boost), 4)
+
+
+def _build_smart_windows(records: list[dict[str, Any]], duration: float, scene_timestamps: list[float]) -> list[dict[str, Any]]:
+    if not records and duration <= 0:
+        return []
+    max_windows = max(1, min(20, int(os.environ.get("TRIPSTORY_SMART_MAX_WINDOWS", "8"))))
+    window_duration = _bounded_window_duration(duration)
+    candidates: list[tuple[float, float]] = []
+    for record in records:
+        candidates.append((_float(record.get("score")), _float(record.get("timestamp"))))
+    for timestamp in scene_timestamps:
+        candidates.append((_candidate_score_for_timestamp(records, _float(timestamp), 0.04), _float(timestamp)))
+    if not candidates:
+        candidates.append((0.25, 0.0))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    selected: list[dict[str, Any]] = []
+    seen_centers: list[float] = []
+    for score, center in candidates:
+        if len(selected) >= max_windows:
+            break
+        if any(abs(center - existing) < window_duration * 0.6 for existing in seen_centers):
+            continue
+        start = max(0.0, center - window_duration / 2)
+        if duration > 0:
+            start = min(start, max(0.0, duration - window_duration))
+        frame_timestamps = _window_frame_timestamps(records, start, window_duration, center)
+        selected.append(
+            {
+                "window_id": f"win_{len(selected) + 1:03d}",
+                "start_time": round(start, 2),
+                "duration": round(window_duration, 2),
+                "score": round(max(0.0, min(1.0, score)), 4),
+                "frame_timestamps": frame_timestamps,
+                "visual_evidence": _window_metric_evidence(records, start, window_duration),
+            }
+        )
+        seen_centers.append(center)
+    return selected
 
 
 def _extract_audio_sample(path: Path) -> Path | None:
@@ -455,6 +569,41 @@ def _frame_data_urls(path: Path, timestamps: list[float]) -> list[dict[str, Any]
     return frames
 
 
+def _window_frame_data_urls(path: Path, windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        return []
+    frames: list[dict[str, Any]] = []
+    max_width = int(os.environ.get("TRIPSTORY_VISION_FRAME_WIDTH", "640"))
+    try:
+        for window in windows:
+            window_id = str(window.get("window_id") or "")
+            for timestamp in window.get("frame_timestamps") or []:
+                ts = max(0.0, _float(timestamp))
+                capture.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+                ok, frame = capture.read()
+                if not ok:
+                    continue
+                height, width = frame.shape[:2]
+                if width > max_width:
+                    scale = max_width / width
+                    frame = cv2.resize(frame, (max_width, int(height * scale)))
+                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+                if not ok:
+                    continue
+                data = base64.b64encode(encoded.tobytes()).decode("ascii")
+                frames.append(
+                    {
+                        "window_id": window_id,
+                        "timestamp": round(ts, 2),
+                        "url": f"data:image/jpeg;base64,{data}",
+                    }
+                )
+    finally:
+        capture.release()
+    return frames
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -611,6 +760,91 @@ def _normalize_moment_descriptions(value: Any) -> list[dict[str, Any]]:
     return [item for item in normalized if item["description"]][:10]
 
 
+def _trim_text(value: Any, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rsplit(" ", 1)[0].strip() + "..."
+
+
+def _normalize_vision_windows(value: Any, existing_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {}
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        window_id = str(item.get("window_id") or "").strip()
+        if window_id:
+            by_id[window_id] = item
+
+    enriched: list[dict[str, Any]] = []
+    for window in existing_windows:
+        next_window = dict(window)
+        parsed = by_id.get(str(window.get("window_id") or ""))
+        if parsed:
+            evidence = (
+                _trim_text(parsed.get("visual_evidence"))
+                or _trim_text(parsed.get("summary"))
+                or _trim_text(parsed.get("description"))
+                or _trim_text(parsed.get("best_moment_description"))
+            )
+            if evidence:
+                next_window["visual_evidence"] = evidence
+            next_window["semantic_source"] = "vision"
+            next_window["visible_subjects"] = _normalize_string_list(parsed.get("visible_subjects"))
+            next_window["locations_or_scenes"] = _normalize_string_list(parsed.get("locations_or_scenes"))
+            next_window["visible_actions"] = _normalize_string_list(parsed.get("actions") or parsed.get("visible_actions"))
+            next_window["visual_mood"] = _trim_text(parsed.get("mood"), 120)
+            next_window["avoid_reasons"] = _normalize_string_list(parsed.get("avoid_reasons"))
+            best = parsed.get("best_moment_description")
+            if isinstance(best, dict):
+                next_window["best_moment_description"] = {
+                    "timestamp": round(_float(best.get("timestamp") or window.get("start_time")), 2),
+                    "description": _trim_text(best.get("description")),
+                }
+            elif _trim_text(best):
+                next_window["best_moment_description"] = {
+                    "timestamp": round(_float(parsed.get("best_frame_timestamp") or window.get("start_time")), 2),
+                    "description": _trim_text(best),
+                }
+        enriched.append(next_window)
+    return enriched
+
+
+def _aggregate_window_strings(windows: list[dict[str, Any]], key: str) -> list[str]:
+    values: list[str] = []
+    for window in windows:
+        for value in window.get(key) or []:
+            text = str(value).strip()
+            if text and text not in values:
+                values.append(text)
+    return values[:10]
+
+
+def _window_moment_descriptions(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    descriptions: list[dict[str, Any]] = []
+    for window in windows:
+        best = window.get("best_moment_description")
+        if isinstance(best, dict) and best.get("description"):
+            descriptions.append(
+                {
+                    "timestamp": round(_float(best.get("timestamp") or window.get("start_time")), 2),
+                    "description": _trim_text(best.get("description")),
+                }
+            )
+            continue
+        evidence = _trim_text(window.get("visual_evidence"))
+        if evidence:
+            descriptions.append(
+                {
+                    "timestamp": round(_float(window.get("start_time")), 2),
+                    "description": evidence,
+                }
+            )
+    return descriptions[:10]
+
+
 def _vision_semantics(path: Path, analysis: dict[str, Any], context: dict[str, Any] | None) -> dict[str, Any] | None:
     config = _vision_provider_config()
     default_enabled = bool(config)
@@ -618,14 +852,31 @@ def _vision_semantics(path: Path, analysis: dict[str, Any], context: dict[str, A
         return None
     if not config:
         return None
-    frames = _frame_data_urls(path, _semantic_timestamps(analysis))
+    smart_windows = [window for window in analysis.get("smart_windows") or [] if isinstance(window, dict)]
+    max_windows = max(1, min(8, int(os.environ.get("TRIPSTORY_VISION_MAX_WINDOWS", "3"))))
+    top_windows = smart_windows[:max_windows]
+    frames = _window_frame_data_urls(path, top_windows) if top_windows else _frame_data_urls(path, _semantic_timestamps(analysis))
     if not frames:
         return None
-    timestamps = ", ".join(f"{frame['timestamp']}s" for frame in frames)
+    frame_map = [
+        {"window_id": frame.get("window_id"), "timestamp": frame.get("timestamp")}
+        for frame in frames
+    ]
     prompt = {
-        "task": "Analyze sampled frames from one travel video clip for editing.",
-        "timestamps": timestamps,
+        "task": "Analyze top candidate windows from one travel video clip for editing.",
+        "frames": frame_map,
         "trip_context": context or {},
+        "smart_windows": [
+            {
+                "window_id": window.get("window_id"),
+                "start_time": window.get("start_time"),
+                "duration": window.get("duration"),
+                "score": window.get("score"),
+                "opencv_evidence": window.get("visual_evidence"),
+                "frame_timestamps": window.get("frame_timestamps"),
+            }
+            for window in top_windows
+        ],
         "known_clip_metrics": {
             "duration_seconds": analysis.get("duration_seconds"),
             "quality_label": analysis.get("quality_label"),
@@ -636,12 +887,17 @@ def _vision_semantics(path: Path, analysis: dict[str, Any], context: dict[str, A
         "rules": [
             "Only describe visual/audio evidence that is present in the sampled frames or transcript.",
             "Do not invent landmarks, people, events, or emotions.",
-            "Return strict JSON with keys: summary, visible_subjects, locations_or_scenes, actions, mood, avoid_reasons, best_moment_descriptions.",
+            "Describe concrete visible content for each window, for example traveler speaking to camera, market street, shore birds, food stall, dark/shaky avoid.",
+            "Return strict JSON with keys: summary, visible_subjects, locations_or_scenes, actions, mood, avoid_reasons, best_moment_descriptions, windows.",
+            "windows must be an array with one object per window_id. Each object must include window_id, visual_evidence, visible_subjects, locations_or_scenes, actions, mood, avoid_reasons, and best_moment_description.",
             "best_moment_descriptions must be objects with timestamp and description.",
         ],
     }
     content: list[dict[str, Any]] = [{"type": "text", "text": json.dumps(prompt, ensure_ascii=False)}]
-    content.extend({"type": "image_url", "image_url": {"url": frame["url"], "detail": "low"}} for frame in frames)
+    for frame in frames:
+        label = f"Frame for {frame.get('window_id') or 'clip'} at {frame['timestamp']}s"
+        content.append({"type": "text", "text": label})
+        content.append({"type": "image_url", "image_url": {"url": frame["url"], "detail": "low"}})
     payload = {
         "model": config["model"],
         "messages": [{"role": "user", "content": content}],
@@ -655,15 +911,18 @@ def _vision_semantics(path: Path, analysis: dict[str, Any], context: dict[str, A
         parsed = _extract_json_object(str(message.get("content") or ""))
         if not parsed:
             return None
+        enriched_windows = _normalize_vision_windows(parsed.get("windows"), smart_windows)
+        best_descriptions = _normalize_moment_descriptions(parsed.get("best_moment_descriptions")) or _window_moment_descriptions(enriched_windows)
         return {
             "semantic_source": config["semantic_source"],
             "semantic_summary": str(parsed.get("summary") or "").strip(),
-            "visible_subjects": _normalize_string_list(parsed.get("visible_subjects")),
-            "locations_or_scenes": _normalize_string_list(parsed.get("locations_or_scenes")),
-            "visible_actions": _normalize_string_list(parsed.get("actions")),
+            "visible_subjects": _normalize_string_list(parsed.get("visible_subjects")) or _aggregate_window_strings(enriched_windows, "visible_subjects"),
+            "locations_or_scenes": _normalize_string_list(parsed.get("locations_or_scenes")) or _aggregate_window_strings(enriched_windows, "locations_or_scenes"),
+            "visible_actions": _normalize_string_list(parsed.get("actions")) or _aggregate_window_strings(enriched_windows, "visible_actions"),
             "visual_mood": str(parsed.get("mood") or "").strip(),
             "avoid_reasons": _normalize_string_list(parsed.get("avoid_reasons")),
-            "best_moment_descriptions": _normalize_moment_descriptions(parsed.get("best_moment_descriptions")),
+            "best_moment_descriptions": best_descriptions,
+            "smart_windows": enriched_windows,
         }
     except Exception as exc:
         log_event(
@@ -691,7 +950,8 @@ def _heuristic_semantics(analysis: dict[str, Any]) -> dict[str, Any]:
     avoid_reasons = []
     if analysis.get("quality_label") in {"dark", "overexposed", "soft or shaky"}:
         avoid_reasons.append(f"{analysis.get('quality_label')} image quality")
-    descriptions = [
+    windows = [window for window in analysis.get("smart_windows") or [] if isinstance(window, dict)]
+    descriptions = _window_moment_descriptions(windows) or [
         {
             "timestamp": round(_float(timestamp), 2),
             "description": f"Detected strong moment in a {analysis.get('quality_label', 'usable')} travel clip.",

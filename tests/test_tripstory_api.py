@@ -199,6 +199,88 @@ class TripStoryApiTest(unittest.TestCase):
         public = self.api_server._public_session(session_id)
         self.assertNotIn("llm_api_key", public["trip_context"])
 
+    def test_patch_voiceover_segments_updates_text_only_and_clears_stale_render(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        story_plan = {
+            "title": "Kyoto",
+            "language": "English",
+            "voiceover_script": "Old line one. Old line two.",
+            "edit_decisions": [
+                {
+                    "segment_id": "seg_001",
+                    "clip_id": "clip1",
+                    "clip": "clip.mp4",
+                    "window_id": "win_001",
+                    "start_time": 2,
+                    "duration": 4,
+                    "caption": "Old caption",
+                }
+            ],
+            "voiceover_segments": [
+                {
+                    "segment_id": "seg_001",
+                    "clip_id": "clip1",
+                    "clip": "clip.mp4",
+                    "window_id": "win_001",
+                    "start_time": 2,
+                    "duration": 4,
+                    "voiceover": "Old line one.",
+                    "caption": "Old caption",
+                }
+            ],
+        }
+        self.api_server._update_session(
+            session_id,
+            phase="complete",
+            story_plan=story_plan,
+            script=story_plan["voiceover_script"],
+            final_video_url="/files/session/holiday_recap.mp4",
+            voiceover_audio_url="/files/session/voiceover.mp3",
+            story_json_url="/files/session/story_plan.json",
+            edit_decisions_url="/files/session/edit_decisions.json",
+            caption_srt_url="/files/session/captions.srt",
+            caption_vtt_url="/files/session/captions.vtt",
+        )
+
+        updated = self.api_server.update_voiceover_segments(
+            session_id,
+            self.api_server.VoiceoverSegmentsPatchRequest(
+                segments=[
+                    self.api_server.VoiceoverSegmentUpdate(
+                        segment_id="seg_001",
+                        voiceover="Kyoto starts with lanterns glowing over the narrow street.",
+                        caption="Lantern street",
+                    )
+                ]
+            ),
+        )
+
+        segment = updated["story_plan"]["voiceover_segments"][0]
+        decision = updated["story_plan"]["edit_decisions"][0]
+        self.assertEqual(updated["phase"], "ready_to_render")
+        self.assertIsNone(updated["final_video_url"])
+        self.assertIsNone(updated["voiceover_audio_url"])
+        self.assertEqual(segment["voiceover"], "Kyoto starts with lanterns glowing over the narrow street.")
+        self.assertEqual(segment["caption"], "Lantern street")
+        self.assertEqual(decision["caption"], "Lantern street")
+        self.assertEqual(decision["start_time"], 2)
+        self.assertEqual(decision["duration"], 4)
+        self.assertEqual(updated["script"], "Kyoto starts with lanterns glowing over the narrow street.")
+
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.update_voiceover_segments(
+                session_id,
+                self.api_server.VoiceoverSegmentsPatchRequest(
+                    segments=[
+                        self.api_server.VoiceoverSegmentUpdate(
+                            segment_id="seg_999",
+                            voiceover="Unknown segment.",
+                        )
+                    ]
+                ),
+            )
+
     def test_session_poll_logs_structured_http_state(self) -> None:
         session = self.api_server._create_session()
         session_id = session["id"]
@@ -227,6 +309,108 @@ class TripStoryApiTest(unittest.TestCase):
 
         self.assertEqual(listed["sessions"][0]["id"], first["id"])
         self.assertIsInstance(self.api_server._normalize_session({"id": first["id"], "updated_at": "200"})["updated_at"], float)
+
+    def test_project_metadata_rename_updates_listing_without_rewriting_context(self) -> None:
+        session = self.api_server._create_session("owner-a")
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context["destination"] = "Kyoto"
+        self.api_server._update_session(session_id, trip_context=context)
+
+        updated = self.api_server.update_session_metadata(
+            session_id,
+            self.api_server.ProjectMetadataRequest(title="Spring family edit"),
+            auth={"owner_id": "owner-a"},
+        )
+        listed = self.api_server.list_sessions(auth={"owner_id": "owner-a"})
+
+        self.assertEqual(updated["metadata"]["title"], "Spring family edit")
+        self.assertEqual(updated["trip_context"]["destination"], "Kyoto")
+        self.assertEqual(listed["sessions"][0]["title"], "Spring family edit")
+        self.assertEqual(listed["sessions"][0]["destination"], "Kyoto")
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.update_session_metadata(
+                session_id,
+                self.api_server.ProjectMetadataRequest(title="Wrong owner"),
+                auth={"owner_id": "owner-b"},
+            )
+
+    def test_duplicate_session_copies_metadata_context_story_and_media_files(self) -> None:
+        session = self.api_server._create_session("owner-a")
+        session_id = session["id"]
+        media_dir = self.media_root / session_id / "media"
+        media_dir.mkdir(parents=True)
+        clip_path = media_dir / "000_clip.mp4"
+        clip_path.write_bytes(b"fake video")
+        output_path = self.media_root / session_id / "holiday_recap.mp4"
+        output_path.write_bytes(b"fake render")
+        context = dict(session["trip_context"])
+        context["destination"] = "Lisbon"
+        story_plan = {
+            "title": "Lisbon Story",
+            "voiceover_script": "A walk through Lisbon.",
+            "edit_decisions": [{"segment_id": "seg_001", "clip_id": "clip1", "clip": "clip.mp4", "duration": 3}],
+            "voiceover_segments": [{"segment_id": "seg_001", "clip_id": "clip1", "voiceover": "A walk through Lisbon."}],
+        }
+        self.api_server._update_session(
+            session_id,
+            phase="complete",
+            metadata={"title": "Lisbon family cut"},
+            trip_context=context,
+            media_items=[
+                {
+                    "id": "clip1",
+                    "filename": "clip.mp4",
+                    "kind": "video",
+                    "path": str(clip_path),
+                    "url": f"/files/{session_id}/media/{clip_path.name}",
+                    "size_bytes": clip_path.stat().st_size,
+                }
+            ],
+            recorded_clips=[str(clip_path)],
+            story_plan=story_plan,
+            script=story_plan["voiceover_script"],
+            final_video_url=f"/files/{session_id}/holiday_recap.mp4",
+            render_options={"target_duration_seconds": 45, "aspect_ratio": "portrait"},
+            share_token="do-not-copy",
+        )
+
+        duplicate = self.api_server.duplicate_session(session_id, auth={"owner_id": "owner-a"})
+        duplicate_id = duplicate["id"]
+
+        self.assertNotEqual(duplicate_id, session_id)
+        self.assertEqual(duplicate["owner_id"], "owner-a")
+        self.assertEqual(duplicate["metadata"]["title"], "Lisbon family cut copy")
+        self.assertEqual(duplicate["trip_context"]["destination"], "Lisbon")
+        self.assertEqual(duplicate["story_plan"], story_plan)
+        self.assertEqual(duplicate["render_options"]["target_duration_seconds"], 45)
+        self.assertIsNone(duplicate["share_token"])
+        self.assertEqual(duplicate["phase"], "complete")
+        self.assertIn(f"/files/{duplicate_id}/", duplicate["media_items"][0]["url"])
+        self.assertIn(duplicate_id, duplicate["media_items"][0]["path"])
+        self.assertTrue(Path(duplicate["media_items"][0]["path"]).exists())
+        self.assertTrue((self.media_root / duplicate_id / "holiday_recap.mp4").exists())
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.duplicate_session(session_id, auth={"owner_id": "owner-b"})
+
+    def test_delete_session_removes_project_jobs_and_media_directory(self) -> None:
+        session = self.api_server._create_session("owner-a")
+        session_id = session["id"]
+        job = self.api_server._create_job(session_id, "render", "Queued render")
+        media_dir = self.media_root / session_id / "media"
+        media_dir.mkdir(parents=True)
+        (media_dir / "000_clip.mp4").write_bytes(b"fake video")
+
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.delete_session(session_id, auth={"owner_id": "owner-b"})
+
+        result = self.api_server.delete_session(session_id, auth={"owner_id": "owner-a"})
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertFalse((self.media_root / session_id).exists())
+        self.assertNotIn(session_id, {item["id"] for item in self.api_server.list_sessions(auth={"owner_id": "owner-a"})["sessions"]})
+        with self.api_server._connect_db() as conn:
+            self.assertIsNone(conn.execute("SELECT id FROM jobs WHERE id = ?", (job["id"],)).fetchone())
 
     def test_generate_story_endpoint_enqueues_rq_job(self) -> None:
         from unittest.mock import patch
@@ -407,6 +591,28 @@ class TripStoryApiTest(unittest.TestCase):
         os.environ.pop("TRIPSTORY_VISION_MODEL", None)
         os.environ.pop("TRIPSTORY_ENABLE_VISION_ANALYSIS", None)
 
+    def test_smart_window_extraction_returns_bounded_candidates(self) -> None:
+        from media_intelligence import analyze_clip
+
+        os.environ["TRIPSTORY_ENABLE_VISION_ANALYSIS"] = "0"
+        clip_path = Path(self.temp_dir.name) / "smart-window.mp4"
+        self._write_test_video(clip_path, seconds=4.0)
+
+        analysis = analyze_clip(clip_path, "smart-window.mp4", context={"destination": "Lisbon"})
+
+        windows = analysis.get("smart_windows") or []
+        self.assertTrue(windows)
+        self.assertLessEqual(len(windows), 8)
+        for window in windows:
+            self.assertTrue(window["window_id"].startswith("win_"))
+            self.assertGreaterEqual(window["start_time"], 0)
+            self.assertGreater(window["duration"], 0)
+            self.assertLessEqual(window["duration"], 8)
+            self.assertLessEqual(window["start_time"] + window["duration"], analysis["duration_seconds"] + 0.05)
+            self.assertTrue(window["frame_timestamps"])
+            self.assertTrue(window["visual_evidence"])
+        os.environ.pop("TRIPSTORY_ENABLE_VISION_ANALYSIS", None)
+
     def test_llm_provider_rate_limit_defaults_are_configurable(self) -> None:
         from llm_provider import LLMProvider
 
@@ -463,6 +669,8 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertIsInstance(plan["edit_decisions"], list)
         self.assertIsInstance(plan["voiceover_segments"], list)
         self.assertIsInstance(plan["edit_decisions"][0]["duration"], float)
+        self.assertEqual(plan["edit_decisions"][0]["segment_id"], plan["voiceover_segments"][0]["segment_id"])
+        self.assertIn("segment_id", plan["voiceover_segments"][0])
         self.assertIn("selected clip", plan["voiceover_script"])
         self.assertTrue(plan["generation"]["llm_used"])
 
@@ -528,7 +736,7 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertIn("Tromso", plan["voiceover_script"])
         self.assertTrue(plan["generation"]["llm_used"])
 
-    def test_story_generation_sends_compact_manifest_not_raw_analysis(self) -> None:
+    def test_story_generation_sends_window_manifest_not_raw_analysis(self) -> None:
         from trip_story import generate_trip_story
 
         captured = {}
@@ -546,8 +754,10 @@ class TripStoryApiTest(unittest.TestCase):
                         "language": "English",
                         "edit_decisions": [
                             {
+                                "segment_id": "seg_001",
                                 "clip_id": "clip1",
                                 "clip": "clip.mp4",
+                                "window_id": "win_001",
                                 "start_time": 4,
                                 "duration": 5,
                                 "reason": "Opening beat with visible mountain hike energy.",
@@ -555,9 +765,11 @@ class TripStoryApiTest(unittest.TestCase):
                         ],
                         "voiceover_segments": [
                             {
+                                "segment_id": "seg_001",
                                 "clip_id": "clip1",
                                 "clip": "clip.mp4",
-                                "voiceover": "This is the moment the trip starts feeling real.",
+                                "window_id": "win_001",
+                                "voiceover": "This snowy mountain trail is where Tromso starts feeling real.",
                             }
                         ],
                     }
@@ -581,6 +793,16 @@ class TripStoryApiTest(unittest.TestCase):
                         "avg_motion": 31,
                         "has_audio": True,
                         "semantic_summary": "A man is walking on a snowy mountain trail with wind and friends nearby.",
+                        "smart_windows": [
+                            {
+                                "window_id": "win_001",
+                                "start_time": 3.5,
+                                "duration": 5.0,
+                                "score": 0.91,
+                                "frame_timestamps": [4.2, 5.0, 6.0],
+                                "visual_evidence": "man walking on a snowy mountain trail with friends nearby",
+                            }
+                        ],
                         "best_moment_timestamps": [4.2, 8.8],
                         "landmark_candidate_timestamps": [6.0],
                         "transcript": "This raw transcript is intentionally long and should not be copied wholesale into the prompt.",
@@ -593,13 +815,78 @@ class TripStoryApiTest(unittest.TestCase):
         user_payload = json.loads(captured["messages"][1]["content"])
         prompt_text = captured["messages"][1]["content"]
         self.assertIn("clip_manifest", user_payload)
+        self.assertIn("smart_windows", user_payload)
         self.assertNotIn("uploaded_media", user_payload)
         self.assertNotIn('"analysis"', prompt_text)
         self.assertNotIn('"width"', prompt_text)
         self.assertNotIn("1280", prompt_text)
         self.assertNotIn("face_count", prompt_text)
         self.assertIn("[Clip clip1] 12s", user_payload["clip_manifest"][0])
-        self.assertIn("snowy mountain", user_payload["clip_manifest"][0])
+        self.assertEqual(user_payload["smart_windows"][0]["windows"][0]["window_id"], "win_001")
+        self.assertIn("snowy mountain", user_payload["smart_windows"][0]["windows"][0]["visual_evidence"])
+
+    def test_voiceover_repair_rejects_generic_narration_when_window_evidence_exists(self) -> None:
+        from trip_story import generate_trip_story
+
+        class GenericProvider:
+            provider = "deepseek"
+            model = "deepseek-chat"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                return json.dumps(
+                    {
+                        "title": "Beach Story",
+                        "language": "English",
+                        "edit_decisions": [
+                            {
+                                "segment_id": "seg_001",
+                                "clip_id": "clip1",
+                                "clip": "beach.mp4",
+                                "window_id": "win_001",
+                                "start_time": 1,
+                                "duration": 4,
+                                "reason": "The window shows birds near the water.",
+                            }
+                        ],
+                        "voiceover_segments": [
+                            {
+                                "segment_id": "seg_001",
+                                "clip_id": "clip1",
+                                "clip": "beach.mp4",
+                                "window_id": "win_001",
+                                "voiceover": "This trip gave us memories we will remember forever.",
+                            }
+                        ],
+                    }
+                )
+
+        plan = generate_trip_story(
+            {"destination": "Algarve", "language": "en"},
+            [
+                {
+                    "id": "clip1",
+                    "filename": "beach.mp4",
+                    "kind": "video",
+                    "size_bytes": 100,
+                    "analysis": {
+                        "smart_windows": [
+                            {
+                                "window_id": "win_001",
+                                "start_time": 1,
+                                "duration": 4,
+                                "score": 0.9,
+                                "visual_evidence": "seagulls near the shore as waves come in",
+                            }
+                        ]
+                    },
+                }
+            ],
+            GenericProvider(),
+        )
+
+        self.assertIn("seagulls", plan["voiceover_script"].lower())
+        self.assertNotIn("memories we will remember", plan["voiceover_script"])
 
     def test_story_generation_uses_configurable_output_budget(self) -> None:
         from trip_story import generate_trip_story
@@ -646,6 +933,84 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertEqual(captured["max_tokens"], 4096)
         self.assertTrue(plan["generation"]["llm_used"])
 
+    def test_story_generation_includes_selected_render_duration(self) -> None:
+        from trip_story import generate_trip_story
+
+        captured = {}
+
+        class CapturingProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-flash"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                captured["messages"] = messages
+                return json.dumps(
+                    {
+                        "title": "Duration Aware",
+                        "language": "English",
+                        "edit_decisions": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "start_time": 0,
+                                "duration": 6,
+                                "reason": "Opening travel beat.",
+                            }
+                        ],
+                        "voiceover_segments": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "voiceover": "The trip opens with the feeling of being there.",
+                            }
+                        ],
+                    }
+                )
+
+        plan = generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [{"id": "clip1", "filename": "clip.mp4", "kind": "video", "size_bytes": 100, "analysis": {}}],
+            CapturingProvider(),
+            render_options={"target_duration_seconds": 60, "include_title_card": True},
+        )
+
+        user_payload = json.loads(captured["messages"][1]["content"])
+        requirements = " ".join(user_payload["requirements"])
+        self.assertIn("60-second rendered video", requirements)
+        self.assertIn("58.0 seconds", requirements)
+        self.assertEqual(plan["generation"]["target_duration_seconds"], 60.0)
+
+    def test_local_story_fallback_expands_segments_for_longer_target_duration(self) -> None:
+        from trip_story import generate_trip_story
+
+        class LocalProvider:
+            provider = "local"
+            model = "local-fallback"
+            configured = False
+
+            def chat(self, messages, max_tokens=900):
+                return ""
+
+        plan = generate_trip_story(
+            {"destination": "Kyoto", "language": "en"},
+            [
+                {
+                    "id": "clip1",
+                    "filename": "clip.mp4",
+                    "kind": "video",
+                    "size_bytes": 100,
+                    "analysis": {"duration_seconds": 30, "semantic_summary": "A quiet walk through lantern-lit streets."},
+                }
+            ],
+            LocalProvider(),
+            render_options={"target_duration_seconds": 45, "include_title_card": True},
+        )
+
+        self.assertGreater(len(plan["voiceover_segments"]), 1)
+        self.assertAlmostEqual(sum(item["duration"] for item in plan["edit_decisions"]), 43.0, places=1)
+        self.assertEqual(plan["generation"]["target_duration_seconds"], 45.0)
+
     def test_story_generation_empty_configured_provider_reports_empty_response(self) -> None:
         from trip_story import generate_trip_story
 
@@ -668,6 +1033,51 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertTrue(plan["generation"]["llm_configured"])
         self.assertIn("empty response", reason)
         self.assertNotIn("not configured", reason)
+
+    def test_story_generation_invalid_json_uses_friendly_fallback_reason(self) -> None:
+        from trip_story import generate_trip_story
+
+        class BrokenJsonProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-flash"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                return '{"title": "Broken", "voiceover_script": "This response is cut off'
+
+        plan = generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [{"id": "clip1", "filename": "clip.mp4", "kind": "video", "size_bytes": 100, "analysis": {}}],
+            BrokenJsonProvider(),
+        )
+
+        reason = plan["generation"]["fallback_reason"]
+        self.assertFalse(plan["generation"]["llm_used"])
+        self.assertTrue(plan["generation"]["llm_configured"])
+        self.assertIn("incomplete JSON", reason)
+        self.assertNotIn("Unterminated string", reason)
+
+    def test_story_generation_parses_fenced_json_response(self) -> None:
+        from trip_story import generate_trip_story
+
+        class FencedProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-flash"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                return """```json
+{"title":"Fenced","language":"English","edit_decisions":[{"segment_id":"seg_001","clip_id":"clip1","clip":"clip.mp4","start_time":0,"duration":4,"reason":"Opening beat."}],"voiceover_segments":[{"segment_id":"seg_001","clip_id":"clip1","clip":"clip.mp4","voiceover":"The trip opens with the first clear travel beat."}]}
+```"""
+
+        plan = generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [{"id": "clip1", "filename": "clip.mp4", "kind": "video", "size_bytes": 100, "analysis": {}}],
+            FencedProvider(),
+        )
+
+        self.assertTrue(plan["generation"]["llm_used"])
+        self.assertEqual(plan["title"], "Fenced")
 
     def test_deepseek_payload_supports_thinking_and_reasoning_env(self) -> None:
         from llm_provider import LLMProvider
@@ -824,6 +1234,86 @@ class TripStoryApiTest(unittest.TestCase):
 
         self.assertLessEqual(sum(decision["duration"] for _, decision in adjusted) + 2, 17.01)
         self.assertTrue(all(decision["duration"] >= 1 for _, decision in adjusted))
+
+    def test_renderer_matches_repeated_clips_by_segment_id(self) -> None:
+        from trip_renderer import _matching_voiceover_segments
+
+        timeline = [
+            ({"id": "clip1", "filename": "clip.mp4"}, {"segment_id": "seg_002", "clip_id": "clip1", "clip": "clip.mp4", "window_id": "win_002", "start_time": 8, "duration": 4}),
+            ({"id": "clip1", "filename": "clip.mp4"}, {"segment_id": "seg_001", "clip_id": "clip1", "clip": "clip.mp4", "window_id": "win_001", "start_time": 1, "duration": 4}),
+        ]
+        story_plan = {
+            "voiceover_segments": [
+                {"segment_id": "seg_001", "clip_id": "clip1", "window_id": "win_001", "voiceover": "First window line."},
+                {"segment_id": "seg_002", "clip_id": "clip1", "window_id": "win_002", "voiceover": "Second window line."},
+            ]
+        }
+
+        matched = _matching_voiceover_segments(story_plan, timeline)
+
+        self.assertEqual(matched[0]["voiceover"], "Second window line.")
+        self.assertEqual(matched[1]["voiceover"], "First window line.")
+
+    def test_render_tts_receives_edited_segment_text(self) -> None:
+        from trip_renderer import render_trip_video
+        from unittest.mock import patch
+
+        clip_path = Path(self.temp_dir.name) / "edited-tts.mp4"
+        output_path = Path(self.temp_dir.name) / "edited-output.mp4"
+        self._write_test_video(clip_path, seconds=3.0)
+        captured: dict[str, str] = {}
+
+        def fake_synthesize(text, output_path, instructions=None):
+            captured["text"] = text
+            return None
+
+        story_plan = {
+            "title": "Edited",
+            "language": "English",
+            "voiceover_script": "Old unsaved text.",
+            "edit_decisions": [
+                {
+                    "segment_id": "seg_001",
+                    "clip_id": "clip1",
+                    "clip": "edited-tts.mp4",
+                    "window_id": "win_001",
+                    "start_time": 0,
+                    "duration": 2,
+                }
+            ],
+            "voiceover_segments": [
+                {
+                    "segment_id": "seg_001",
+                    "clip_id": "clip1",
+                    "clip": "edited-tts.mp4",
+                    "window_id": "win_001",
+                    "voiceover": "Edited narration about the lantern street.",
+                    "caption": "Edited caption",
+                }
+            ],
+        }
+
+        with patch("trip_renderer.TTSProvider") as provider:
+            provider.return_value.synthesize.side_effect = fake_synthesize
+            render_trip_video(
+                [str(clip_path)],
+                story_plan,
+                str(output_path),
+                media_items=[
+                    {
+                        "id": "clip1",
+                        "filename": "edited-tts.mp4",
+                        "path": str(clip_path),
+                        "analysis": {"duration_seconds": 3.0},
+                    }
+                ],
+                render_options={"include_title_card": False, "target_duration_seconds": 2},
+                captions_srt_path=str(Path(self.temp_dir.name) / "edited.srt"),
+                captions_vtt_path=str(Path(self.temp_dir.name) / "edited.vtt"),
+            )
+
+        self.assertEqual(captured["text"], "Edited narration about the lantern street.")
+        self.assertTrue(output_path.exists())
 
     def test_llm_and_tts_logs_attempts_retries_without_secrets(self) -> None:
         from llm_provider import LLMProvider

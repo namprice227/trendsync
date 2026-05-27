@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -33,7 +34,49 @@ TECHNICAL_VOICEOVER_PATTERNS = (
     re.compile(r"\bthis moment shows\b", re.IGNORECASE),
     re.compile(r"\bthe places you explored\b", re.IGNORECASE),
 )
+GENERIC_VOICEOVER_PATTERNS = (
+    re.compile(r"\b(this|that)\s+(trip|journey|memory|moment)\b", re.IGNORECASE),
+    re.compile(r"\b(the|our|your)\s+(trip|journey|adventure|memories|moments)\b", re.IGNORECASE),
+    re.compile(r"\bbeautiful\s+(place|places|moment|moments|memories)\b", re.IGNORECASE),
+    re.compile(r"\bmemories?\s+(we|you)\s+(will|want to)\s+remember\b", re.IGNORECASE),
+)
+KEYWORD_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "around",
+    "because",
+    "before",
+    "camera",
+    "clip",
+    "clips",
+    "detected",
+    "during",
+    "from",
+    "into",
+    "moment",
+    "moments",
+    "near",
+    "quality",
+    "scene",
+    "selected",
+    "shows",
+    "that",
+    "the",
+    "this",
+    "through",
+    "travel",
+    "trip",
+    "usable",
+    "video",
+    "window",
+    "with",
+}
 logger = get_logger("story")
+
+
+class NonObjectStoryResponse(ValueError):
+    pass
 
 
 def _story_max_tokens() -> int:
@@ -85,6 +128,35 @@ def _as_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _segment_id(index: int) -> str:
+    return f"seg_{index + 1:03d}"
+
+
+def _target_duration_seconds(render_options: dict[str, Any] | None = None, context: dict[str, Any] | None = None) -> float:
+    render_options = render_options or {}
+    context = context or {}
+    value = render_options.get("target_duration_seconds") or context.get("target_duration_seconds") or 30
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 30.0
+    return max(6.0, min(180.0, seconds))
+
+
+def _include_title_card(render_options: dict[str, Any] | None = None) -> bool:
+    if not render_options:
+        return True
+    return bool(render_options.get("include_title_card", True))
+
+
+def _voiceover_budget(render_options: dict[str, Any] | None = None, context: dict[str, Any] | None = None) -> tuple[float, int]:
+    target_seconds = _target_duration_seconds(render_options, context)
+    title_seconds = 2.0 if _include_title_card(render_options) else 0.0
+    voiceover_seconds = max(4.0, target_seconds - title_seconds)
+    segment_count = max(1, min(30, math.ceil(voiceover_seconds / 5.5)))
+    return voiceover_seconds, segment_count
+
+
 def _normalize_clip_plan(value: Any, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = []
     for index, item in enumerate(_as_list(value, fallback)):
@@ -116,8 +188,10 @@ def _normalize_edit_decisions(value: Any, fallback: list[dict[str, Any]]) -> lis
             item = {"reason": _as_text(item)}
         normalized.append(
             {
+                "segment_id": _as_text(item.get("segment_id"), _segment_id(index)),
                 "clip_id": _as_text(item.get("clip_id")),
                 "clip": _as_text(item.get("clip"), f"clip_{index + 1}"),
+                "window_id": _as_text(item.get("window_id")),
                 "start_time": max(0.0, _as_float(item.get("start_time"), 0.0)),
                 "duration": max(1.0, min(10.0, _as_float(item.get("duration"), 5.5))),
                 "role": _as_text(item.get("role"), "story beat"),
@@ -144,8 +218,10 @@ def _normalize_voiceover_segments(
             purpose = _as_text(item.get("purpose"), _as_text(decision.get("role"), "story beat"))
             normalized.append(
                 {
+                    "segment_id": _as_text(item.get("segment_id"), _as_text(decision.get("segment_id"), _segment_id(index))),
                     "clip_id": _as_text(item.get("clip_id"), _as_text(decision.get("clip_id"))),
                     "clip": _as_text(item.get("clip"), _as_text(decision.get("clip"), f"clip_{index + 1}")),
+                    "window_id": _as_text(item.get("window_id"), _as_text(decision.get("window_id"))),
                     "start_time": max(0.0, _as_float(item.get("start_time"), _as_float(decision.get("start_time"), 0.0))),
                     "duration": max(1.0, min(10.0, _as_float(item.get("duration"), _as_float(decision.get("duration"), 5.5)))),
                     "voiceover": voiceover,
@@ -156,8 +232,10 @@ def _normalize_voiceover_segments(
         else:
             normalized.append(
                 {
+                    "segment_id": _as_text(decision.get("segment_id"), _segment_id(index)),
                     "clip_id": _as_text(decision.get("clip_id")),
                     "clip": _as_text(decision.get("clip"), f"clip_{index + 1}"),
+                    "window_id": _as_text(decision.get("window_id")),
                     "start_time": max(0.0, _as_float(decision.get("start_time"), 0.0)),
                     "duration": max(1.0, min(10.0, _as_float(decision.get("duration"), 5.5))),
                     "voiceover": _as_text(item),
@@ -166,7 +244,44 @@ def _normalize_voiceover_segments(
                 }
             )
     normalized = [item for item in normalized if item.get("voiceover")]
-    return normalized or fallback
+    if not edit_decisions:
+        return normalized or fallback
+
+    fallback_by_id = {
+        _as_text(item.get("segment_id")): item
+        for item in fallback
+        if isinstance(item, dict) and _as_text(item.get("segment_id"))
+    }
+    normalized_by_id = {
+        _as_text(item.get("segment_id")): item
+        for item in normalized
+        if _as_text(item.get("segment_id"))
+    }
+    aligned: list[dict[str, Any]] = []
+    for index, decision in enumerate(edit_decisions):
+        segment_id = _as_text(decision.get("segment_id"), _segment_id(index))
+        segment = normalized_by_id.get(segment_id)
+        if segment is None and index < len(normalized):
+            segment = normalized[index]
+        if segment is None:
+            segment = fallback_by_id.get(segment_id)
+        if segment is None and index < len(fallback):
+            segment = fallback[index]
+        segment = dict(segment or {})
+        aligned.append(
+            {
+                "segment_id": segment_id,
+                "clip_id": _as_text(segment.get("clip_id"), _as_text(decision.get("clip_id"))),
+                "clip": _as_text(segment.get("clip"), _as_text(decision.get("clip"), f"clip_{index + 1}")),
+                "window_id": _as_text(segment.get("window_id"), _as_text(decision.get("window_id"))),
+                "start_time": max(0.0, _as_float(decision.get("start_time"), _as_float(segment.get("start_time"), 0.0))),
+                "duration": max(1.0, min(10.0, _as_float(decision.get("duration"), _as_float(segment.get("duration"), 5.5)))),
+                "voiceover": _as_text(segment.get("voiceover")),
+                "caption": _as_text(segment.get("caption"), _as_text(decision.get("caption"), f"Moment {index + 1}")),
+                "purpose": _as_text(segment.get("purpose"), _as_text(decision.get("role"), "story beat")),
+            }
+        )
+    return aligned or normalized or fallback
 
 
 def _normalize_story_plan(plan: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
@@ -288,6 +403,80 @@ def _clip_manifest(media_items: list[dict[str, Any]]) -> list[str]:
     return [_clip_manifest_line(item, index) for index, item in enumerate(media_items)]
 
 
+def _window_evidence_text(window: dict[str, Any], fallback: str = "") -> str:
+    candidates = [
+        window.get("visual_evidence"),
+        window.get("semantic_summary"),
+        window.get("summary"),
+    ]
+    best = window.get("best_moment_description")
+    if isinstance(best, dict):
+        candidates.append(best.get("description"))
+    candidates.extend(window.get("locations_or_scenes") or [])
+    candidates.extend(window.get("visible_actions") or [])
+    candidates.extend(window.get("visible_subjects") or [])
+    for candidate in candidates:
+        cleaned = _safe_creative_cue(candidate, 180)
+        if cleaned:
+            return cleaned
+    return fallback
+
+
+def _smart_window_manifest(media_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    manifest: list[dict[str, Any]] = []
+    for index, item in enumerate(media_items):
+        analysis = item.get("analysis") or {}
+        clip_id = _as_text(item.get("id") or item.get("filename") or f"clip_{index + 1}")
+        windows = []
+        for window in analysis.get("smart_windows") or []:
+            if not isinstance(window, dict):
+                continue
+            evidence = _window_evidence_text(window, _clip_evidence(item))
+            windows.append(
+                {
+                    "window_id": _as_text(window.get("window_id"), f"win_{len(windows) + 1:03d}"),
+                    "start_time": round(_as_float(window.get("start_time"), 0.0), 2),
+                    "duration": round(max(1.0, min(10.0, _as_float(window.get("duration"), 5.5))), 2),
+                    "score": round(max(0.0, min(1.0, _as_float(window.get("score"), 0.0))), 4),
+                    "frame_timestamps": [
+                        round(_as_float(timestamp, 0.0), 2)
+                        for timestamp in (window.get("frame_timestamps") or [])[:4]
+                    ],
+                    "visual_evidence": evidence,
+                    "avoid_reasons": [
+                        _compact_text(reason, 64)
+                        for reason in (window.get("avoid_reasons") or [])
+                        if _compact_text(reason, 64)
+                    ][:3],
+                }
+            )
+        if not windows:
+            best_times = analysis.get("best_moment_timestamps") or analysis.get("landmark_candidate_timestamps") or [0.0]
+            for offset, timestamp in enumerate(best_times[:3]):
+                windows.append(
+                    {
+                        "window_id": f"win_{offset + 1:03d}",
+                        "start_time": max(0.0, round(_as_float(timestamp, 0.0) - 2.75, 2)),
+                        "duration": 5.5,
+                        "score": 0.25,
+                        "frame_timestamps": [round(_as_float(timestamp, 0.0), 2)],
+                        "visual_evidence": _clip_evidence(item),
+                        "avoid_reasons": [],
+                    }
+                )
+        manifest.append(
+            {
+                "clip_id": clip_id,
+                "clip": _as_text(item.get("filename"), f"clip_{index + 1}"),
+                "duration_seconds": round(_as_float(analysis.get("duration_seconds"), 0.0), 2),
+                "semantic_summary": _safe_creative_cue(analysis.get("semantic_summary"), 140),
+                "transcript_excerpt": _safe_creative_cue(analysis.get("transcript"), 140),
+                "windows": windows[:8],
+            }
+        )
+    return manifest
+
+
 def _destination_name(context: dict[str, Any]) -> str:
     return _as_text(context.get("destination"), "the trip")
 
@@ -313,9 +502,11 @@ def _clip_evidence(item: dict[str, Any]) -> str:
     return _as_text(analysis.get("summary"), f"the clip named {item.get('filename', 'this moment')}")
 
 
-def _clip_voiceover_cue(item: dict[str, Any]) -> str:
+def _clip_voiceover_cue(item: dict[str, Any], window: dict[str, Any] | None = None) -> str:
     analysis = item.get("analysis") or {}
     candidates: list[str] = []
+    if window:
+        candidates.append(_window_evidence_text(window))
     for key in ("semantic_summary", "transcript"):
         if analysis.get(key):
             candidates.append(_as_text(analysis.get(key)))
@@ -345,10 +536,10 @@ def _clip_voiceover_cue(item: dict[str, Any]) -> str:
     return "one of those blink-and-you-miss-it travel moments"
 
 
-def _tiktok_voiceover_line(context: dict[str, Any], item: dict[str, Any], index: int, total: int) -> str:
+def _tiktok_voiceover_line(context: dict[str, Any], item: dict[str, Any], index: int, total: int, window: dict[str, Any] | None = None) -> str:
     destination = _destination_name(context)
     places = _story_place_phrase(context)
-    cue = _clip_voiceover_cue(item)
+    cue = _clip_voiceover_cue(item, window)
     highlights = _clean_voiceover_cue(_as_text(context.get("highlights")))
     companions = _clean_voiceover_cue(_as_text(context.get("companions")))
     with_who = f" with {companions}" if companions and companions.lower() not in {"solo", "alone"} else ""
@@ -372,6 +563,50 @@ def _clip_for_segment(segment: dict[str, Any], media_items: list[dict[str, Any]]
     return media_items[index] if index < len(media_items) else {}
 
 
+def _window_for_segment(item: dict[str, Any], segment: dict[str, Any]) -> dict[str, Any] | None:
+    window_id = str(segment.get("window_id") or "").strip()
+    if not window_id:
+        return None
+    analysis = item.get("analysis") or {}
+    for window in analysis.get("smart_windows") or []:
+        if isinstance(window, dict) and str(window.get("window_id") or "") == window_id:
+            return window
+    return None
+
+
+def _evidence_keywords(item: dict[str, Any], window: dict[str, Any] | None) -> set[str]:
+    raw_parts = []
+    if window:
+        raw_parts.append(_window_evidence_text(window))
+        raw_parts.extend(str(value) for value in window.get("locations_or_scenes") or [])
+        raw_parts.extend(str(value) for value in window.get("visible_actions") or [])
+        raw_parts.extend(str(value) for value in window.get("visible_subjects") or [])
+    analysis = item.get("analysis") or {}
+    raw_parts.append(analysis.get("semantic_summary") or "")
+    raw_parts.extend(str(value) for value in analysis.get("locations_or_scenes") or [])
+    raw_parts.extend(str(value) for value in analysis.get("visible_actions") or [])
+    raw_parts.extend(str(value) for value in analysis.get("visible_subjects") or [])
+    words = set()
+    for part in raw_parts:
+        for word in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", str(part).lower()):
+            cleaned = word.strip("'-")
+            if cleaned and cleaned not in KEYWORD_STOPWORDS:
+                words.add(cleaned)
+    return words
+
+
+def _looks_generic_voiceover(text: str, item: dict[str, Any], window: dict[str, Any] | None) -> bool:
+    if not text:
+        return True
+    if not any(pattern.search(text) for pattern in GENERIC_VOICEOVER_PATTERNS):
+        return False
+    keywords = _evidence_keywords(item, window)
+    if not keywords:
+        return True
+    lowered = text.lower()
+    return not any(keyword in lowered for keyword in list(keywords)[:20])
+
+
 def _repair_voiceover_for_audience(plan: dict[str, Any], context: dict[str, Any], media_items: list[dict[str, Any]]) -> dict[str, Any]:
     segments = plan.get("voiceover_segments") if isinstance(plan.get("voiceover_segments"), list) else []
     repaired = []
@@ -380,9 +615,10 @@ def _repair_voiceover_for_audience(plan: dict[str, Any], context: dict[str, Any]
         if not isinstance(segment, dict):
             continue
         item = _clip_for_segment(segment, media_items, index)
+        window = _window_for_segment(item, segment)
         voiceover = _as_text(segment.get("voiceover"))
-        if not voiceover or _looks_like_editor_metadata(voiceover):
-            voiceover = _tiktok_voiceover_line(context, item, index, total)
+        if not voiceover or _looks_like_editor_metadata(voiceover) or _looks_generic_voiceover(voiceover, item, window):
+            voiceover = _tiktok_voiceover_line(context, item, index, total, window)
         caption = _as_text(segment.get("caption"))
         if _looks_like_editor_metadata(caption):
             caption = _destination_name(context)
@@ -393,6 +629,8 @@ def _repair_voiceover_for_audience(plan: dict[str, Any], context: dict[str, Any]
                 {
                     "clip_id": item.get("id"),
                     "clip": item.get("filename", f"clip_{index + 1}"),
+                    "segment_id": _segment_id(index),
+                    "window_id": "",
                     "start_time": 0.0,
                     "duration": 5.5,
                     "voiceover": _tiktok_voiceover_line(context, item, index, len(media_items)),
@@ -406,7 +644,11 @@ def _repair_voiceover_for_audience(plan: dict[str, Any], context: dict[str, Any]
     return plan
 
 
-def _fallback_story(context: dict[str, Any], media_items: list[dict[str, Any]]) -> dict[str, Any]:
+def _fallback_story(
+    context: dict[str, Any],
+    media_items: list[dict[str, Any]],
+    render_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     destination = context.get("destination") or "your trip"
     duration = context.get("duration") or "a memorable holiday"
     places = context.get("places_visited") or destination
@@ -414,30 +656,56 @@ def _fallback_story(context: dict[str, Any], media_items: list[dict[str, Any]]) 
     audience = context.get("audience") or "friends and family"
     language = _language_name(context.get("language"))
     clip_count = len(media_items)
+    voiceover_seconds, target_segment_count = _voiceover_budget(render_options, context)
+    segment_duration = round(max(2.0, min(8.0, voiceover_seconds / target_segment_count)), 2)
+    candidate_windows: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    for item in media_items:
+        windows = [window for window in (item.get("analysis") or {}).get("smart_windows") or [] if isinstance(window, dict)]
+        if windows:
+            candidate_windows.extend((item, window) for window in windows)
+        else:
+            candidate_windows.append((item, None))
+    candidate_windows.sort(key=lambda pair: -_as_float((pair[1] or {}).get("score"), 0.0))
+    planned_pairs = [candidate_windows[index % len(candidate_windows)] for index in range(target_segment_count)] if candidate_windows else []
 
     edit_decisions = []
     voiceover_segments = []
-    for idx, item in enumerate(media_items):
+    for idx, (item, window) in enumerate(planned_pairs):
         analysis = item.get("analysis") or {}
-        best_times = analysis.get("best_moment_timestamps") or analysis.get("landmark_candidate_timestamps") or [0]
-        try:
-            start_time = max(0.0, float(best_times[0]) - 2.0)
-        except (TypeError, ValueError, IndexError):
-            start_time = 0.0
+        if window:
+            start_time = max(0.0, _as_float(window.get("start_time"), 0.0))
+            duration_seconds = max(1.0, min(10.0, _as_float(window.get("duration"), segment_duration)))
+            window_id = _as_text(window.get("window_id"))
+            evidence = _window_evidence_text(window, _clip_evidence(item))
+        else:
+            best_times = analysis.get("best_moment_timestamps") or analysis.get("landmark_candidate_timestamps") or [0]
+            try:
+                best_time = best_times[idx % len(best_times)] if best_times else 0
+                start_time = max(0.0, float(best_time) - segment_duration / 2)
+            except (TypeError, ValueError, IndexError):
+                start_time = 0.0
+            duration_seconds = segment_duration
+            window_id = ""
+            evidence = _clip_evidence(item)
+        clip_duration = _as_float(analysis.get("duration_seconds"), 0.0)
+        if clip_duration:
+            start_time = min(start_time, max(0.0, clip_duration - duration_seconds))
         quality = analysis.get("quality_label") or "usable"
-        evidence = _clip_evidence(item)
         clip_id = item.get("id") or item.get("filename", f"clip_{idx + 1}")
         clip_name = item.get("filename", f"clip_{idx + 1}")
         caption = item.get("filename", f"Moment {idx + 1}")
         role = "arrival" if idx == 0 else "memory beat"
+        segment_id = _segment_id(idx)
         edit_decisions.append(
             {
+                "segment_id": segment_id,
                 "clip_id": clip_id,
                 "clip": clip_name,
+                "window_id": window_id,
                 "start_time": round(start_time, 2),
-                "duration": 5.5,
+                "duration": duration_seconds,
                 "role": role,
-                "reason": f"Fallback edit uses this {quality} clip because analysis says: {evidence}",
+                "reason": f"Fallback edit uses this {quality} window because analysis says: {evidence}",
                 "transition": "fade",
                 "caption": caption,
                 "audio_strategy": "duck original ambience under narration",
@@ -445,11 +713,13 @@ def _fallback_story(context: dict[str, Any], media_items: list[dict[str, Any]]) 
         )
         voiceover_segments.append(
             {
+                "segment_id": segment_id,
                 "clip_id": clip_id,
                 "clip": clip_name,
+                "window_id": window_id,
                 "start_time": round(start_time, 2),
-                "duration": 5.5,
-                "voiceover": _tiktok_voiceover_line(context, item, idx, len(media_items)),
+                "duration": duration_seconds,
+                "voiceover": _tiktok_voiceover_line(context, item, idx, max(len(planned_pairs), 1), window),
                 "caption": destination,
                 "purpose": role,
             }
@@ -493,27 +763,94 @@ def _fallback_story(context: dict[str, Any], media_items: list[dict[str, Any]]) 
             "llm_provider": "local",
             "llm_model": "local-fallback",
             "fallback_reason": "No configured LLM response was available.",
+            "target_duration_seconds": _target_duration_seconds(render_options, context),
+            "planned_voiceover_seconds": voiceover_seconds,
         },
     }
+
+
+def _extract_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return None
+
+
+def _parse_llm_story_json(content: str) -> dict[str, Any]:
+    stripped = content.strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as original_error:
+        fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", stripped, re.IGNORECASE | re.DOTALL)
+        if fenced:
+            try:
+                parsed = json.loads(fenced.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return parsed
+                raise NonObjectStoryResponse("LLM returned a non-object JSON response.")
+        balanced = _extract_balanced_json_object(stripped)
+        if balanced and balanced != stripped:
+            try:
+                parsed = json.loads(balanced)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return parsed
+                raise NonObjectStoryResponse("LLM returned a non-object JSON response.")
+        raise original_error
+    if not isinstance(parsed, dict):
+        raise NonObjectStoryResponse("LLM returned a non-object JSON response.")
+    return parsed
 
 
 def generate_trip_story(
     context: dict[str, Any],
     media_items: list[dict[str, Any]],
     provider: LLMProvider | None = None,
+    render_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = provider or LLMProvider()
     language = _language_name(context.get("language"))
-    fallback = _fallback_story(context, media_items)
+    fallback = _fallback_story(context, media_items, render_options)
+    target_seconds = _target_duration_seconds(render_options, context)
+    voiceover_seconds, target_segment_count = _voiceover_budget(render_options, context)
     fallback["generation"] = {
         "llm_used": False,
         "llm_provider": provider.provider,
         "llm_model": provider.model,
         "llm_configured": provider.configured,
         "fallback_reason": "LLM provider is not configured. Check TRIPSTORY_LLM_PROVIDER and provider API key in .env.",
+        "target_duration_seconds": target_seconds,
+        "planned_voiceover_seconds": voiceover_seconds,
     }
 
     media_manifest = _clip_manifest(media_items)
+    smart_windows = _smart_window_manifest(media_items)
 
     system = (
         "You are a senior travel film editor and story producer. Build a concise, emotionally coherent "
@@ -529,25 +866,32 @@ def generate_trip_story(
         "target_language": language,
         "trip_context": context,
         "clip_manifest": media_manifest,
+        "smart_windows": smart_windows,
         "manifest_rules": [
             "Each manifest line is compact: clip id, duration, creative visual cue, people/motion/audio hints, best timestamps, and avoid hints.",
-            "Use only the manifest for story planning. Do not ask for or invent raw detector metadata.",
-            "Best timestamps are optional source-clip seconds for edit start choices; do not mention them in voiceover.",
+            "Use smart_windows as the primary editing evidence. Each window has a stable window_id, start_time, duration, score, sampled frame_timestamps, and visual_evidence.",
+            "Use only clip_manifest and smart_windows for story planning. Do not ask for or invent raw detector metadata.",
+            "Best timestamps and frame_timestamps are source-clip seconds for edit choices; do not mention them in voiceover.",
         ],
         "requirements": [
             "Make the story feel personal, not like a generic travel ad.",
             "Assume clips may be imperfect phone footage.",
-            "Keep voiceover suitable for a short 45-90 second video.",
-            "Use semantic_summary and best_moment_descriptions first when present. Use numeric analysis only as fallback evidence.",
-            "Use clip analysis to choose the best moments, avoid weak/dark/shaky sections when alternatives exist, and favor clips with faces, speech, scenic candidates, or strong quality labels.",
+            f"Write for a {int(round(target_seconds))}-second rendered video.",
+            f"The title card uses 2 seconds when enabled, so edit_decisions should total about {voiceover_seconds:.1f} seconds.",
+            f"Return about {target_segment_count} voiceover_segments, using repeated clips only when needed to fill the selected duration.",
+            "Choose exact windows from smart_windows first. Prefer high score windows with concrete visual_evidence. Avoid weak/dark/shaky windows when alternatives exist.",
+            "Use semantic_summary and smart window visual_evidence first when present. Use numeric analysis only as fallback evidence.",
             "Voiceover is audience-facing TikTok narration. It must sound natural, emotional, and watchable, not like metadata.",
             "Never put timestamps, seconds, resolution, scene counts, face counts, quality labels, filenames, or phrases like audio present in voiceover_script, voiceover_segments, or captions.",
             "Keep each voiceover segment punchy: one short sentence, usually 8-18 words, with a strong hook or emotional turn.",
-            "Return edit_decisions as an ordered timeline. Each item must include clip_id, clip, start_time, duration, role, reason, transition, caption, and audio_strategy.",
-            "Return voiceover_segments in the same order and length as edit_decisions. Each segment must include clip_id, clip, start_time, duration, voiceover, caption, and purpose.",
-            "Each voiceover segment must describe the actual selected clip segment. Do not write a generic trip summary unless no clip evidence exists.",
+            "Return edit_decisions as an ordered timeline. Each item must include segment_id, clip_id, clip, window_id, start_time, duration, role, reason, transition, caption, and audio_strategy.",
+            "Each edit_decision must select an exact clip_id and window_id from smart_windows. Use the selected window's start_time and duration unless the clip is shorter.",
+            "Return voiceover_segments in the same order and length as edit_decisions. Each segment must include segment_id, clip_id, clip, window_id, start_time, duration, voiceover, caption, and purpose.",
+            "The segment_id in each voiceover_segments item must exactly match the paired edit_decisions item.",
+            "Each voiceover segment must mention the actual visible content in the selected window, such as the shore birds, traveler speaking to camera, market street, food stall, or dark/shaky avoid. Do not write a generic trip summary unless no window evidence exists.",
             "The full voiceover_script must equal the ordered voiceover_segments joined together.",
             "Use start_time in seconds from the source clip. Choose durations between 2 and 8 seconds unless the clip analysis says the clip is shorter.",
+            "For longer target durations, add more clip-specific narration beats instead of stretching one generic sentence.",
             "The reason field must explain why this exact clip segment belongs at that point in the story.",
             "Stay vendor neutral and do not mention a specific AI model.",
         ],
@@ -594,22 +938,7 @@ def generate_trip_story(
                 stage="story_generation",
             )
             return fallback
-        parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            fallback["generation"]["fallback_reason"] = "LLM returned a non-object JSON response."
-            log_event(
-                logger,
-                30,
-                "story_generation_fallback",
-                provider=provider.provider,
-                model=provider.model,
-                clip_count=len(media_items),
-                elapsed_seconds=round(time.monotonic() - started, 3),
-                fallback_reason="non_object_json",
-                outcome="local_fallback",
-                stage="story_generation",
-            )
-            return fallback
+        parsed = _parse_llm_story_json(content)
         merged = _normalize_story_plan({**fallback, **parsed}, fallback)
         merged = _repair_voiceover_for_audience(merged, context, media_items)
         merged["generation"] = {
@@ -618,6 +947,8 @@ def generate_trip_story(
             "llm_model": provider.model,
             "llm_configured": provider.configured,
             "fallback_reason": None,
+            "target_duration_seconds": target_seconds,
+            "planned_voiceover_seconds": voiceover_seconds,
         }
         log_event(
             logger,
@@ -628,11 +959,49 @@ def generate_trip_story(
             clip_count=len(media_items),
             voiceover_segment_count=len(merged.get("voiceover_segments") or []),
             edit_decision_count=len(merged.get("edit_decisions") or []),
+            smart_window_count=sum(len(item.get("windows") or []) for item in smart_windows),
             elapsed_seconds=round(time.monotonic() - started, 3),
             outcome="llm",
             stage="story_generation",
         )
         return merged
+    except json.JSONDecodeError as exc:
+        fallback["generation"]["fallback_reason"] = (
+            "LLM returned incomplete JSON, so TripStory used the local story fallback. "
+            "Increase TRIPSTORY_STORY_MAX_TOKENS or choose a model with a larger output budget."
+        )
+        log_event(
+            logger,
+            30,
+            "story_generation_fallback",
+            provider=provider.provider,
+            model=provider.model,
+            clip_count=len(media_items),
+            exception_type=type(exc).__name__,
+            elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
+            fallback_reason="invalid_json",
+            outcome="local_fallback",
+            stage="story_generation",
+        )
+        logger.debug("Story generation returned invalid JSON", exc_info=True)
+        return fallback
+    except NonObjectStoryResponse as exc:
+        fallback["generation"]["fallback_reason"] = "LLM returned a non-object JSON response."
+        log_event(
+            logger,
+            30,
+            "story_generation_fallback",
+            provider=provider.provider,
+            model=provider.model,
+            clip_count=len(media_items),
+            exception_type=type(exc).__name__,
+            elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
+            fallback_reason="non_object_json",
+            outcome="local_fallback",
+            stage="story_generation",
+        )
+        logger.debug("Story generation returned a non-object response", exc_info=True)
+        return fallback
     except Exception as exc:
         log_event(
             logger,

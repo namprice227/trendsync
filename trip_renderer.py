@@ -421,20 +421,32 @@ def _matching_voiceover_segments(
     timeline: list[tuple[dict[str, Any], dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     raw_segments = [segment for segment in story_plan.get("voiceover_segments") or [] if isinstance(segment, dict)]
+    segments_by_id = {
+        str(segment.get("segment_id")): segment_index
+        for segment_index, segment in enumerate(raw_segments)
+        if segment.get("segment_id")
+    }
     used: set[int] = set()
     matched: list[dict[str, Any]] = []
     for index, (item, decision) in enumerate(timeline):
-        item_ids = {str(item.get("id") or ""), str(item.get("filename") or ""), str(decision.get("clip_id") or ""), str(decision.get("clip") or "")}
+        segment_id = str(decision.get("segment_id") or "").strip()
         match_index = None
+        if segment_id:
+            candidate = segments_by_id.get(segment_id)
+            if candidate is not None and candidate not in used:
+                match_index = candidate
+        if match_index is None and index < len(raw_segments) and index not in used:
+            match_index = index
+        item_ids = {str(item.get("id") or ""), str(item.get("filename") or ""), str(decision.get("clip_id") or ""), str(decision.get("clip") or "")}
         for segment_index, segment in enumerate(raw_segments):
+            if match_index is not None:
+                break
             if segment_index in used:
                 continue
             segment_ids = {str(segment.get("clip_id") or ""), str(segment.get("clip") or "")}
             if item_ids & segment_ids:
                 match_index = segment_index
                 break
-        if match_index is None and index < len(raw_segments) and index not in used:
-            match_index = index
         if match_index is not None:
             used.add(match_index)
             segment = dict(raw_segments[match_index])
@@ -443,8 +455,10 @@ def _matching_voiceover_segments(
         text = str(segment.get("voiceover") or segment.get("caption") or decision.get("caption") or decision.get("reason") or "").strip()
         matched.append(
             {
+                "segment_id": segment.get("segment_id") or decision.get("segment_id") or f"seg_{index + 1:03d}",
                 "clip_id": segment.get("clip_id") or decision.get("clip_id") or item.get("id"),
                 "clip": segment.get("clip") or decision.get("clip") or item.get("filename"),
+                "window_id": segment.get("window_id") or decision.get("window_id") or "",
                 "start_time": _decision_float(decision, "start_time", _decision_float(segment, "start_time", 0.0)),
                 "duration": _decision_float(decision, "duration", _decision_float(segment, "duration", 6.0)),
                 "voiceover": text,
@@ -523,6 +537,8 @@ def _write_edit_decisions(
         voiceover = voiceover_segments[index] if index < len(voiceover_segments) else {}
         payload.append(
             {
+                "segment_id": decision.get("segment_id") or voiceover.get("segment_id") or f"seg_{index + 1:03d}",
+                "window_id": decision.get("window_id") or voiceover.get("window_id") or "",
                 "source_clip_id": item.get("id"),
                 "source_clip": item.get("filename"),
                 "source_start_time": _decision_float(decision, "start_time", 0.0),
@@ -538,6 +554,30 @@ def _write_edit_decisions(
         )
         cursor += duration
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _story_plan_for_timeline(
+    story_plan: dict[str, Any],
+    timeline: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    adjusted = dict(story_plan)
+    adjusted_decisions = []
+    for index, (_, decision) in enumerate(timeline):
+        next_decision = dict(decision)
+        next_decision["segment_id"] = next_decision.get("segment_id") or f"seg_{index + 1:03d}"
+        next_decision["window_id"] = next_decision.get("window_id") or ""
+        adjusted_decisions.append(next_decision)
+    adjusted["edit_decisions"] = adjusted_decisions
+    adjusted["voiceover_segments"] = _matching_voiceover_segments(story_plan, timeline)
+    adjusted["voiceover_script"] = " ".join(
+        str(segment.get("voiceover") or "").strip()
+        for segment in adjusted["voiceover_segments"]
+        if str(segment.get("voiceover") or "").strip()
+    )
+    generation = dict(adjusted.get("generation") or {})
+    generation["render_timeline_seconds"] = round(sum(_decision_duration(decision, 6.0) for _, decision in timeline), 2)
+    adjusted["generation"] = generation
+    return adjusted
 
 
 def render_trip_video(
@@ -652,13 +692,14 @@ def render_trip_video(
     if include_title_card:
         total_seconds += TITLE_CARD_SECONDS
     _assert_duration_is_bounded(assembly_path, total_seconds)
-    voiceover_segments = _matching_voiceover_segments(story_plan, timeline)
+    adjusted_story_plan = _story_plan_for_timeline(story_plan, timeline)
+    voiceover_segments = adjusted_story_plan.get("voiceover_segments") or []
     if progress_callback:
         progress_callback("writing_captions", 65)
     captions_started = time.monotonic()
     _write_edit_decisions(timeline, voiceover_segments, output.with_name("edit_decisions.json"))
     timeline_blocks = _timeline_caption_blocks(
-        story_plan,
+        adjusted_story_plan,
         timeline,
         include_title_card,
         segment_seconds,
@@ -666,7 +707,7 @@ def render_trip_video(
     if timeline_blocks:
         _write_caption_blocks(timeline_blocks, captions_srt_path, captions_vtt_path)
     else:
-        _write_captions(story_plan.get("voiceover_script") or "", total_seconds, captions_srt_path, captions_vtt_path)
+        _write_captions(adjusted_story_plan.get("voiceover_script") or "", total_seconds, captions_srt_path, captions_vtt_path)
     log_event(
         logger,
         20,
@@ -680,7 +721,7 @@ def render_trip_video(
         outcome="success",
     )
 
-    script = _timeline_voiceover_script(story_plan, timeline)
+    script = _timeline_voiceover_script(adjusted_story_plan, timeline)
     generated_narration = None
     if _ffmpeg_available() and assembly_path.exists():
         if progress_callback:
@@ -689,7 +730,10 @@ def render_trip_video(
         generated_narration = TTSProvider().synthesize(
             script,
             narration_path or output.with_name("voiceover.mp3"),
-            instructions=f"Narrate as a warm travel recap in {story_plan.get('language') or 'the requested language'}.",
+            instructions=(
+                f"Narrate as a warm travel recap in {adjusted_story_plan.get('language') or 'the requested language'}. "
+                f"Aim to fit a {total_seconds:.0f}-second video."
+            ),
         )
         log_event(
             logger,
@@ -747,7 +791,7 @@ def render_trip_video(
         )
 
     if metadata_path:
-        Path(metadata_path).write_text(json.dumps(story_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(metadata_path).write_text(json.dumps(adjusted_story_plan, ensure_ascii=False, indent=2), encoding="utf-8")
         log_event(
             logger,
             20,
