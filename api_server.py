@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ from llm_provider import LLMProvider
 from media_intelligence import analyze_clip, vision_semantics_source
 from trip_renderer import render_trip_video
 from trip_story import generate_trip_story
+from tripstory_logging import configure_logging, get_logger, http_request_logging_enabled, log_event
 
 
 def _load_dotenv(path: Path = Path(".env")) -> None:
@@ -27,7 +28,7 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        print(f"[api_server] Could not load {path}: {exc}")
+        get_logger("api").warning("dotenv_load_failed %s", json.dumps({"path": str(path), "exception_type": type(exc).__name__}))
         return
 
     for raw_line in lines:
@@ -44,13 +45,27 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
 
 
 _load_dotenv()
+configure_logging()
+logger = get_logger("api")
 
 MEDIA_ROOT = Path(os.environ.get("TRIPSTORY_MEDIA_DIR", "trip_sessions"))
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 SESSION_STORE = Path(os.environ.get("TRIPSTORY_SESSION_STORE", str(MEDIA_ROOT.with_name(f"{MEDIA_ROOT.name}_sessions.json"))))
 SESSION_DB = Path(os.environ.get("TRIPSTORY_SESSION_DB", str(MEDIA_ROOT.with_name(f"{MEDIA_ROOT.name}.sqlite3"))))
 MAX_UPLOAD_BYTES = int(os.environ.get("TRIPSTORY_MAX_UPLOAD_MB", "512")) * 1024 * 1024
+SQLITE_TIMEOUT_SECONDS = float(os.environ.get("TRIPSTORY_SQLITE_TIMEOUT_SECONDS", "20.0"))
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
+ACTIVE_JOB_STATES = {
+    "queued",
+    "analyzing",
+    "planning",
+    "preparing",
+    "rendering_segments",
+    "writing_captions",
+    "synthesizing_narration",
+    "mixing_audio",
+}
+DEFAULT_STALE_JOB_SECONDS = int(os.environ.get("TRIPSTORY_STALE_JOB_SECONDS", str(int(os.environ.get("TRIPSTORY_JOB_TIMEOUT_SECONDS", "3600")) + 300)))
 
 PHASE_SCREENS = {
     "collecting_context": "context",
@@ -81,9 +96,137 @@ _lock = threading.RLock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
-def _init_db() -> None:
+def _connect_db() -> sqlite3.Connection:
     SESSION_DB.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(SESSION_DB) as conn:
+    conn = sqlite3.connect(SESSION_DB, timeout=SQLITE_TIMEOUT_SECONDS)
+    conn.execute(f"PRAGMA busy_timeout = {int(SQLITE_TIMEOUT_SECONDS * 1000)}")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _extract_request_ids(path: str) -> dict[str, str]:
+    parts = [part for part in path.split("/") if part]
+    fields: dict[str, str] = {}
+    if len(parts) >= 2 and parts[0] in {"sessions", "files"}:
+        fields["session_id"] = parts[1]
+    if len(parts) >= 4 and parts[0] == "sessions" and parts[2] == "jobs":
+        fields["job_id"] = parts[3]
+    return fields
+
+
+def _http_scope_fields(scope: dict[str, Any]) -> dict[str, Any]:
+    path = str(scope.get("path") or "")
+    client = scope.get("client")
+    headers = {
+        key.decode("latin-1").lower(): value.decode("latin-1")
+        for key, value in scope.get("headers", [])
+    }
+    fields: dict[str, Any] = {
+        "method": scope.get("method"),
+        "path": path,
+        "client_host": client[0] if client else None,
+        "content_length": headers.get("content-length"),
+    }
+    fields.update(_extract_request_ids(path))
+    return fields
+
+
+def _route_path(scope: dict[str, Any]) -> str | None:
+    route = scope.get("route")
+    return getattr(route, "path", None)
+
+
+def _session_status_fields(path: str, status_code: int) -> dict[str, Any]:
+    ids = _extract_request_ids(path)
+    session_id = ids.get("session_id")
+    if not session_id or not path.startswith("/sessions/") or status_code >= 400:
+        return {}
+    try:
+        session = _public_session(session_id)
+    except HTTPException:
+        return {}
+    active_job = session.get("active_job") or {}
+    fields: dict[str, Any] = {
+        "session_phase": session.get("phase"),
+        "session_screen": session.get("screen"),
+        "session_progress_percent": session.get("progress_percent"),
+        "media_count": len(session.get("media_items") or []),
+        "events_count": len(session.get("events") or []),
+        "final_video_ready": bool(session.get("final_video_url")),
+    }
+    if active_job:
+        fields.update(
+            active_job_id=active_job.get("id"),
+            active_job_type=active_job.get("type"),
+            active_job_state=active_job.get("state"),
+            active_job_progress_percent=active_job.get("progress_percent"),
+            active_job_step=active_job.get("current_step"),
+        )
+    return fields
+
+
+class HTTPRequestLogMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.wrapped_app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not http_request_logging_enabled():
+            await self.wrapped_app(scope, receive, send)
+            return
+
+        request_id = uuid.uuid4().hex[:8]
+        started = time.monotonic()
+        base_fields = {"request_id": request_id, **_http_scope_fields(scope)}
+        completed = False
+        log_event(logger, 10, "http_request_start", **base_fields)
+
+        async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal completed
+            if message.get("type") == "http.response.start":
+                status_code = int(message.get("status") or 0)
+                level = 40 if status_code >= 500 else 30 if status_code >= 400 else 20
+                complete_fields = {
+                    **base_fields,
+                    "route": _route_path(scope),
+                    "status_code": status_code,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                    "outcome": "success" if status_code < 400 else "error",
+                }
+                complete_fields.update(_session_status_fields(str(scope.get("path") or ""), status_code))
+                log_event(logger, level, "http_request_complete", **complete_fields)
+                completed = True
+            await send(message)
+
+        try:
+            await self.wrapped_app(scope, receive, send_wrapper)
+        except Exception as exc:
+            log_event(
+                logger,
+                40,
+                "http_request_failed",
+                **base_fields,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                exception_type=type(exc).__name__,
+                outcome="hard_failure",
+            )
+            raise
+        if not completed:
+            log_event(
+                logger,
+                30,
+                "http_request_complete",
+                **base_fields,
+                route=_route_path(scope),
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                outcome="missing_response_start",
+            )
+
+
+app.add_middleware(HTTPRequestLogMiddleware)
+
+
+def _init_db() -> None:
+    with _connect_db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -96,6 +239,24 @@ def _init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner_updated ON sessions(owner_id, updated_at DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                progress_percent INTEGER NOT NULL,
+                current_step TEXT NOT NULL,
+                error TEXT,
+                rq_job_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_session_updated ON jobs(session_id, updated_at DESC)")
         conn.commit()
 
 
@@ -144,6 +305,13 @@ class RenderRequest(BaseModel):
 
 def _now() -> float:
     return round(time.time(), 3)
+
+
+def _timestamp(value: Any, fallback: float | None = None) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback if fallback is not None else _now()
 
 
 def _default_context() -> dict[str, str]:
@@ -199,6 +367,8 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
 def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     session = _default_session(str(raw.get("id") or uuid.uuid4().hex[:12]))
     session.update(raw)
+    session["created_at"] = _timestamp(session.get("created_at"))
+    session["updated_at"] = _timestamp(session.get("updated_at"), session["created_at"])
     context = _default_context()
     context.update(raw.get("trip_context") or {})
     context.pop("llm_api_key", None)
@@ -210,7 +380,7 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     render_options = RenderRequest().model_dump()
     render_options.update(raw.get("render_options") or {})
     session["render_options"] = render_options
-    if session.get("phase") in {"uploading", "planning", "rendering"}:
+    if session.get("phase") == "uploading":
         session["phase"] = "error"
         session["progress_label"] = "Interrupted work"
         session["next_action"] = "The API restarted during background work. Retry the last action."
@@ -219,13 +389,61 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     return session
 
 
+def _read_session_from_db(session_id: str) -> dict[str, Any] | None:
+    if not SESSION_DB.exists():
+        return None
+    try:
+        with _connect_db() as conn:
+            row = conn.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        data = json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _refresh_session_from_db_locked(session_id: str) -> None:
+    raw = _read_session_from_db(session_id)
+    if not raw:
+        return
+    incoming = _normalize_session(raw)
+    current = _sessions.get(session_id)
+    if current is None or float(incoming.get("updated_at") or 0) > float(current.get("updated_at") or 0):
+        _sessions[session_id] = incoming
+
+
+def _refresh_sessions_from_db_locked() -> None:
+    if not SESSION_DB.exists():
+        return
+    try:
+        with _connect_db() as conn:
+            rows = conn.execute("SELECT id, data FROM sessions").fetchall()
+    except sqlite3.Error:
+        return
+    for session_id, raw_data in rows:
+        try:
+            raw = json.loads(raw_data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict):
+            incoming = _normalize_session(raw)
+            current = _sessions.get(str(session_id))
+            if current is None or float(incoming.get("updated_at") or 0) > float(current.get("updated_at") or 0):
+                _sessions[str(session_id)] = incoming
+
+
 def _save_sessions_locked() -> None:
+    _refresh_sessions_from_db_locked()
     SESSION_STORE.parent.mkdir(parents=True, exist_ok=True)
     temp_path = SESSION_STORE.with_suffix(".json.tmp")
     temp_path.write_text(json.dumps(_sessions, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(SESSION_STORE)
     _init_db()
-    with sqlite3.connect(SESSION_DB) as conn:
+    with _connect_db() as conn:
         for session_id, session in _sessions.items():
             conn.execute(
                 """
@@ -252,17 +470,17 @@ def _load_sessions() -> None:
     data: dict[str, Any] = {}
     if SESSION_DB.exists():
         try:
-            with sqlite3.connect(SESSION_DB) as conn:
+            with _connect_db() as conn:
                 rows = conn.execute("SELECT id, data FROM sessions").fetchall()
             data = {row[0]: json.loads(row[1]) for row in rows}
         except (sqlite3.Error, json.JSONDecodeError) as exc:
-            print(f"[api_server] Could not load session database: {exc}")
+            log_event(logger, 30, "session_database_load_failed", path=str(SESSION_DB), exception_type=type(exc).__name__, outcome="fallback_to_json")
             data = {}
     if not data and SESSION_STORE.exists():
         try:
             data = json.loads(SESSION_STORE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[api_server] Could not load session store: {exc}")
+            log_event(logger, 30, "session_store_load_failed", path=str(SESSION_STORE), exception_type=type(exc).__name__, outcome="empty_sessions")
             return
     if not isinstance(data, dict):
         return
@@ -290,21 +508,224 @@ def _public_url(session_id: str, path: str | Path) -> str:
     return f"/files/{session_id}/{Path(path).name}"
 
 
+def _row_to_job(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+    keys = (
+        "id",
+        "session_id",
+        "type",
+        "state",
+        "progress_percent",
+        "current_step",
+        "error",
+        "rq_job_id",
+        "attempts",
+        "created_at",
+        "updated_at",
+    )
+    return {key: row[index] for index, key in enumerate(keys)}
+
+
+def _create_job(session_id: str, job_type: str, current_step: str) -> dict[str, Any]:
+    _init_db()
+    job_id = uuid.uuid4().hex[:12]
+    now = _now()
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (id, session_id, type, state, progress_percent, current_step, error, rq_job_id, attempts, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)
+            """,
+            (job_id, session_id, job_type, "queued", 0, current_step, now, now),
+        )
+        conn.commit()
+    return _get_job(job_id)
+
+
+def _get_job(job_id: str) -> dict[str, Any]:
+    _init_db()
+    with _connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, session_id, type, state, progress_percent, current_step, error, rq_job_id, attempts, created_at, updated_at
+            FROM jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _row_to_job(row)
+
+
+def _latest_active_job(session_id: str) -> dict[str, Any] | None:
+    _init_db()
+    placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
+    with _connect_db() as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, session_id, type, state, progress_percent, current_step, error, rq_job_id, attempts, created_at, updated_at
+            FROM jobs
+            WHERE session_id = ? AND state IN ({placeholders})
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (session_id, *ACTIVE_JOB_STATES),
+        ).fetchone()
+    if not row:
+        return None
+    job = _row_to_job(row)
+    if _job_is_stale(job):
+        _expire_stale_job(job)
+        return None
+    return job
+
+
+def _job_is_stale(job: dict[str, Any]) -> bool:
+    stale_after = max(60, DEFAULT_STALE_JOB_SECONDS)
+    return (_now() - float(job.get("updated_at") or 0)) > stale_after
+
+
+def _expire_stale_job(job: dict[str, Any]) -> None:
+    job_id = str(job.get("id") or "")
+    session_id = str(job.get("session_id") or "")
+    job_type = str(job.get("type") or "job")
+    if not job_id or not session_id:
+        return
+    message = f"{job_type.replace('_', ' ').title()} interrupted before completion."
+    log_event(
+        logger,
+        30,
+        "stale_job_expired",
+        session_id=session_id,
+        job_id=job_id,
+        job_type=job_type,
+        previous_state=job.get("state"),
+        previous_step=job.get("current_step"),
+        stale_seconds=round(_now() - float(job.get("updated_at") or 0), 1),
+        outcome="marked_failed",
+    )
+    _update_job(job_id, state="failed", current_step=message, error=message)
+    with _lock:
+        _refresh_session_from_db_locked(session_id)
+        session = _sessions.get(session_id)
+        if not session or session.get("phase") not in {"planning", "rendering"}:
+            return
+        session["phase"] = "error"
+        session["screen"] = PHASE_SCREENS["error"]
+        session["progress_label"] = message
+        session["next_action"] = "Start Redis and the TripStory worker, then retry the action."
+        session["error"] = message
+        session["updated_at"] = _now()
+        _save_sessions_locked()
+
+
+def _update_job(job_id: str, **updates: Any) -> dict[str, Any]:
+    allowed = {"state", "progress_percent", "current_step", "error", "rq_job_id", "attempts"}
+    fields = []
+    values: list[Any] = []
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        fields.append(f"{key} = ?")
+        values.append(value)
+    if not fields:
+        return _get_job(job_id)
+    fields.append("updated_at = ?")
+    values.append(_now())
+    values.append(job_id)
+    _init_db()
+    with _connect_db() as conn:
+        conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
+    return _get_job(job_id)
+
+
+def _job_progress(job_id: str | None, session_id: str, state: str, step: str, progress_percent: int) -> None:
+    log_event(
+        logger,
+        20,
+        "job_progress",
+        session_id=session_id,
+        job_id=job_id,
+        state=state,
+        stage=state,
+        progress_percent=max(0, min(100, progress_percent)),
+        step=step,
+    )
+    if job_id:
+        _update_job(job_id, state=state, current_step=step, progress_percent=max(0, min(100, progress_percent)), error=None)
+    _event(session_id, step, progress_percent)
+
+
+def _enqueue_rq_job(job_id: str) -> str:
+    try:
+        from redis import Redis
+        from rq import Queue
+        from worker import run_tripstory_job
+    except ImportError as exc:
+        raise RuntimeError("RQ queue backend requires redis and rq packages. Run pip install -r requirements.txt.") from exc
+
+    redis_url = os.environ.get("TRIPSTORY_REDIS_URL", "redis://localhost:6379/0")
+    queue_name = os.environ.get("TRIPSTORY_QUEUE_NAME", "tripstory")
+    timeout = int(os.environ.get("TRIPSTORY_JOB_TIMEOUT_SECONDS", "3600"))
+    connection = Redis.from_url(redis_url)
+    queue = Queue(queue_name, connection=connection)
+    rq_job = queue.enqueue(run_tripstory_job, job_id, job_timeout=timeout)
+    log_event(logger, 20, "rq_job_enqueued", job_id=job_id, rq_job_id=str(rq_job.id), queue_name=queue_name, timeout_seconds=timeout, outcome="success")
+    return str(rq_job.id)
+
+
+def _enqueue_job(session_id: str, job_type: str) -> dict[str, Any]:
+    step = "Queued story generation" if job_type == "story_generation" else "Queued render"
+    job = _create_job(session_id, job_type, step)
+    log_event(logger, 20, "job_created", session_id=session_id, job_id=job["id"], job_type=job_type, state="queued", step=step)
+    backend = os.environ.get("TRIPSTORY_QUEUE_BACKEND", "rq").strip().lower()
+    if backend == "inline":
+        run_queued_job(job["id"])
+        return _get_job(job["id"])
+    if backend != "rq":
+        raise HTTPException(status_code=500, detail=f"Unsupported queue backend: {backend}")
+    try:
+        rq_job_id = _enqueue_rq_job(job["id"])
+        return _update_job(job["id"], rq_job_id=rq_job_id)
+    except Exception as exc:
+        logger.exception("Queue enqueue failed")
+        log_event(logger, 40, "job_enqueue_failed", session_id=session_id, job_id=job["id"], job_type=job_type, exception_type=type(exc).__name__, outcome="hard_failure")
+        _update_job(job["id"], state="failed", current_step="Queue enqueue failed", error=str(exc))
+        _update_session(
+            session_id,
+            phase="error",
+            progress_label="Queue enqueue failed",
+            next_action="Start Redis and the TripStory worker, then retry the action.",
+            error=str(exc),
+        )
+        raise HTTPException(status_code=503, detail=f"Could not enqueue job: {exc}") from exc
+
+
 def _public_session(session_id: str) -> dict[str, Any]:
     with _lock:
+        _refresh_session_from_db_locked(session_id)
         session = _sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        active_job = _latest_active_job(session_id)
+        if active_job is None:
+            _refresh_session_from_db_locked(session_id)
+            session = _sessions.get(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
         public = dict(session)
         public["screen"] = PHASE_SCREENS.get(public["phase"], "context")
         context = dict(public.get("trip_context") or {})
         context.pop("llm_api_key", None)
         public["trip_context"] = context
+        public["active_job"] = active_job
         return public
 
 
 def _event(session_id: str, label: str, progress_percent: int | None = None, level: str = "info") -> None:
     with _lock:
+        _refresh_session_from_db_locked(session_id)
         session = _sessions.get(session_id)
         if session is None:
             return
@@ -319,6 +740,7 @@ def _event(session_id: str, label: str, progress_percent: int | None = None, lev
 
 def _update_session(session_id: str, **updates: Any) -> dict[str, Any]:
     with _lock:
+        _refresh_session_from_db_locked(session_id)
         session = _sessions.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -346,6 +768,7 @@ def _create_session(owner_id: str = "local") -> dict[str, Any]:
         _sessions[session_id] = session
         _save_sessions_locked()
     _session_dir(session_id)
+    log_event(logger, 20, "session_created", session_id=session_id, owner_id=owner_id)
     return _public_session(session_id)
 
 
@@ -364,7 +787,21 @@ def _ensure_current_clip_analysis(session_id: str, media_items: list[dict[str, A
         needs_semantics = not analysis.get("semantic_source") or (expected_source and analysis.get("semantic_source") != expected_source)
         if not path.exists() or not needs_semantics:
             continue
+        analysis_started = time.monotonic()
+        log_event(logger, 20, "clip_analysis_refresh_start", session_id=session_id, clip_id=item.get("id"), clip_name=item.get("filename"), stage="clip_analysis")
         item["analysis"] = analyze_clip(path, item.get("filename"), context=context)
+        log_event(
+            logger,
+            20,
+            "clip_analysis_refresh_complete",
+            session_id=session_id,
+            clip_id=item.get("id"),
+            clip_name=item.get("filename"),
+            semantic_source=(item.get("analysis") or {}).get("semantic_source"),
+            elapsed_seconds=round(time.monotonic() - analysis_started, 3),
+            stage="clip_analysis",
+            outcome="success",
+        )
         refreshed = True
     if refreshed:
         _update_session(
@@ -375,14 +812,16 @@ def _ensure_current_clip_analysis(session_id: str, media_items: list[dict[str, A
     return media_items
 
 
-def _generate_story_background(session_id: str) -> None:
+def _generate_story_background(session_id: str, job_id: str | None = None) -> None:
+    started = time.monotonic()
     try:
+        log_event(logger, 20, "story_job_start", session_id=session_id, job_id=job_id, stage="story_generation")
         session = _public_session(session_id)
         media_items = list(session.get("media_items") or [])
         if not media_items:
             raise ValueError("Upload at least one clip or video before generating the story.")
 
-        _event(session_id, "Analyzing trip brief and clip intelligence", 35)
+        _job_progress(job_id, session_id, "analyzing", "Analyzing trip brief and clip intelligence", 35)
         context = dict(session.get("trip_context") or {})
         media_items = _ensure_current_clip_analysis(session_id, media_items, context)
         selected_provider = (context.get("llm_provider") or "").strip().lower()
@@ -391,9 +830,22 @@ def _generate_story_background(session_id: str) -> None:
             provider=provider_name,
             model=context.get("llm_model") or None,
         )
+        log_event(
+            logger,
+            20,
+            "story_provider_selected",
+            session_id=session_id,
+            job_id=job_id,
+            provider=provider.provider,
+            model=provider.model,
+            configured=provider.configured,
+            media_item_count=len(media_items),
+            stage="story_generation",
+        )
         if provider.configured:
-            _event(session_id, f"Calling {provider.provider} LLM for voiceover and smart edit decisions", 45)
+            _job_progress(job_id, session_id, "planning", f"Calling {provider.provider} LLM for voiceover and smart edit decisions", 45)
         else:
+            _job_progress(job_id, session_id, "planning", f"Using local fallback because {provider.provider} is not configured", 45)
             _event(session_id, f"Using local fallback because {provider.provider} is not configured", 45, level="warning")
         plan = generate_trip_story(context, media_items, provider)
         generation = plan.get("generation") or {}
@@ -414,7 +866,36 @@ def _generate_story_background(session_id: str) -> None:
             llm_provider=provider.provider,
             progress_percent=100,
         )
+        if job_id:
+            _update_job(job_id, state="complete", current_step="Narrative plan generated", progress_percent=100, error=None)
+        log_event(
+            logger,
+            20,
+            "story_job_complete",
+            session_id=session_id,
+            job_id=job_id,
+            provider=provider.provider,
+            model=provider.model,
+            llm_used=generation.get("llm_used"),
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="success",
+            stage="story_generation",
+        )
     except Exception as exc:
+        logger.exception("Story planning failed")
+        log_event(
+            logger,
+            40,
+            "story_job_failed",
+            session_id=session_id,
+            job_id=job_id,
+            exception_type=type(exc).__name__,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="hard_failure",
+            stage="story_generation",
+        )
+        if job_id:
+            _update_job(job_id, state="failed", current_step="Story planning failed", error=str(exc))
         _update_session(
             session_id,
             phase="error",
@@ -424,8 +905,10 @@ def _generate_story_background(session_id: str) -> None:
         )
 
 
-def _render_background(session_id: str) -> None:
+def _render_background(session_id: str, job_id: str | None = None) -> None:
+    started = time.monotonic()
     try:
+        log_event(logger, 20, "render_job_start", session_id=session_id, job_id=job_id, stage="render")
         session = _public_session(session_id)
         clips = list(session.get("recorded_clips") or [])
         story_plan = session.get("story_plan")
@@ -442,6 +925,19 @@ def _render_background(session_id: str) -> None:
         captions_vtt_path = session_dir / "captions.vtt"
         edit_decisions_path = session_dir / "edit_decisions.json"
         render_options = dict(session.get("render_options") or {})
+        timeline_decisions = story_plan.get("edit_decisions") or []
+        log_event(
+            logger,
+            20,
+            "render_job_inputs",
+            session_id=session_id,
+            job_id=job_id,
+            clip_count=len(clips),
+            selected_timeline_clip_count=len(timeline_decisions) or len(clips),
+            include_title_card=render_options.get("include_title_card", True),
+            aspect_ratio=render_options.get("aspect_ratio", "original"),
+            stage="render",
+        )
 
         _update_session(
             session_id,
@@ -451,7 +947,16 @@ def _render_background(session_id: str) -> None:
             progress_percent=10,
             error=None,
         )
-        _event(session_id, "Preparing story-aware render", 15)
+        _job_progress(job_id, session_id, "preparing", "Preparing story-aware render", 15)
+
+        def progress_callback(state: str, progress_percent: int) -> None:
+            labels = {
+                "rendering_segments": "Rendering timeline segments",
+                "writing_captions": "Writing captions and edit decisions",
+                "synthesizing_narration": "Synthesizing narration",
+                "mixing_audio": "Mixing narration with video",
+            }
+            _job_progress(job_id, session_id, state, labels.get(state, state.replace("_", " ")), progress_percent)
 
         rendered_path = render_trip_video(
             clips,
@@ -464,6 +969,7 @@ def _render_background(session_id: str) -> None:
             context=dict(session.get("trip_context") or {}),
             captions_srt_path=str(captions_srt_path),
             captions_vtt_path=str(captions_vtt_path),
+            progress_callback=progress_callback,
         )
         _event(session_id, "Render finished", 95)
         _update_session(
@@ -479,7 +985,35 @@ def _render_background(session_id: str) -> None:
             caption_vtt_url=_public_url(session_id, captions_vtt_path) if captions_vtt_path.exists() else None,
             progress_percent=100,
         )
+        if job_id:
+            _update_job(job_id, state="complete", current_step="Render complete", progress_percent=100, error=None)
+        log_event(
+            logger,
+            20,
+            "render_job_complete",
+            session_id=session_id,
+            job_id=job_id,
+            output_path=Path(rendered_path).name,
+            narration_written=narration_path.exists(),
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="success",
+            stage="render",
+        )
     except Exception as exc:
+        logger.exception("Render failed")
+        log_event(
+            logger,
+            40,
+            "render_job_failed",
+            session_id=session_id,
+            job_id=job_id,
+            exception_type=type(exc).__name__,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="hard_failure",
+            stage="render",
+        )
+        if job_id:
+            _update_job(job_id, state="failed", current_step="Render failed", error=str(exc))
         _update_session(
             session_id,
             phase="error",
@@ -487,6 +1021,21 @@ def _render_background(session_id: str) -> None:
             next_action="Check the uploaded files and try rendering again.",
             error=str(exc),
         )
+
+
+def run_queued_job(job_id: str) -> None:
+    job = _get_job(job_id)
+    _update_job(job_id, attempts=int(job.get("attempts") or 0) + 1)
+    log_event(logger, 20, "job_run_start", session_id=job["session_id"], job_id=job_id, job_type=job["type"], attempt=int(job.get("attempts") or 0) + 1)
+    if job["type"] == "story_generation":
+        _generate_story_background(job["session_id"], job_id=job_id)
+        return
+    if job["type"] == "render":
+        _render_background(job["session_id"], job_id=job_id)
+        return
+    _update_job(job_id, state="failed", current_step="Unknown job type", error=f"Unsupported job type: {job['type']}")
+    log_event(logger, 40, "job_run_failed", session_id=job["session_id"], job_id=job_id, job_type=job["type"], outcome="unsupported_job_type")
+    raise ValueError(f"Unsupported job type: {job['type']}")
 
 
 @app.get("/health")
@@ -503,7 +1052,7 @@ def list_sessions(auth: dict[str, str] = Depends(_auth_context)) -> dict[str, An
             for session_id, session in _sessions.items()
             if (session.get("owner_id") or "local") == owner_id
         ]
-    sessions.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
+    sessions.sort(key=lambda item: _timestamp(item.get("updated_at"), 0), reverse=True)
     return {
         "sessions": [
             {
@@ -627,28 +1176,27 @@ async def upload_media(
 @app.post("/sessions/{session_id}/generate-story")
 def generate_story(
     session_id: str,
-    background_tasks: BackgroundTasks,
     auth: dict[str, str] = Depends(_auth_context),
 ) -> dict[str, Any]:
     session = _public_session(session_id)
     _ensure_owner(session, _owner_from_auth(auth))
     if not session.get("media_items"):
         raise HTTPException(status_code=409, detail="Upload media before generating the story.")
-    background_tasks.add_task(_generate_story_background, session_id)
-    return _update_session(
+    _update_session(
         session_id,
         phase="planning",
-        progress_label="Writing travel narrative",
-        next_action="The model is turning your trip context into a voiceover plan.",
-        progress_percent=10,
+        progress_label="Queued story generation",
+        next_action="The story job is queued for the worker.",
+        progress_percent=0,
         error=None,
     )
+    _enqueue_job(session_id, "story_generation")
+    return _public_session(session_id)
 
 
 @app.post("/sessions/{session_id}/render")
 def render_session(
     session_id: str,
-    background_tasks: BackgroundTasks,
     request: RenderRequest | None = None,
     auth: dict[str, str] = Depends(_auth_context),
 ) -> dict[str, Any]:
@@ -660,15 +1208,26 @@ def render_session(
         raise HTTPException(status_code=409, detail="Upload at least one video clip before rendering.")
     render_options = request.model_dump() if request else dict(session.get("render_options") or RenderRequest().model_dump())
     _update_session(session_id, render_options=render_options)
-    background_tasks.add_task(_render_background, session_id)
-    return _update_session(
+    _update_session(
         session_id,
         phase="rendering",
         progress_label="Queued render",
-        next_action="The recap video is being assembled.",
-        progress_percent=5,
+        next_action="The render job is queued for the worker.",
+        progress_percent=0,
         error=None,
     )
+    _enqueue_job(session_id, "render")
+    return _public_session(session_id)
+
+
+@app.get("/sessions/{session_id}/jobs/{job_id}")
+def get_job(session_id: str, job_id: str, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    job = _get_job(job_id)
+    if job["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.post("/sessions/{session_id}/share")
@@ -697,8 +1256,9 @@ def delete_session(session_id: str, auth: dict[str, str] = Depends(_auth_context
         _sessions.pop(session_id, None)
         _save_sessions_locked()
         if SESSION_DB.exists():
-            with sqlite3.connect(SESSION_DB) as conn:
+            with _connect_db() as conn:
                 conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                conn.execute("DELETE FROM jobs WHERE session_id = ?", (session_id,))
                 conn.commit()
     shutil.rmtree(MEDIA_ROOT / session_id, ignore_errors=True)
     return {"status": "deleted"}

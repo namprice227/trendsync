@@ -1,4 +1,4 @@
-import type { ProjectSummary, RenderOptions, TripContext, TripSession } from './types';
+import type { JobSummary, ProjectSummary, RenderOptions, TripContext, TripSession } from './types';
 
 export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '');
@@ -96,6 +96,11 @@ export async function renderTripVideo(baseUrl: string, sessionId: string, option
     body: options ? JSON.stringify(options) : undefined,
   });
   return readJson<TripSession>(response);
+}
+
+export async function getJob(baseUrl: string, sessionId: string, jobId: string): Promise<JobSummary> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/jobs/${jobId}`));
+  return readJson<JobSummary>(response);
 }
 
 export async function shareSession(baseUrl: string, sessionId: string): Promise<{ share_token: string; share_url: string; session: TripSession }> {

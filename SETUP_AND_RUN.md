@@ -64,6 +64,34 @@ TRIPSTORY_LLM_MIN_INTERVAL_SECONDS=5
 TRIPSTORY_LLM_MAX_RETRIES=3
 ```
 
+Logging is enabled in the API and worker terminals by default:
+
+```bash
+TRIPSTORY_LOG_LEVEL=INFO
+TRIPSTORY_LOG_HTTP_REQUESTS=1
+TRIPSTORY_LOG_FILE=
+TRIPSTORY_LOG_API_PAYLOADS=0
+```
+
+Set `TRIPSTORY_LOG_FILE=/tmp/tripstory.log` to also write logs to a file, then watch it with:
+
+```bash
+tail -f /tmp/tripstory.log
+```
+
+During a generation or render, watch the API and worker terminals for `http_request_complete`, `job_progress`, `llm_request_attempt`, `tts_request_attempt`, and render events such as `render_segment_created`. Session polling logs include `session_phase`, `session_progress_percent`, `active_job_state`, and `active_job_step`, which are the fastest way to distinguish a queued job from a blocked worker. To confirm only one LLM or TTS call is active at a time, verify each `llm_request_attempt` or `tts_request_attempt` is followed by a completion/retry line before the next attempt starts. Logs include provider/model/status/elapsed metadata, not API keys, full prompts, full scripts, or uploaded file contents.
+
+Local SQLite and ffmpeg safeguards:
+
+```bash
+TRIPSTORY_SESSION_DB=trip_sessions.sqlite3
+TRIPSTORY_SQLITE_TIMEOUT_SECONDS=20
+TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
+TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
+```
+
+The API and RQ worker both read and write SQLite. Connections enable WAL mode and a busy timeout so the local database can handle concurrent API polling and worker progress updates. ffmpeg probes are also bounded by timeouts; audio-level probing runs with `-nostdin`, `stdin=DEVNULL`, and audio-only mapping so a bad video stream or terminal job-control issue cannot occupy the worker indefinitely after restart.
+
 Default provider models:
 
 - OpenAI: `gpt-4o-mini`
@@ -140,7 +168,25 @@ export TRIPSTORY_MEDIA_DIR="/path/to/media"
 export TRIPSTORY_SESSION_STORE="/path/to/sessions.json"
 ```
 
-## 4. Run The API
+## 4. Run Redis, Worker, And API
+
+Story generation and rendering are queued through RQ. Start Redis first:
+
+```bash
+redis-server
+```
+
+The Conda environment installs Redis from `environment.yml`. If you use the venv path instead, install Redis through your OS package manager or Docker.
+
+In a second terminal, start the TripStory worker:
+
+```bash
+python worker.py
+```
+
+Keep this worker running in the foreground or under a process supervisor. If the terminal suspends the worker or one of its children, the queue can stop moving even though the API still responds. In `ps`, `STAT T` or `Tl` on `python worker.py` or `ffmpeg` means the process is stopped, not doing slow work.
+
+In a third terminal, start the API:
 
 ```bash
 python -m uvicorn api_server:app --host 0.0.0.0 --port 8010
@@ -189,19 +235,39 @@ npm run typecheck
 
 ## 7. MVP Flow
 
-1. Start the API.
-2. Start the mobile/web app.
-3. Upload at least one video clip.
-4. Save trip context.
-5. Generate a narrative plan with smart edit decisions.
-6. Choose timeline favorites/order and export ratio.
-7. Render the holiday recap video.
-8. Preview the video. If TTS is configured, generated narration is mixed into the render.
+1. Start Redis.
+2. Start the TripStory worker.
+3. Start the API.
+4. Start the mobile/web app.
+5. Upload at least one video clip.
+6. Save trip context.
+7. Generate a narrative plan with smart edit decisions.
+8. Choose timeline favorites/order and export ratio.
+9. Render the holiday recap video.
+10. Preview the video. If TTS is configured, generated narration is mixed into the render.
 
 ## 8. Known MVP Limits
 
 - Auth is token/header based for local MVP use, not a full identity provider.
-- Background work still uses FastAPI background tasks, not a durable distributed queue.
 - Clip intelligence is local and heuristic. It names likely landmarks from trip context and scenic frames, but it does not yet run a true landmark-recognition model.
 - Sessions persist to SQLite with JSON backup compatibility, but there is no full account system or production role model.
-- Long-running generation/rendering uses FastAPI background tasks, not a production queue.
+- Long-running generation/rendering uses RQ + Redis with a lightweight SQLite jobs table, not a fully distributed production workflow system.
+
+## 9. Quick Troubleshooting
+
+If rendering is stuck on the frontend:
+
+```bash
+sqlite3 trip_sessions.sqlite3 "select id, session_id, type, state, progress_percent, current_step, error, rq_job_id, attempts, datetime(updated_at, 'unixepoch', 'localtime') from jobs order by updated_at desc limit 10;"
+ps -ef
+```
+
+Look for one active `story_generation` or `render` job ahead of the job you care about. With one worker, that job blocks every queued job behind it.
+
+If ffmpeg looks stuck, test the media file directly:
+
+```bash
+timeout 20 .conda/trendsync-py312/bin/ffmpeg -nostdin -hide_banner -i trip_sessions/<session_id>/media/<file>.mp4 -vn -af volumedetect -f null -
+```
+
+If the direct command finishes quickly but the worker remains stuck, restart the worker so it loads current code and clears the stopped child process.

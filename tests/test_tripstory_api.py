@@ -39,6 +39,15 @@ class TripStoryApiTest(unittest.TestCase):
             "TRIPSTORY_TTS_VOICE",
             "TRIPSTORY_ENABLE_TRANSCRIPTION",
             "TRIPSTORY_SESSION_DB",
+            "TRIPSTORY_SQLITE_TIMEOUT_SECONDS",
+            "TRIPSTORY_QUEUE_BACKEND",
+            "TRIPSTORY_REDIS_URL",
+            "TRIPSTORY_QUEUE_NAME",
+            "TRIPSTORY_JOB_TIMEOUT_SECONDS",
+            "TRIPSTORY_LOG_LEVEL",
+            "TRIPSTORY_LOG_FILE",
+            "TRIPSTORY_LOG_API_PAYLOADS",
+            "TRIPSTORY_LOG_HTTP_REQUESTS",
         ):
             os.environ.pop(key, None)
 
@@ -54,6 +63,7 @@ class TripStoryApiTest(unittest.TestCase):
             "GEMINI_API_KEY",
             "DEEPSEEK_API_KEY",
             "TRIPSTORY_TTS_PROVIDER",
+            "TRIPSTORY_QUEUE_BACKEND",
         ):
             os.environ.pop(key, None)
 
@@ -117,6 +127,10 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertNotIn("face hits", planned["script"])
         self.assertIn("reason", planned["story_plan"]["edit_decisions"][0])
         self.assertFalse(planned["story_plan"]["generation"]["llm_used"])
+        planning_events = [event["label"] for event in planned["events"]]
+        self.assertIn("Analyzing trip brief and clip intelligence", planning_events)
+        self.assertIn("Using local fallback because local is not configured", planning_events)
+        self.assertIn("Narrative plan generated with local fallback", planning_events)
 
         self.api_server._render_background(session_id)
         rendered = self.api_server._public_session(session_id)
@@ -128,6 +142,10 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertTrue((self.media_root / session_id / "story_plan.json").exists())
         self.assertTrue((self.media_root / session_id / "edit_decisions.json").exists())
         self.assertTrue(self.session_store.exists())
+        render_events = [event["label"] for event in rendered["events"]]
+        self.assertIn("Preparing story-aware render", render_events)
+        self.assertIn("Writing captions and edit decisions", render_events)
+        self.assertIn("Render finished", render_events)
 
         reloaded = importlib.reload(self.api_server)
         persisted = reloaded._public_session(session_id)
@@ -148,6 +166,152 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertNotIn("llm_api_key", updated["trip_context"])
         public = self.api_server._public_session(session_id)
         self.assertNotIn("llm_api_key", public["trip_context"])
+
+    def test_session_poll_logs_structured_http_state(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+
+        fields = self.api_server._session_status_fields(f"/sessions/{session_id}", 200)
+
+        self.assertEqual(fields["session_phase"], "collecting_context")
+        self.assertEqual(fields["session_screen"], "context")
+        self.assertEqual(fields["session_progress_percent"], 0)
+        self.assertEqual(fields["media_count"], 0)
+        self.assertFalse(fields["final_video_ready"])
+
+    def test_session_timestamps_are_normalized_for_listing_sort(self) -> None:
+        first = self.api_server._create_session()
+        second = self.api_server._create_session()
+        with self.api_server._connect_db() as conn:
+            first_data = json.loads(conn.execute("SELECT data FROM sessions WHERE id = ?", (first["id"],)).fetchone()[0])
+            first_data["updated_at"] = "2000000000"
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?, data = ? WHERE id = ?",
+                (2000000000.0, json.dumps(first_data), first["id"]),
+            )
+            conn.commit()
+
+        listed = self.api_server.list_sessions()
+
+        self.assertEqual(listed["sessions"][0]["id"], first["id"])
+        self.assertIsInstance(self.api_server._normalize_session({"id": first["id"], "updated_at": "200"})["updated_at"], float)
+
+    def test_generate_story_endpoint_enqueues_rq_job(self) -> None:
+        from unittest.mock import patch
+
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context.update({"destination": "Kyoto", "llm_provider": "local"})
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            media_items=[{"id": "clip1", "filename": "clip.mp4", "kind": "video", "path": "clip.mp4", "analysis": {}}],
+            recorded_clips=["clip.mp4"],
+            phase="ready_to_plan",
+        )
+        os.environ["TRIPSTORY_QUEUE_BACKEND"] = "rq"
+        with patch.object(self.api_server, "_enqueue_rq_job", return_value="rq-story-1") as enqueue:
+            queued = self.api_server.generate_story(session_id)
+
+        enqueue.assert_called_once()
+        self.assertEqual(queued["phase"], "planning")
+        self.assertIsNotNone(queued["active_job"])
+        self.assertEqual(queued["active_job"]["type"], "story_generation")
+        self.assertEqual(queued["active_job"]["state"], "queued")
+        self.assertEqual(queued["active_job"]["rq_job_id"], "rq-story-1")
+
+        job = self.api_server.get_job(session_id, queued["active_job"]["id"])
+        self.assertEqual(job["session_id"], session_id)
+        self.assertEqual(job["type"], "story_generation")
+        os.environ.pop("TRIPSTORY_QUEUE_BACKEND", None)
+
+    def test_render_endpoint_enqueues_rq_job(self) -> None:
+        from unittest.mock import patch
+
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        self.api_server._update_session(
+            session_id,
+            story_plan={"title": "Kyoto", "voiceover_script": "A trip begins.", "edit_decisions": []},
+            recorded_clips=["clip.mp4"],
+            phase="ready_to_render",
+        )
+        os.environ["TRIPSTORY_QUEUE_BACKEND"] = "rq"
+        with patch.object(self.api_server, "_enqueue_rq_job", return_value="rq-render-1") as enqueue:
+            queued = self.api_server.render_session(session_id, self.api_server.RenderRequest())
+
+        enqueue.assert_called_once()
+        self.assertEqual(queued["phase"], "rendering")
+        self.assertIsNotNone(queued["active_job"])
+        self.assertEqual(queued["active_job"]["type"], "render")
+        self.assertEqual(queued["active_job"]["rq_job_id"], "rq-render-1")
+        os.environ.pop("TRIPSTORY_QUEUE_BACKEND", None)
+
+    def test_worker_completes_story_generation_job(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context.update({"destination": "Kyoto", "llm_provider": "local"})
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            media_items=[{"id": "clip1", "filename": "clip.mp4", "kind": "video", "path": "clip.mp4", "analysis": {}}],
+            recorded_clips=["clip.mp4"],
+            phase="planning",
+        )
+        job = self.api_server._create_job(session_id, "story_generation", "Queued story generation")
+
+        self.api_server.run_queued_job(job["id"])
+
+        completed = self.api_server._get_job(job["id"])
+        planned = self.api_server._public_session(session_id)
+        self.assertEqual(completed["state"], "complete")
+        self.assertEqual(completed["progress_percent"], 100)
+        self.assertEqual(planned["phase"], "ready_to_render")
+        self.assertIsNone(planned["active_job"])
+
+    def test_worker_marks_failed_job_and_session_error(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        job = self.api_server._create_job(session_id, "story_generation", "Queued story generation")
+
+        self.api_server.run_queued_job(job["id"])
+
+        failed = self.api_server._get_job(job["id"])
+        public = self.api_server._public_session(session_id)
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(public["phase"], "error")
+        self.assertIn("Upload at least one", public["error"])
+
+    def test_stale_active_job_expires_on_session_poll(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        self.api_server._update_session(session_id, phase="planning", progress_percent=35)
+        job = self.api_server._create_job(session_id, "story_generation", "Queued story generation")
+        stale_updated_at = self.api_server._now() - self.api_server.DEFAULT_STALE_JOB_SECONDS - 10
+        with self.api_server._connect_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET state = ?, progress_percent = ?, current_step = ?, updated_at = ? WHERE id = ?",
+                ("analyzing", 35, "Analyzing trip brief and clip intelligence", stale_updated_at, job["id"]),
+            )
+            conn.commit()
+
+        public = self.api_server._public_session(session_id)
+        expired = self.api_server._get_job(job["id"])
+
+        self.assertIsNone(public["active_job"])
+        self.assertEqual(public["phase"], "error")
+        self.assertEqual(expired["state"], "failed")
+        self.assertIn("interrupted", public["error"])
+
+    def test_sqlite_connections_use_wal_and_busy_timeout(self) -> None:
+        with self.api_server._connect_db() as conn:
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+        self.assertEqual(journal_mode.lower(), "wal")
+        self.assertEqual(busy_timeout, int(self.api_server.SQLITE_TIMEOUT_SECONDS * 1000))
 
     def test_provider_presets_configure_openai_compatible_endpoints(self) -> None:
         from llm_provider import LLMProvider
@@ -332,6 +496,79 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertIn("Tromso", plan["voiceover_script"])
         self.assertTrue(plan["generation"]["llm_used"])
 
+    def test_story_generation_sends_compact_manifest_not_raw_analysis(self) -> None:
+        from trip_story import generate_trip_story
+
+        captured = {}
+
+        class CapturingProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-pro"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                captured["messages"] = messages
+                return json.dumps(
+                    {
+                        "title": "Compact Story",
+                        "language": "English",
+                        "edit_decisions": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "start_time": 4,
+                                "duration": 5,
+                                "reason": "Opening beat with visible mountain hike energy.",
+                            }
+                        ],
+                        "voiceover_segments": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "voiceover": "This is the moment the trip starts feeling real.",
+                            }
+                        ],
+                    }
+                )
+
+        generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [
+                {
+                    "id": "clip1",
+                    "filename": "clip.mp4",
+                    "kind": "video",
+                    "size_bytes": 100,
+                    "analysis": {
+                        "duration_seconds": 12.5,
+                        "width": 1280,
+                        "height": 720,
+                        "scene_count": 1,
+                        "quality_label": "strong",
+                        "face_count": 2,
+                        "avg_motion": 31,
+                        "has_audio": True,
+                        "semantic_summary": "A man is walking on a snowy mountain trail with wind and friends nearby.",
+                        "best_moment_timestamps": [4.2, 8.8],
+                        "landmark_candidate_timestamps": [6.0],
+                        "transcript": "This raw transcript is intentionally long and should not be copied wholesale into the prompt.",
+                    },
+                }
+            ],
+            CapturingProvider(),
+        )
+
+        user_payload = json.loads(captured["messages"][1]["content"])
+        prompt_text = captured["messages"][1]["content"]
+        self.assertIn("clip_manifest", user_payload)
+        self.assertNotIn("uploaded_media", user_payload)
+        self.assertNotIn('"analysis"', prompt_text)
+        self.assertNotIn('"width"', prompt_text)
+        self.assertNotIn("1280", prompt_text)
+        self.assertNotIn("face_count", prompt_text)
+        self.assertIn("[Clip clip1] 12s", user_payload["clip_manifest"][0])
+        self.assertIn("snowy mountain", user_payload["clip_manifest"][0])
+
     def test_deepseek_payload_supports_thinking_and_reasoning_env(self) -> None:
         from llm_provider import LLMProvider
         from unittest.mock import patch
@@ -382,6 +619,63 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertEqual(provider.model, "gpt-4o-mini-tts")
         self.assertEqual(provider.voice, "coral")
         os.environ.pop("OPENAI_API_KEY", None)
+
+    def test_llm_and_tts_logs_attempts_retries_without_secrets(self) -> None:
+        from llm_provider import LLMProvider
+        from tts_provider import TTSProvider
+        from unittest.mock import patch
+
+        class FakeResponse:
+            def __init__(self, status_code: int, payload: dict | None = None, content: bytes = b"audio") -> None:
+                self.status_code = status_code
+                self.headers = {"Retry-After": "0"} if status_code == 429 else {}
+                self._payload = payload or {"choices": [{"message": {"content": "Story JSON"}}]}
+                self.content = content
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+                return None
+
+            def json(self):
+                return self._payload
+
+        os.environ["DEEPSEEK_API_KEY"] = "sk-test-secret-llm"
+        os.environ["TRIPSTORY_LLM_MIN_INTERVAL_SECONDS"] = "0"
+        os.environ["TRIPSTORY_LLM_MAX_RETRIES"] = "1"
+        with self.assertLogs("tripstory.llm", level="INFO") as llm_logs:
+            with patch("llm_provider.requests.post", side_effect=[FakeResponse(429), FakeResponse(200)]):
+                result = LLMProvider(provider="deepseek").chat([{"role": "user", "content": "private trip context"}])
+
+        self.assertEqual(result, "Story JSON")
+        llm_output = "\n".join(llm_logs.output)
+        self.assertIn("llm_request_attempt", llm_output)
+        self.assertIn("llm_request_retry", llm_output)
+        self.assertIn("llm_request_complete", llm_output)
+        self.assertNotIn("sk-test-secret-llm", llm_output)
+        self.assertNotIn("private trip context", llm_output)
+
+        os.environ["OPENAI_API_KEY"] = "sk-test-secret-tts"
+        os.environ["TRIPSTORY_TTS_MIN_INTERVAL_SECONDS"] = "0"
+        os.environ["TRIPSTORY_TTS_MAX_RETRIES"] = "1"
+        tts_target = Path(self.temp_dir.name) / "voiceover.mp3"
+        with self.assertLogs("tripstory.tts", level="INFO") as tts_logs:
+            with patch("tts_provider.requests.post", side_effect=[FakeResponse(429), FakeResponse(200, content=b"mp3")]):
+                output_path = TTSProvider().synthesize("This is private narration.", tts_target)
+
+        self.assertEqual(output_path, str(tts_target))
+        tts_output = "\n".join(tts_logs.output)
+        self.assertIn("tts_request_attempt", tts_output)
+        self.assertIn("tts_request_retry", tts_output)
+        self.assertIn("tts_request_complete", tts_output)
+        self.assertNotIn("sk-test-secret-tts", tts_output)
+        self.assertNotIn("This is private narration", tts_output)
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("TRIPSTORY_LLM_MIN_INTERVAL_SECONDS", None)
+        os.environ.pop("TRIPSTORY_LLM_MAX_RETRIES", None)
+        os.environ.pop("TRIPSTORY_TTS_MIN_INTERVAL_SECONDS", None)
+        os.environ.pop("TRIPSTORY_TTS_MAX_RETRIES", None)
 
 
 if __name__ == "__main__":

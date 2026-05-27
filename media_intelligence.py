@@ -16,10 +16,15 @@ import cv2
 import numpy as np
 import requests
 
+from tripstory_logging import approximate_tokens, get_logger, log_event
+
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
 _vision_lock = threading.Lock()
 _last_vision_request_at = 0.0
+logger = get_logger("media")
+FFMPEG_PROBE_TIMEOUT = int(os.environ.get("TRIPSTORY_FFMPEG_PROBE_TIMEOUT", "30"))
+FFMPEG_AUDIO_TIMEOUT = int(os.environ.get("TRIPSTORY_FFMPEG_AUDIO_TIMEOUT", "45"))
 
 VISION_PRESETS = {
     "gemini": {
@@ -41,8 +46,8 @@ VISION_PRESETS = {
 
 def _run_json(command: list[str]) -> dict[str, Any]:
     try:
-        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except OSError:
+        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=FFMPEG_PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return {}
     if result.returncode != 0 or not result.stdout.strip():
         return {}
@@ -97,9 +102,12 @@ def _fps(value: Any) -> float:
 
 
 def _audio_levels(path: Path) -> dict[str, Any]:
-    command = ["ffmpeg", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"]
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"]
     try:
-        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=FFMPEG_AUDIO_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log_event(logger, 30, "audio_level_probe_timeout", clip_name=path.name, timeout_seconds=FFMPEG_AUDIO_TIMEOUT, outcome="fallback_without_audio_levels", stage="clip_analysis")
+        return {"mean_volume_db": None, "max_volume_db": None}
     except OSError:
         return {"mean_volume_db": None, "max_volume_db": None}
     text = result.stderr
@@ -239,6 +247,7 @@ def _extract_audio_sample(path: Path) -> Path | None:
     target = Path(tempfile.gettempdir()) / f"tripstory_transcribe_{path.stem}.mp3"
     command = [
         "ffmpeg",
+        "-nostdin",
         "-y",
         "-i",
         str(path),
@@ -252,8 +261,8 @@ def _extract_audio_sample(path: Path) -> Path | None:
         str(target),
     ]
     try:
-        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError:
+        result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=FFMPEG_AUDIO_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     return target if result.returncode == 0 and target.exists() and target.stat().st_size else None
 
@@ -268,6 +277,7 @@ def _transcribe(path: Path, has_audio: bool) -> str | None:
     if not sample:
         return None
     try:
+        started = time.monotonic()
         with sample.open("rb") as handle:
             response = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
@@ -279,9 +289,33 @@ def _transcribe(path: Path, has_audio: bool) -> str | None:
         response.raise_for_status()
         data = response.json()
         text = str(data.get("text") or "").strip()
+        log_event(
+            logger,
+            20,
+            "transcription_complete",
+            provider="openai",
+            model=os.environ.get("TRIPSTORY_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
+            clip_name=path.name,
+            status_code=response.status_code,
+            output_chars=len(text),
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="success" if text else "empty",
+            stage="clip_analysis",
+        )
         return text or None
     except Exception as exc:
-        print(f"[media_intelligence] transcription unavailable for {path.name}: {exc}")
+        log_event(
+            logger,
+            30,
+            "transcription_unavailable",
+            provider="openai",
+            model=os.environ.get("TRIPSTORY_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
+            clip_name=path.name,
+            exception_type=type(exc).__name__,
+            outcome="fallback_without_transcript",
+            stage="clip_analysis",
+        )
+        logger.debug("Transcription exception", exc_info=True)
         return None
     finally:
         try:
@@ -438,18 +472,101 @@ def _rate_limited_vision_post(payload: dict[str, Any], config: dict[str, str]) -
             elapsed = time.monotonic() - _last_vision_request_at
             if elapsed < min_interval:
                 time.sleep(min_interval - elapsed)
+            prompt_chars = sum(
+                len(str(part.get("text") or ""))
+                for message in payload.get("messages") or []
+                for part in (message.get("content") or [])
+                if isinstance(part, dict)
+            )
+            image_count = sum(
+                1
+                for message in payload.get("messages") or []
+                for part in (message.get("content") or [])
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            )
+            started = time.monotonic()
+            log_event(
+                logger,
+                20,
+                "vision_request_attempt",
+                provider=config.get("provider"),
+                model=config.get("model"),
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                input_chars=prompt_chars,
+                approximate_input_tokens=approximate_tokens("x" * prompt_chars),
+                image_count=image_count,
+                max_output_tokens=payload.get("max_tokens"),
+                stage="clip_analysis",
+            )
             response = requests.post(
                 endpoint,
                 headers={"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=timeout,
             )
+            request_elapsed = round(time.monotonic() - started, 3)
             _last_vision_request_at = time.monotonic()
             if response.status_code != 429:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.RequestException:
+                    log_event(
+                        logger,
+                        40,
+                        "vision_request_failed",
+                        provider=config.get("provider"),
+                        model=config.get("model"),
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        status_code=response.status_code,
+                        elapsed_seconds=request_elapsed,
+                        outcome="http_error",
+                        stage="clip_analysis",
+                    )
+                    raise
+                log_event(
+                    logger,
+                    20,
+                    "vision_request_complete",
+                    provider=config.get("provider"),
+                    model=config.get("model"),
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    status_code=response.status_code,
+                    elapsed_seconds=request_elapsed,
+                    outcome="success",
+                    stage="clip_analysis",
+                )
                 return response.json()
             retry_after = _float(response.headers.get("retry-after"))
-            time.sleep(retry_after or min(30.0, (2**attempt) + random.random()))
+            retry_delay = retry_after or min(30.0, (2**attempt) + random.random())
+            log_event(
+                logger,
+                30,
+                "vision_request_retry",
+                provider=config.get("provider"),
+                model=config.get("model"),
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                status_code=response.status_code,
+                retry_delay_seconds=round(retry_delay, 3),
+                elapsed_seconds=request_elapsed,
+                outcome="retry",
+                stage="clip_analysis",
+            )
+            time.sleep(retry_delay)
+    log_event(
+        logger,
+        40,
+        "vision_request_failed",
+        provider=config.get("provider"),
+        model=config.get("model"),
+        max_retries=max_retries,
+        status_code=response.status_code,
+        outcome="rate_limited",
+        stage="clip_analysis",
+    )
     response.raise_for_status()
     return None
 
@@ -532,7 +649,18 @@ def _vision_semantics(path: Path, analysis: dict[str, Any], context: dict[str, A
             "best_moment_descriptions": _normalize_moment_descriptions(parsed.get("best_moment_descriptions")),
         }
     except Exception as exc:
-        print(f"[media_intelligence] {config['provider']} vision analysis unavailable for {path.name}: {exc}")
+        log_event(
+            logger,
+            30,
+            "vision_analysis_unavailable",
+            provider=config["provider"],
+            model=config["model"],
+            clip_name=path.name,
+            exception_type=type(exc).__name__,
+            outcome="heuristic_fallback",
+            stage="clip_analysis",
+        )
+        logger.debug("Vision analysis exception", exc_info=True)
         return None
 
 
@@ -567,6 +695,15 @@ def _heuristic_semantics(analysis: dict[str, Any]) -> dict[str, Any]:
 
 def analyze_clip(path: str | Path, filename: str | None = None, context: dict[str, Any] | None = None) -> dict[str, Any]:
     source = Path(path)
+    started = time.monotonic()
+    log_event(
+        logger,
+        20,
+        "clip_analysis_start",
+        clip_name=filename or source.name,
+        stage="clip_analysis",
+        outcome="started",
+    )
     analysis: dict[str, Any] = {
         "filename": filename or source.name,
         "path": str(source),
@@ -574,6 +711,16 @@ def analyze_clip(path: str | Path, filename: str | None = None, context: dict[st
     }
     if not source.exists() or source.suffix.lower() not in VIDEO_SUFFIXES:
         analysis.update({"summary": "No video analysis available.", "best_moment_timestamps": []})
+        log_event(
+            logger,
+            30,
+            "clip_analysis_skipped",
+            clip_name=filename or source.name,
+            status=analysis["status"],
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="skipped",
+            stage="clip_analysis",
+        )
         return analysis
 
     probe = _probe(source)
@@ -588,6 +735,18 @@ def analyze_clip(path: str | Path, filename: str | None = None, context: dict[st
     analysis["named_landmarks"] = _named_landmarks(analysis, context)
     analysis.update(_vision_semantics(source, analysis, context) or _heuristic_semantics(analysis))
     analysis["summary"] = _summary(analysis)
+    log_event(
+        logger,
+        20,
+        "clip_analysis_complete",
+        clip_name=filename or source.name,
+        duration_seconds=analysis.get("duration_seconds"),
+        has_audio=analysis.get("has_audio"),
+        semantic_source=analysis.get("semantic_source"),
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        outcome="success",
+        stage="clip_analysis",
+    )
     return analysis
 
 

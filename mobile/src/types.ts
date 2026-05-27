@@ -120,6 +120,20 @@ export type RenderOptions = {
   include_music_bed: boolean;
 };
 
+export type JobSummary = {
+  id: string;
+  session_id: string;
+  type: string;
+  state: string;
+  progress_percent: number;
+  current_step: string;
+  error?: string | null;
+  rq_job_id?: string | null;
+  attempts: number;
+  created_at: number;
+  updated_at: number;
+};
+
 export type ProjectSummary = {
   id: string;
   destination: string;
@@ -141,6 +155,7 @@ export type TripSession = {
   progress_label: string;
   progress_percent: number;
   events: Array<{ at: number; level: string; label: string }>;
+  active_job?: JobSummary | null;
   trip_context: TripContext;
   media_items: MediaItem[];
   recorded_clips: string[];

@@ -21,15 +21,45 @@ The LLM layer is vendor-neutral. By default the app works with a deterministic f
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    user[Expo web or mobile app] --> api[FastAPI API<br/>api_server.py]
+    api --> db[(SQLite<br/>sessions + jobs)]
+    api --> media[(trip_sessions/<br/>uploaded media + renders)]
+    api --> redis[(Redis queue)]
+    redis --> worker[RQ worker<br/>worker.py]
+    worker --> db
+    worker --> media
+    worker --> ffmpeg[ffmpeg / ffprobe]
+    worker --> llm[LLM providers<br/>DeepSeek / OpenAI / Gemini / custom]
+    worker --> vision[Vision analysis<br/>Gemini or OpenAI-compatible]
+    worker --> tts[TTS / transcription<br/>OpenAI optional]
+    api --> user
 ```
-Mobile App ──► FastAPI Session API ──► Vendor-Neutral LLM Brain
-    │                 │                         │
-    │                 ├── media upload          ├── OpenAI-compatible endpoint
-    │                 ├── trip context          └── local fallback
-    │                 ├── story plan
-    │                 └── video render
-    │
-    └── Upload -> Context -> Story -> Video
+
+The API remains responsive during story generation and rendering. It creates a job row in SQLite, enqueues the job in Redis/RQ, and the frontend polls `/sessions/{session_id}` for `phase`, `screen`, `progress_percent`, and active job details.
+
+```mermaid
+sequenceDiagram
+    participant UI as Expo app
+    participant API as FastAPI
+    participant DB as SQLite
+    participant Redis as Redis/RQ
+    participant W as Worker
+    participant F as ffmpeg
+    participant AI as AI providers
+
+    UI->>API: POST /sessions/{id}/generate-story
+    API->>DB: create jobs row, state=queued
+    API->>Redis: enqueue run_tripstory_job(job_id)
+    API-->>UI: 202-style session response
+    UI->>API: GET /sessions/{id} polling
+    Redis->>W: deliver job
+    W->>DB: state=analyzing/planning
+    W->>F: probe media and audio levels
+    W->>AI: vision/story/TTS calls when configured
+    W->>DB: progress + final session update
+    API-->>UI: active_job_state/progress/current_step
 ```
 
 ## Key Files
@@ -37,9 +67,12 @@ Mobile App ──► FastAPI Session API ──► Vendor-Neutral LLM Brain
 | File | Purpose |
 |------|---------|
 | `api_server.py` | FastAPI app for trip sessions, media upload, story generation, and rendering |
+| `worker.py` | RQ worker entrypoint for queued story and render jobs |
 | `llm_provider.py` | Vendor-neutral OpenAI-compatible chat client |
+| `media_intelligence.py` | ffprobe/ffmpeg/OpenCV clip analysis and optional frame vision/transcription |
 | `trip_story.py` | Multilingual narrative and voiceover generation |
 | `trip_renderer.py` | Lightweight video assembly from uploaded clips |
+| `tripstory_logging.py` | Structured API/worker logging helpers |
 | `mobile/App.tsx` | Expo mobile UI for the TripStory workflow |
 | `mobile/src/api.ts` | Mobile API client |
 | `mobile/src/types.ts` | Trip session, context, media, and story types |
@@ -64,7 +97,20 @@ If your shell has user-site Python packages visible, keep the Conda environment 
 export PYTHONNOUSERSITE=1
 ```
 
-## Run The API
+## Run Redis, Worker, And API
+
+Start Redis and the worker for queued story/render jobs:
+
+```bash
+redis-server
+python worker.py
+```
+
+The Conda environment includes Redis. If using a plain venv, install/run Redis separately.
+
+Keep the worker in the foreground while developing, or run it under a process supervisor. If you suspend the worker terminal with shell job control, the active worker child and any child `ffmpeg` process can stop and block the queue. The media probes are hardened with `-nostdin`, `stdin=DEVNULL`, and subprocess timeouts, but a stopped old worker must still be restarted.
+
+Then start the API:
 
 ```bash
 python -m uvicorn api_server:app --host 0.0.0.0 --port 8010
@@ -86,6 +132,34 @@ LLM calls are serialized server-side to avoid accidental concurrent requests. Tu
 TRIPSTORY_LLM_MIN_INTERVAL_SECONDS=3
 TRIPSTORY_LLM_MAX_RETRIES=2
 ```
+
+Backend logs are structured as timestamped key/value JSON fields in the API and worker terminals. Optional logging controls:
+
+```bash
+TRIPSTORY_LOG_LEVEL=INFO
+TRIPSTORY_LOG_HTTP_REQUESTS=1
+TRIPSTORY_LOG_FILE=/tmp/tripstory.log
+TRIPSTORY_LOG_API_PAYLOADS=0
+```
+
+With HTTP request logging enabled, session polling emits structured app-state fields such as `session_phase`, `session_progress_percent`, `active_job_state`, and `active_job_step` in addition to Uvicorn's access log. Set `TRIPSTORY_LOG_LEVEL=DEBUG` to include request-start records too.
+
+Queued jobs older than `TRIPSTORY_STALE_JOB_SECONDS` are marked failed on the next session poll, so a lost Redis/RQ job does not leave the frontend spinner running forever.
+SQLite connections use WAL mode with `TRIPSTORY_SQLITE_TIMEOUT_SECONDS=20` by default so the API and worker can share the local job/session database more reliably.
+Media probing uses explicit ffmpeg timeouts so broken clips cannot occupy the only worker forever:
+
+```bash
+TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
+TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
+```
+
+Watch live logs in the terminals running `python -m uvicorn ...` and `python worker.py`, or follow the optional file:
+
+```bash
+tail -f /tmp/tripstory.log
+```
+
+To confirm provider calls are serialized, start one story generation and watch for one `llm_request_attempt` at a time followed by `llm_request_complete` or `llm_request_retry`. Narration uses the same pattern with `tts_request_attempt`.
 
 Default models:
 
@@ -168,6 +242,20 @@ Default API URL:
 
 TripStory renders a stitched recap video, analyzes uploaded clips, saves the generated story plan beside it as JSON, and mixes generated narration into the video when server-side TTS is configured.
 
+## Operations Notes
+
+Use three long-running processes locally:
+
+| Process | Command | Responsibility |
+|---------|---------|----------------|
+| Redis | `redis-server` | Stores queued and started RQ jobs |
+| Worker | `python worker.py` | Runs clip analysis, story planning, TTS, and render jobs |
+| API | `python -m uvicorn api_server:app --host 0.0.0.0 --port 8010` | Serves the frontend, persists sessions, and reports job progress |
+
+If the frontend spinner is stuck, check `/sessions/{session_id}` logs first. A healthy queued render behind another active job looks like `active_job_state=queued`. A blocked worker usually shows one old `started` RQ job, one busy worker, and no recent `job_progress` lines.
+
+For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the process is stopped by job control, not doing slow encoding. Restart the worker so it loads the latest subprocess hardening and releases the queue.
+
 ## Implemented Now
 
 - FastAPI session API with health check, session creation, context save, media upload, story generation, and render endpoints.
@@ -179,6 +267,7 @@ TripStory renders a stitched recap video, analyzes uploaded clips, saves the gen
 - LLM-driven smart edit planning with concrete `edit_decisions`: clip ID, source start time, duration, role, transition, caption, audio strategy, and clip-grounded reasoning for every selected segment.
 - Timeline-aligned `voiceover_segments` that pair each selected clip with a narration line, caption, start time, duration, and purpose.
 - Story-aware rendering that follows the LLM edit timeline or user timeline, trims around chosen moments, adds fades, creates a title/date card, supports portrait/landscape/square exports, and saves segment-timed SRT/VTT subtitles plus `edit_decisions.json`.
+- RQ + Redis queueing for story generation and rendering, with a SQLite-backed jobs table and frontend-visible job progress.
 - SQLite-backed session/project persistence with JSON backup compatibility, project listing, share tokens, and optional API token authentication.
 - Upload hardening with file type checks, upload size limits, render progress, event logs, and server-side cleanup-ready project deletion.
 - Mobile project library, favorite clip markers, timeline ordering controls, export controls, share action, and render progress display.
@@ -187,7 +276,7 @@ TripStory renders a stitched recap video, analyzes uploaded clips, saves the gen
 ## Remaining Production Gaps
 
 - Full identity provider login, password reset, billing, teams, and production-grade role management. The MVP has owner headers and optional API token auth.
-- A durable distributed job queue. The MVP still uses FastAPI background tasks with progress/events.
+- A fully distributed production workflow system. The MVP uses RQ + Redis locally with SQLite job state.
 - Dedicated landmark-recognition model. The MVP can use sampled-frame visual summaries and context hints, but it does not run a specialist landmark classifier.
 - Native mobile camera capture, offline/resumable uploads, drag-and-drop gestures, native share sheets, and a full nonlinear editor.
 - The older TrendFlow TikTok analysis modules are not folded into the TripStory product beyond remaining available as separate legacy modules.

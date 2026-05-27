@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from llm_provider import LLMProvider
+from tripstory_logging import get_logger, log_event
 
 
 LANGUAGE_NAMES = {
@@ -30,6 +32,7 @@ TECHNICAL_VOICEOVER_PATTERNS = (
     re.compile(r"\bthis moment shows\b", re.IGNORECASE),
     re.compile(r"\bthe places you explored\b", re.IGNORECASE),
 )
+logger = get_logger("story")
 
 
 def _language_name(code: str | None) -> str:
@@ -189,6 +192,92 @@ def _looks_like_editor_metadata(text: str) -> bool:
 def _clean_voiceover_cue(value: str) -> str:
     text = " ".join(value.replace("\n", " ").split()).strip(" .")
     return text[:180] if text else ""
+
+
+def _compact_text(value: Any, limit: int = 120) -> str:
+    text = _as_text(value)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rsplit(" ", 1)[0].strip() + "..."
+
+
+def _safe_creative_cue(value: Any, limit: int = 120) -> str:
+    text = _compact_text(value, limit)
+    return "" if _looks_like_editor_metadata(text) else text
+
+
+def _motion_label(value: Any) -> str:
+    motion = _as_float(value, 0.0)
+    if motion >= 28:
+        return "high"
+    if motion >= 12:
+        return "medium"
+    if motion > 0:
+        return "low"
+    return ""
+
+
+def _people_label(face_count: Any) -> str:
+    count = int(_as_float(face_count, 0.0))
+    if count >= 6:
+        return "group"
+    if count >= 1:
+        return "visible"
+    return "none"
+
+
+def _timestamp_list(values: Any, limit: int = 3) -> str:
+    timestamps = []
+    for value in values or []:
+        try:
+            timestamps.append(f"{max(0.0, float(value)):.1f}s")
+        except (TypeError, ValueError):
+            continue
+    return ",".join(timestamps[:limit])
+
+
+def _clip_manifest_line(item: dict[str, Any], index: int) -> str:
+    analysis = item.get("analysis") or {}
+    clip_id = _compact_text(item.get("id") or item.get("filename") or f"clip_{index + 1}", 32)
+    duration = int(round(_as_float(analysis.get("duration_seconds"), 0.0)))
+
+    cue = (
+        _safe_creative_cue(analysis.get("semantic_summary"), 100)
+        or _safe_creative_cue((analysis.get("best_moment_descriptions") or [{}])[0].get("description") if analysis.get("best_moment_descriptions") else "", 100)
+        or _safe_creative_cue(", ".join(str(value) for value in (analysis.get("locations_or_scenes") or [])[:2]), 80)
+        or _safe_creative_cue(", ".join(str(value) for value in (analysis.get("visible_actions") or [])[:2]), 80)
+        or _safe_creative_cue(analysis.get("transcript"), 100)
+        or "travel moment"
+    )
+
+    parts = [f"[Clip {clip_id}] {duration}s", cue]
+    people = _people_label(analysis.get("face_count"))
+    if people != "none":
+        parts.append(f"people:{people}")
+    motion = _motion_label(analysis.get("avg_motion"))
+    if motion:
+        parts.append(f"motion:{motion}")
+    if analysis.get("has_audio"):
+        audio = "speech" if analysis.get("transcript") else "ambient"
+        parts.append(f"audio:{audio}")
+    best = _timestamp_list(analysis.get("best_moment_timestamps") or analysis.get("landmark_candidate_timestamps"))
+    if best:
+        parts.append(f"best:{best}")
+    avoid = [
+        _compact_text(reason, 32)
+        for reason in (analysis.get("avoid_reasons") or [])
+        if _compact_text(reason, 32)
+    ]
+    if avoid:
+        parts.append(f"avoid:{','.join(avoid[:2])}")
+    return " | ".join(parts)
+
+
+def _clip_manifest(media_items: list[dict[str, Any]]) -> list[str]:
+    return [_clip_manifest_line(item, index) for index, item in enumerate(media_items)]
 
 
 def _destination_name(context: dict[str, Any]) -> str:
@@ -416,16 +505,7 @@ def generate_trip_story(
         "fallback_reason": "LLM provider is not configured. Check TRIPSTORY_LLM_PROVIDER and provider API key in .env.",
     }
 
-    media_summary = [
-        {
-            "id": item.get("id"),
-            "filename": item.get("filename"),
-            "kind": item.get("kind"),
-            "size_bytes": item.get("size_bytes"),
-            "analysis": item.get("analysis"),
-        }
-        for item in media_items
-    ]
+    media_manifest = _clip_manifest(media_items)
 
     system = (
         "You are a senior travel film editor and story producer. Build a concise, emotionally coherent "
@@ -440,7 +520,12 @@ def generate_trip_story(
     user = {
         "target_language": language,
         "trip_context": context,
-        "uploaded_media": media_summary,
+        "clip_manifest": media_manifest,
+        "manifest_rules": [
+            "Each manifest line is compact: clip id, duration, creative visual cue, people/motion/audio hints, best timestamps, and avoid hints.",
+            "Use only the manifest for story planning. Do not ask for or invent raw detector metadata.",
+            "Best timestamps are optional source-clip seconds for edit start choices; do not mention them in voiceover.",
+        ],
         "requirements": [
             "Make the story feel personal, not like a generic travel ad.",
             "Assume clips may be imperfect phone footage.",
@@ -461,6 +546,20 @@ def generate_trip_story(
     }
 
     try:
+        started = time.monotonic()
+        manifest_chars = sum(len(line) for line in media_manifest)
+        log_event(
+            logger,
+            20,
+            "story_generation_start",
+            provider=provider.provider,
+            model=provider.model,
+            configured=provider.configured,
+            clip_count=len(media_items),
+            manifest_chars=manifest_chars,
+            language=language,
+            stage="story_generation",
+        )
         content = provider.chat(
             [
                 {"role": "system", "content": system},
@@ -469,10 +568,34 @@ def generate_trip_story(
             max_tokens=1800,
         )
         if not content:
+            log_event(
+                logger,
+                30,
+                "story_generation_fallback",
+                provider=provider.provider,
+                model=provider.model,
+                clip_count=len(media_items),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                fallback_reason="empty_llm_response",
+                outcome="local_fallback",
+                stage="story_generation",
+            )
             return fallback
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             fallback["generation"]["fallback_reason"] = "LLM returned a non-object JSON response."
+            log_event(
+                logger,
+                30,
+                "story_generation_fallback",
+                provider=provider.provider,
+                model=provider.model,
+                clip_count=len(media_items),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                fallback_reason="non_object_json",
+                outcome="local_fallback",
+                stage="story_generation",
+            )
             return fallback
         merged = _normalize_story_plan({**fallback, **parsed}, fallback)
         merged = _repair_voiceover_for_audience(merged, context, media_items)
@@ -483,8 +606,33 @@ def generate_trip_story(
             "llm_configured": provider.configured,
             "fallback_reason": None,
         }
+        log_event(
+            logger,
+            20,
+            "story_generation_complete",
+            provider=provider.provider,
+            model=provider.model,
+            clip_count=len(media_items),
+            voiceover_segment_count=len(merged.get("voiceover_segments") or []),
+            edit_decision_count=len(merged.get("edit_decisions") or []),
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="llm",
+            stage="story_generation",
+        )
         return merged
     except Exception as exc:
-        print(f"[trip_story] LLM unavailable, using fallback: {exc}")
+        log_event(
+            logger,
+            30,
+            "story_generation_fallback",
+            provider=provider.provider,
+            model=provider.model,
+            clip_count=len(media_items),
+            exception_type=type(exc).__name__,
+            elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
+            outcome="local_fallback",
+            stage="story_generation",
+        )
+        logger.debug("Story generation exception", exc_info=True)
         fallback["generation"]["fallback_reason"] = str(exc)
         return fallback

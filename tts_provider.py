@@ -9,9 +9,12 @@ from pathlib import Path
 
 import requests
 
+from tripstory_logging import api_payload_logging_enabled, get_logger, log_event, redacted_snippet
+
 
 _tts_lock = threading.Lock()
 _last_tts_request_at = 0.0
+logger = get_logger("tts")
 
 
 class TTSProvider:
@@ -47,6 +50,16 @@ class TTSProvider:
     def synthesize(self, text: str, output_path: str | Path, instructions: str | None = None) -> str | None:
         cleaned = " ".join((text or "").split())
         if not cleaned or not self.configured:
+            log_event(
+                logger,
+                20,
+                "tts_unconfigured",
+                provider=self.provider,
+                model=self.model,
+                voice=self.voice,
+                input_chars=len(cleaned),
+                outcome="skipped",
+            )
             return None
 
         target = Path(output_path)
@@ -67,6 +80,19 @@ class TTSProvider:
                     elapsed = time.monotonic() - _last_tts_request_at
                     if elapsed < self.min_interval:
                         time.sleep(self.min_interval - elapsed)
+                    started = time.monotonic()
+                    log_event(
+                        logger,
+                        20,
+                        "tts_request_attempt",
+                        provider=self.provider,
+                        model=self.model,
+                        voice=self.voice,
+                        input_chars=len(payload["input"]),
+                        attempt=attempt + 1,
+                        max_retries=self.max_retries,
+                        payload_snippet=redacted_snippet(payload) if api_payload_logging_enabled() else None,
+                    )
                     response = requests.post(
                         "https://api.openai.com/v1/audio/speech",
                         headers={
@@ -76,22 +102,105 @@ class TTSProvider:
                         json=payload,
                         timeout=self.timeout,
                     )
+                    request_elapsed = round(time.monotonic() - started, 3)
                     _last_tts_request_at = time.monotonic()
                     if response.status_code != 429:
-                        response.raise_for_status()
+                        try:
+                            response.raise_for_status()
+                        except requests.RequestException:
+                            log_event(
+                                logger,
+                                40,
+                                "tts_request_failed",
+                                provider=self.provider,
+                                model=self.model,
+                                voice=self.voice,
+                                input_chars=len(payload["input"]),
+                                attempt=attempt + 1,
+                                max_retries=self.max_retries,
+                                status_code=response.status_code,
+                                elapsed_seconds=request_elapsed,
+                                outcome="http_error",
+                            )
+                            raise
+                        log_event(
+                            logger,
+                            20,
+                            "tts_request_complete",
+                            provider=self.provider,
+                            model=self.model,
+                            voice=self.voice,
+                            input_chars=len(payload["input"]),
+                            attempt=attempt + 1,
+                            max_retries=self.max_retries,
+                            status_code=response.status_code,
+                            elapsed_seconds=request_elapsed,
+                            output_bytes=len(response.content),
+                            outcome="success",
+                        )
                         break
                     retry_after = response.headers.get("retry-after")
                     try:
                         delay = float(retry_after) if retry_after else 0.0
                     except ValueError:
                         delay = 0.0
-                    time.sleep(delay or min(30.0, (2**attempt) + random.random()))
+                    retry_delay = delay or min(30.0, (2**attempt) + random.random())
+                    log_event(
+                        logger,
+                        30,
+                        "tts_request_retry",
+                        provider=self.provider,
+                        model=self.model,
+                        voice=self.voice,
+                        input_chars=len(payload["input"]),
+                        attempt=attempt + 1,
+                        max_retries=self.max_retries,
+                        status_code=response.status_code,
+                        retry_delay_seconds=round(retry_delay, 3),
+                        elapsed_seconds=request_elapsed,
+                        outcome="retry",
+                    )
+                    time.sleep(retry_delay)
                 else:
+                    log_event(
+                        logger,
+                        40,
+                        "tts_request_failed",
+                        provider=self.provider,
+                        model=self.model,
+                        voice=self.voice,
+                        input_chars=len(payload["input"]),
+                        max_retries=self.max_retries,
+                        status_code=response.status_code,
+                        outcome="rate_limited",
+                    )
                     response.raise_for_status()
             except requests.RequestException as exc:
-                print(f"[tts_provider] TTS unavailable, rendering without generated narration: {exc}")
+                log_event(
+                    logger,
+                    30,
+                    "tts_unavailable_fallback",
+                    provider=self.provider,
+                    model=self.model,
+                    voice=self.voice,
+                    input_chars=len(payload["input"]),
+                    exception_type=type(exc).__name__,
+                    outcome="fallback_without_narration",
+                )
+                logger.debug("TTS request exception", exc_info=True)
                 return None
         target.write_bytes(response.content)
+        log_event(
+            logger,
+            20,
+            "tts_audio_written",
+            provider=self.provider,
+            model=self.model,
+            voice=self.voice,
+            output_path=target.name,
+            output_bytes=target.stat().st_size,
+            outcome="success",
+        )
         return str(target)
 
 
@@ -166,4 +275,14 @@ def mix_narration(video_path: str | Path, narration_path: str | Path, output_pat
         ]
 
     subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    log_event(
+        logger,
+        20,
+        "audio_mix_complete",
+        source_video=Path(video_path).name,
+        narration=Path(narration_path).name,
+        output_path=target.name,
+        had_source_audio=has_audio,
+        outcome="success",
+    )
     return str(target)

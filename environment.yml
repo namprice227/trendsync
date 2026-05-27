@@ -5,6 +5,7 @@ dependencies:
   - python=3.12
   - pip
   - ffmpeg
+  - redis
   - nodejs=20
 variables:
   PYTHONNOUSERSITE: "1"

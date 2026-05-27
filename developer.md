@@ -34,6 +34,87 @@ The intended split is:
 - `mobile/src/types.ts`: frontend TypeScript shapes.
 - `tests/test_tripstory_api.py`: backend regression tests.
 - `.env.example`: safe config template.
+- `worker.py`: RQ worker entrypoint for story and render jobs.
+
+## Runtime Architecture
+
+```mermaid
+flowchart TB
+    subgraph Client
+        UI[Expo app<br/>mobile/App.tsx]
+    end
+
+    subgraph API
+        FastAPI[FastAPI<br/>api_server.py]
+        Middleware[Request logging<br/>session state enrichment]
+    end
+
+    subgraph Persistence
+        SQLite[(SQLite<br/>sessions + jobs)]
+        JSON[(JSON backup<br/>trip_sessions_sessions.json)]
+        Files[(Media directory<br/>trip_sessions/)]
+    end
+
+    subgraph Queue
+        Redis[(Redis)]
+        RQ[RQ worker<br/>worker.py]
+    end
+
+    subgraph Processing
+        Probe[ffprobe / ffmpeg<br/>clip metrics + render]
+        Vision[Gemini or OpenAI-compatible vision]
+        LLM[DeepSeek / OpenAI / Gemini / custom LLM]
+        TTS[OpenAI TTS / transcription optional]
+    end
+
+    UI <--> FastAPI
+    FastAPI --> Middleware
+    FastAPI <--> SQLite
+    FastAPI --> JSON
+    FastAPI <--> Files
+    FastAPI --> Redis
+    Redis --> RQ
+    RQ <--> SQLite
+    RQ <--> Files
+    RQ --> Probe
+    RQ --> Vision
+    RQ --> LLM
+    RQ --> TTS
+```
+
+The API and worker intentionally share the same SQLite database. The API creates sessions and job rows, while the worker updates job progress and final session output. SQLite is opened with a timeout, `busy_timeout`, and WAL mode so local API/worker concurrency is reliable enough for MVP development.
+
+```mermaid
+stateDiagram-v2
+    [*] --> collecting_context
+    collecting_context --> uploading: user uploads clips
+    uploading --> planning: generate story
+    planning --> ready_to_render: story job succeeds
+    planning --> error: story job fails/stales
+    ready_to_render --> rendering: render video
+    rendering --> complete: render succeeds
+    rendering --> error: render fails/stales
+    error --> planning: user retries story
+    error --> rendering: user retries render
+```
+
+Jobs are separate from session phases:
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> analyzing: worker starts story job
+    queued --> preparing: worker starts render job
+    analyzing --> planning
+    planning --> completed
+    preparing --> rendering
+    rendering --> completed
+    queued --> failed
+    analyzing --> failed
+    planning --> failed
+    preparing --> failed
+    rendering --> failed
+```
 
 ## Environment
 
@@ -80,7 +161,25 @@ Storage:
 TRIPSTORY_MEDIA_DIR=trip_sessions
 TRIPSTORY_SESSION_STORE=trip_sessions_sessions.json
 TRIPSTORY_SESSION_DB=trip_sessions.sqlite3
+TRIPSTORY_SQLITE_TIMEOUT_SECONDS=20
 TRIPSTORY_MAX_UPLOAD_MB=512
+```
+
+Queue:
+
+```bash
+TRIPSTORY_QUEUE_BACKEND=rq
+TRIPSTORY_REDIS_URL=redis://localhost:6379/0
+TRIPSTORY_QUEUE_NAME=tripstory
+TRIPSTORY_JOB_TIMEOUT_SECONDS=3600
+TRIPSTORY_STALE_JOB_SECONDS=3900
+```
+
+Media subprocess limits:
+
+```bash
+TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
+TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
 ```
 
 ## End-To-End Flow
@@ -105,6 +204,42 @@ Sessions are kept in memory and persisted to both:
 - SQLite: `trip_sessions.sqlite3`
 
 The SQLite table stores the whole session object as JSON. This is simple and flexible, but not ideal for production querying.
+
+Long-running work is tracked separately in the SQLite `jobs` table. Job records store type, state, progress, current step, error, RQ id, and attempts.
+
+### 1.1 Queue And Worker Contract
+
+Story generation and rendering are long-running jobs. The API must not run them inside the request/response cycle when `TRIPSTORY_QUEUE_BACKEND=rq`.
+
+```mermaid
+sequenceDiagram
+    participant UI as Frontend
+    participant API as FastAPI
+    participant DB as SQLite jobs table
+    participant Redis as Redis/RQ
+    participant W as worker.py
+
+    UI->>API: POST /sessions/{id}/generate-story or /render
+    API->>DB: INSERT job state=queued, progress=0
+    API->>Redis: enqueue run_tripstory_job(job_id)
+    API->>DB: save rq_job_id
+    API-->>UI: session with active_job_state=queued
+    Redis->>W: deliver job
+    W->>DB: attempts += 1, state=analyzing/preparing
+    W->>DB: job_progress updates
+    W->>DB: state=completed or failed
+    UI->>API: GET /sessions/{id}
+    API-->>UI: active job fields + session phase/screen/progress
+```
+
+The frontend spinner should always be explainable from one of these places:
+
+- The API HTTP log for `/sessions/{session_id}`.
+- The SQLite `jobs` row for the session.
+- The RQ queue/started registry in Redis.
+- The host process tree for the worker and child processes.
+
+Only one worker process means one stuck job blocks every queued job behind it. Starting more workers can improve throughput, but shared SQLite and local ffmpeg/render CPU load should be considered before doing that.
 
 ### 2. Trip Context
 
@@ -163,6 +298,14 @@ Local deterministic analysis:
 - face hits through OpenCV Haar cascade
 - quality label
 
+ffmpeg/ffprobe subprocess rules:
+
+- Every ffmpeg/ffprobe call must have a timeout.
+- Child processes should use `-nostdin` when supported.
+- Python subprocess calls that do not need input should use `stdin=subprocess.DEVNULL`.
+- Audio-level probing should use `-vn` so `volumedetect` scans only audio and does not decode video frames.
+- A timeout should degrade to missing metadata rather than fail the whole upload unless the caller truly needs that output.
+
 Optional external analysis:
 
 - OpenAI audio transcription when `TRIPSTORY_ENABLE_TRANSCRIPTION=1`.
@@ -189,7 +332,36 @@ If vision fails, the backend falls back to heuristic summaries. The app should s
 
 Story planning is in `trip_story.py`.
 
-The backend builds a `media_summary` from uploaded items and sends it to `LLMProvider`.
+The backend does not send raw `analysis` objects to DeepSeek. It first builds a compact `clip_manifest`.
+
+Manifest example:
+
+```text
+[Clip clip1] 12s | snowy mountain trail with friends nearby | people:visible | motion:high | audio:ambient | best:4.2s,8.8s
+```
+
+The manifest keeps the information DeepSeek needs for planning:
+
+- clip id
+- duration
+- creative visual cue
+- people presence
+- motion level
+- audio hint
+- best timestamps for possible edit start points
+- avoid hints
+
+The manifest intentionally drops high-token or low-value fields:
+
+- raw JSON blobs
+- resolution
+- bitrate
+- scene counts
+- raw face detector counts
+- full transcripts
+- detector implementation details
+
+This is the main token-control layer. If story generation starts getting expensive again, inspect `_clip_manifest_line()` before changing the model prompt.
 
 The LLM is asked to return strict JSON:
 
@@ -357,6 +529,18 @@ The frontend never sees provider API keys.
 
 ## How To Run
 
+Redis:
+
+```bash
+redis-server
+```
+
+Worker:
+
+```bash
+.conda/trendsync-py312/bin/python worker.py
+```
+
 Backend:
 
 ```bash
@@ -388,17 +572,21 @@ npm run typecheck
 - Voiceover metadata cleanup prevents technical narration.
 - Timeline-aligned voiceover segments and captions.
 - Render follows planned clip order/start/duration.
+- Story generation and rendering run through RQ + Redis jobs.
+- Public sessions expose active job progress.
 - Session persistence survives API restart.
 
 ## Current Limitations
 
-- Background work uses FastAPI background tasks, not a durable queue.
 - SQLite stores full session JSON, not normalized relational tables.
+- The queue is local RQ + Redis, not a full production orchestration system.
+- Transcription still depends on OpenAI when enabled.
+- Frame understanding still depends on Gemini by default.
+- TTS is OpenAI-only.
 - Vision only samples a few frames per clip.
 - Scene detection is simple histogram comparison.
 - Face detection is basic Haar cascade, not modern face recognition.
 - No dedicated landmark classifier.
-- TTS is OpenAI-only.
 - No music library or beat-sync editing.
 - No waveform view or visual timeline editor.
 - Render transitions are simple fades, not full nonlinear editing.
@@ -409,6 +597,8 @@ npm run typecheck
 
 ### Better Clip Intelligence
 
+- Add local transcription with `whisper.cpp` or `faster-whisper` so short trip clips can be transcribed on CPU/GPU with zero API cost.
+- Add local frame understanding with a small VLM such as Florence-2 or Moondream2 behind the same manifest interface.
 - Extract thumbnails and show them in the UI.
 - Sample one frame per scene, not only top-scored frames.
 - Add shot boundary detection with a stronger model.
@@ -419,7 +609,7 @@ npm run typecheck
 
 ### Better Story Planning
 
-- Give DeepSeek a smaller, cleaner summary instead of raw analysis blobs.
+- Keep improving the compact manifest so DeepSeek receives dense story evidence instead of raw detector output.
 - Add a second "critic" pass that checks story plan quality.
 - Score each voiceover segment for audience appeal.
 - Let the user choose TikTok, family archive, cinematic, funny, or documentary style.
@@ -427,6 +617,7 @@ npm run typecheck
 
 ### Better Rendering
 
+- Add local TTS with a local model such as F5-TTS or another deployable voice model.
 - Add true xfade transitions.
 - Burn captions into video when `burn_captions=true`.
 - Add subtitle style presets.
@@ -448,8 +639,10 @@ npm run typecheck
 
 ### Better Production Architecture
 
-- Move background jobs to Celery, RQ, Dramatiq, or a hosted queue.
-- Store sessions/projects in Postgres.
+- Move from local RQ to a deployment-grade queue/worker setup when scaling beyond one machine.
+- Replace JSON-in-SQLite session storage with relational tables for sessions, media items, story plans, jobs, and render artifacts.
+- Add deeper render/job substates if local ASR/VLM/TTS are added.
+- Store sessions/projects in Postgres for deployment.
 - Store media in object storage.
 - Add real user accounts.
 - Add per-user project ownership.
@@ -458,6 +651,50 @@ npm run typecheck
 - Add deployment health checks.
 
 ## Debugging Guide
+
+If the frontend spinner keeps running:
+
+1. Check API logs for the latest `/sessions/{session_id}` record. The structured log should include `session_phase`, `session_progress_percent`, `active_job_state`, `active_job_step`, and `active_job_progress_percent`.
+2. Check the SQLite jobs table:
+
+```bash
+sqlite3 trip_sessions.sqlite3 "select id, session_id, type, state, progress_percent, current_step, error, rq_job_id, attempts, datetime(updated_at, 'unixepoch', 'localtime') from jobs order by updated_at desc limit 10;"
+```
+
+3. Check the process tree:
+
+```bash
+ps -ef
+```
+
+4. If you need host-level process state, inspect the worker and child process with:
+
+```bash
+ps -o pid,ppid,pgid,sid,tpgid,stat,wchan:30,etime,time,cmd -p <worker_pid>,<child_pid>
+```
+
+Interpretation:
+
+- `queued` in SQLite/RQ means the job is waiting for a worker.
+- `started` in RQ plus no recent `job_progress` means the active worker is blocked or stopped.
+- `STAT T` or `STAT Tl` means Linux stopped the process with a signal. This is not slow ffmpeg work; it is job control or a stop signal.
+- `do_signal_stop` in `wchan` confirms the process is stopped.
+- One stopped worker child blocks later queued jobs when only one RQ worker is running.
+
+The most common local fix is to restart the worker so it loads the latest code and releases the stopped child process. Do not mark Redis or SQLite jobs manually unless you understand whether the job should be retried, failed, or abandoned.
+
+If `ffmpeg -af volumedetect` appears slow:
+
+- First test the exact media file outside the worker with a hard timeout:
+
+```bash
+timeout 20 .conda/trendsync-py312/bin/ffmpeg -nostdin -hide_banner -i trip_sessions/<session_id>/media/<file>.mp4 -vn -af volumedetect -f null -
+```
+
+- If this completes quickly but the worker is stuck, the issue is worker/process state, not audio analysis speed.
+- Check for `STAT T`/`Tl` on worker or ffmpeg.
+- Ensure the running worker has the current code. The hardened command includes `-nostdin`, `-vn`, `stdin=DEVNULL`, and `TRIPSTORY_FFMPEG_AUDIO_TIMEOUT`.
+- Bad source video timestamps can produce warnings like `non monotonically increasing dts`; using `-vn` avoids decoding the video stream during audio-level probing.
 
 If the Plan screen shows `FALLBACK`:
 

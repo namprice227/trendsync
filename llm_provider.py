@@ -8,6 +8,8 @@ from typing import Any
 
 import requests
 
+from tripstory_logging import api_payload_logging_enabled, approximate_tokens, get_logger, log_event, redacted_snippet
+
 
 PROVIDER_PRESETS = {
     "local": {
@@ -38,6 +40,7 @@ PROVIDER_PRESETS = {
 
 _chat_lock = threading.Lock()
 _last_request_at = 0.0
+logger = get_logger("llm")
 
 
 class LLMProvider:
@@ -118,6 +121,14 @@ class LLMProvider:
 
     def chat(self, messages: list[dict[str, str]], max_tokens: int = 900) -> str | None:
         if not self.configured:
+            log_event(
+                logger,
+                20,
+                "llm_unconfigured",
+                provider=self.provider,
+                model=self.model,
+                outcome="fallback",
+            )
             return None
 
         endpoint = self.base_url
@@ -138,18 +149,107 @@ class LLMProvider:
             payload["reasoning_effort"] = self.reasoning_effort
         if self.provider == "deepseek" and self.thinking_type:
             payload["thinking"] = {"type": self.thinking_type}
+        input_chars = sum(len(str(message.get("content") or "")) for message in messages)
+        input_tokens = approximate_tokens("".join(str(message.get("content") or "") for message in messages))
+        payload_snippet = redacted_snippet(messages) if api_payload_logging_enabled() else None
         with _chat_lock:
             self._wait_for_turn()
             for attempt in range(self.max_retries + 1):
-                response = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
+                started = time.monotonic()
+                log_event(
+                    logger,
+                    20,
+                    "llm_request_attempt",
+                    provider=self.provider,
+                    model=self.model,
+                    attempt=attempt + 1,
+                    max_retries=self.max_retries,
+                    input_chars=input_chars,
+                    approximate_input_tokens=input_tokens,
+                    max_output_tokens=max_tokens,
+                    payload_snippet=payload_snippet,
+                )
+                try:
+                    response = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
+                except requests.RequestException:
+                    log_event(
+                        logger,
+                        40,
+                        "llm_request_failed",
+                        provider=self.provider,
+                        model=self.model,
+                        attempt=attempt + 1,
+                        max_retries=self.max_retries,
+                        elapsed_seconds=round(time.monotonic() - started, 3),
+                        outcome="request_exception",
+                    )
+                    logger.debug("LLM request exception", exc_info=True)
+                    raise
+                elapsed = round(time.monotonic() - started, 3)
                 self._mark_request()
                 if response.status_code != 429:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except requests.RequestException:
+                        log_event(
+                            logger,
+                            40,
+                            "llm_request_failed",
+                            provider=self.provider,
+                            model=self.model,
+                            attempt=attempt + 1,
+                            max_retries=self.max_retries,
+                            status_code=response.status_code,
+                            elapsed_seconds=elapsed,
+                            outcome="http_error",
+                        )
+                        raise
                     data = response.json()
-                    return data["choices"][0]["message"]["content"].strip()
+                    content = data["choices"][0]["message"]["content"].strip()
+                    log_event(
+                        logger,
+                        20,
+                        "llm_request_complete",
+                        provider=self.provider,
+                        model=self.model,
+                        attempt=attempt + 1,
+                        max_retries=self.max_retries,
+                        status_code=response.status_code,
+                        elapsed_seconds=elapsed,
+                        output_chars=len(content),
+                        approximate_output_tokens=approximate_tokens(content),
+                        outcome="success",
+                    )
+                    return content
                 if attempt >= self.max_retries:
+                    log_event(
+                        logger,
+                        40,
+                        "llm_request_failed",
+                        provider=self.provider,
+                        model=self.model,
+                        attempt=attempt + 1,
+                        max_retries=self.max_retries,
+                        status_code=response.status_code,
+                        elapsed_seconds=elapsed,
+                        outcome="rate_limited",
+                    )
                     response.raise_for_status()
-                self._sleep_after_429(response, attempt)
+                delay = self._retry_delay(response, attempt)
+                log_event(
+                    logger,
+                    30,
+                    "llm_request_retry",
+                    provider=self.provider,
+                    model=self.model,
+                    attempt=attempt + 1,
+                    max_retries=self.max_retries,
+                    status_code=response.status_code,
+                    retry_delay_seconds=round(delay, 3),
+                    elapsed_seconds=elapsed,
+                    outcome="retry",
+                )
+                time.sleep(delay)
         return None
 
     def _wait_for_turn(self) -> None:
@@ -163,7 +263,7 @@ class LLMProvider:
         global _last_request_at
         _last_request_at = time.monotonic()
 
-    def _sleep_after_429(self, response: requests.Response, attempt: int) -> None:
+    def _retry_delay(self, response: requests.Response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After")
         try:
             wait_seconds = float(retry_after) if retry_after else 0.0
@@ -171,4 +271,4 @@ class LLMProvider:
             wait_seconds = 0.0
         if wait_seconds <= 0:
             wait_seconds = min(30.0, (2 ** attempt) * self.min_interval + random.uniform(0.25, 1.25))
-        time.sleep(wait_seconds)
+        return wait_seconds

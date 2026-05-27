@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tts_provider import TTSProvider, mix_narration
+from tripstory_logging import get_logger, log_event
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
+logger = get_logger("renderer")
 
 
 def _ffmpeg_available() -> bool:
@@ -414,6 +417,7 @@ def render_trip_video(
     context: dict[str, Any] | None = None,
     captions_srt_path: str | None = None,
     captions_vtt_path: str | None = None,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> str:
     """Create a holiday recap assembly from uploaded videos.
 
@@ -434,62 +438,224 @@ def render_trip_video(
     assembly_path = output.with_name(f"{output.stem}_assembly{output.suffix}")
     segment_seconds = float(render_options.get("segment_seconds") or 6)
     aspect_ratio = str(render_options.get("aspect_ratio") or "original")
+    include_title_card = bool(render_options.get("include_title_card", True))
+    render_started = time.monotonic()
+    log_event(
+        logger,
+        20,
+        "render_start",
+        stage="render",
+        selected_clip_count=len(timeline),
+        aspect_ratio=aspect_ratio,
+        include_title_card=include_title_card,
+        output_path=output.name,
+    )
 
     if _ffmpeg_available():
         try:
+            if progress_callback:
+                progress_callback("rendering_segments", 35)
             segment_paths = []
-            if render_options.get("include_title_card", True):
-                segment_paths.append(_make_title_card(output.with_name("000_title_card.mp4"), story_plan, context, aspect_ratio))
+            if include_title_card:
+                title_started = time.monotonic()
+                title_path = _make_title_card(output.with_name("000_title_card.mp4"), story_plan, context, aspect_ratio)
+                segment_paths.append(title_path)
+                log_event(
+                    logger,
+                    20,
+                    "render_title_card_created",
+                    stage="title_card",
+                    output_path=Path(title_path).name,
+                    elapsed_seconds=round(time.monotonic() - title_started, 3),
+                    outcome="success",
+                )
             for index, (item, decision) in enumerate(timeline, start=1):
-                segment_paths.append(_make_segment(item, decision, output.with_name(f"{index:03d}_segment.mp4"), aspect_ratio, segment_seconds))
+                segment_started = time.monotonic()
+                source_start = max(0.0, _decision_float(decision, "start_time", _segment_start(item, segment_seconds)))
+                duration = max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds)))
+                segment_path = _make_segment(item, decision, output.with_name(f"{index:03d}_segment.mp4"), aspect_ratio, segment_seconds)
+                segment_paths.append(segment_path)
+                log_event(
+                    logger,
+                    20,
+                    "render_segment_created",
+                    stage="rendering_segments",
+                    segment_index=index,
+                    clip_id=item.get("id"),
+                    clip_name=item.get("filename"),
+                    source_start_seconds=round(source_start, 2),
+                    duration_seconds=round(duration, 2),
+                    output_path=Path(segment_path).name,
+                    elapsed_seconds=round(time.monotonic() - segment_started, 3),
+                    outcome="success",
+                )
             if len(segment_paths) > 1:
+                concat_started = time.monotonic()
                 _concat_with_ffmpeg(segment_paths, str(assembly_path))
+                log_event(
+                    logger,
+                    20,
+                    "render_concat_complete",
+                    stage="concat",
+                    segment_count=len(segment_paths),
+                    output_path=assembly_path.name,
+                    elapsed_seconds=round(time.monotonic() - concat_started, 3),
+                    outcome="success",
+                )
             else:
                 shutil.copyfile(segment_paths[0], assembly_path)
+                log_event(
+                    logger,
+                    20,
+                    "render_concat_skipped_single_segment",
+                    stage="concat",
+                    segment_count=len(segment_paths),
+                    output_path=assembly_path.name,
+                    outcome="success",
+                )
         except Exception as exc:
-            print(f"[trip_renderer] Story-aware render failed, falling back to simple assembly: {exc}")
+            log_event(
+                logger,
+                30,
+                "render_story_aware_fallback",
+                stage="rendering_segments",
+                exception_type=type(exc).__name__,
+                fallback_path="simple_assembly",
+                selected_clip_count=len(video_paths),
+                outcome="fallback",
+            )
+            logger.debug("Story-aware render exception", exc_info=True)
             if len(video_paths) > 1:
                 _concat_with_ffmpeg(video_paths, str(assembly_path))
             else:
                 shutil.copyfile(video_paths[0], assembly_path)
     else:
+        log_event(
+            logger,
+            30,
+            "render_ffmpeg_unavailable_fallback",
+            stage="rendering_segments",
+            fallback_path="copy_first_clip",
+            selected_clip_count=len(video_paths),
+            output_path=output.name,
+            outcome="fallback",
+        )
         shutil.copyfile(video_paths[0], output)
 
     total_seconds = sum(max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds))) for _, decision in timeline)
-    if render_options.get("include_title_card", True):
+    if include_title_card:
         total_seconds += 2
     voiceover_segments = _matching_voiceover_segments(story_plan, timeline)
+    if progress_callback:
+        progress_callback("writing_captions", 65)
+    captions_started = time.monotonic()
     _write_edit_decisions(timeline, voiceover_segments, output.with_name("edit_decisions.json"))
     timeline_blocks = _timeline_caption_blocks(
         story_plan,
         timeline,
-        bool(render_options.get("include_title_card", True)),
+        include_title_card,
         segment_seconds,
     )
     if timeline_blocks:
         _write_caption_blocks(timeline_blocks, captions_srt_path, captions_vtt_path)
     else:
         _write_captions(story_plan.get("voiceover_script") or "", total_seconds, captions_srt_path, captions_vtt_path)
+    log_event(
+        logger,
+        20,
+        "render_captions_written",
+        stage="writing_captions",
+        caption_block_count=len(timeline_blocks),
+        edit_decisions_path="edit_decisions.json",
+        srt_path=Path(captions_srt_path).name if captions_srt_path else None,
+        vtt_path=Path(captions_vtt_path).name if captions_vtt_path else None,
+        elapsed_seconds=round(time.monotonic() - captions_started, 3),
+        outcome="success",
+    )
 
     script = _timeline_voiceover_script(story_plan, timeline)
     generated_narration = None
     if _ffmpeg_available() and assembly_path.exists():
+        if progress_callback:
+            progress_callback("synthesizing_narration", 75)
+        narration_started = time.monotonic()
         generated_narration = TTSProvider().synthesize(
             script,
             narration_path or output.with_name("voiceover.mp3"),
             instructions=f"Narrate as a warm travel recap in {story_plan.get('language') or 'the requested language'}.",
         )
+        log_event(
+            logger,
+            20 if generated_narration else 30,
+            "render_narration_synth_complete",
+            stage="synthesizing_narration",
+            narration_path=Path(generated_narration).name if generated_narration else None,
+            input_chars=len(script),
+            elapsed_seconds=round(time.monotonic() - narration_started, 3),
+            outcome="success" if generated_narration else "skipped_or_fallback",
+        )
 
     if generated_narration and _ffmpeg_available():
         try:
+            if progress_callback:
+                progress_callback("mixing_audio", 85)
+            mix_started = time.monotonic()
             mix_narration(assembly_path, generated_narration, output)
+            log_event(
+                logger,
+                20,
+                "render_audio_mix_complete",
+                stage="mixing_audio",
+                assembly_path=assembly_path.name,
+                narration_path=Path(generated_narration).name,
+                output_path=output.name,
+                elapsed_seconds=round(time.monotonic() - mix_started, 3),
+                outcome="success",
+            )
         except Exception as exc:
-            print(f"[trip_renderer] Narration mix failed, using silent video assembly: {exc}")
+            log_event(
+                logger,
+                30,
+                "render_audio_mix_fallback",
+                stage="mixing_audio",
+                exception_type=type(exc).__name__,
+                fallback_path="assembly_without_generated_mix",
+                output_path=output.name,
+                outcome="fallback",
+            )
+            logger.debug("Narration mix exception", exc_info=True)
             shutil.copyfile(assembly_path, output)
     elif assembly_path.exists():
         shutil.copyfile(assembly_path, output)
+        log_event(
+            logger,
+            20,
+            "render_output_written",
+            stage="finalize",
+            output_path=output.name,
+            narration_mixed=False,
+            outcome="success",
+        )
 
     if metadata_path:
         Path(metadata_path).write_text(json.dumps(story_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_event(
+            logger,
+            20,
+            "render_metadata_written",
+            stage="finalize",
+            metadata_path=Path(metadata_path).name,
+            outcome="success",
+        )
 
+    log_event(
+        logger,
+        20,
+        "render_complete",
+        stage="render",
+        output_path=output.name,
+        elapsed_seconds=round(time.monotonic() - render_started, 3),
+        selected_clip_count=len(timeline),
+        outcome="success",
+    )
     return str(output)

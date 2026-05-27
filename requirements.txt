@@ -17,6 +17,8 @@ librosa==0.11.0
 scenedetect==0.7
 moviepy==2.2.1
 requests==2.33.1
+redis>=5.2,<6.0
+rq>=2.0,<3.0
 PyYAML==6.0.3
 fastmcp>=2.0,<3.0
 dtaidistance>=2.3,<3.0

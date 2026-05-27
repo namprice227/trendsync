@@ -185,10 +185,20 @@ function StatusStrip({ session }: { session: TripSession }) {
       </View>
       <View style={styles.statusCopy}>
         <Text style={styles.statusLabel}>{session.progress_label}</Text>
-        <Text style={styles.statusAction}>{session.error || session.next_action}</Text>
-        {session.progress_percent ? (
+        <Text style={styles.statusAction}>{session.error || session.active_job?.current_step || session.next_action}</Text>
+        {session.active_job ? (
+          <Text style={styles.projectMeta}>
+            {session.active_job.type.replaceAll('_', ' ')} · {session.active_job.state.replaceAll('_', ' ')}
+          </Text>
+        ) : null}
+        {session.progress_percent || session.active_job?.progress_percent ? (
           <View style={styles.progressTrack}>
-            <View style={[styles.progressFill, { width: `${Math.min(100, Math.max(0, session.progress_percent))}%` }]} />
+            <View
+              style={[
+                styles.progressFill,
+                { width: `${Math.min(100, Math.max(0, session.active_job?.progress_percent || session.progress_percent))}%` },
+              ]}
+            />
           </View>
         ) : null}
       </View>
