@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -33,6 +34,13 @@ TECHNICAL_VOICEOVER_PATTERNS = (
     re.compile(r"\bthe places you explored\b", re.IGNORECASE),
 )
 logger = get_logger("story")
+
+
+def _story_max_tokens() -> int:
+    try:
+        return max(512, int(os.environ.get("TRIPSTORY_STORY_MAX_TOKENS", "4096")))
+    except ValueError:
+        return 4096
 
 
 def _language_name(code: str | None) -> str:
@@ -565,9 +573,14 @@ def generate_trip_story(
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
             ],
-            max_tokens=1800,
+            max_tokens=_story_max_tokens(),
         )
         if not content:
+            if provider.configured:
+                fallback["generation"]["fallback_reason"] = (
+                    f"{provider.provider} returned an empty response. "
+                    "Increase TRIPSTORY_STORY_MAX_TOKENS or choose a model with a larger output budget."
+                )
             log_event(
                 logger,
                 30,

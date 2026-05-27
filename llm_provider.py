@@ -97,7 +97,7 @@ class LLMProvider:
             or preset.get("model")
             or "local-fallback"
         )
-        self.timeout = timeout or int(os.environ.get("TRIPSTORY_LLM_TIMEOUT", "45"))
+        self.timeout = timeout or int(os.environ.get("TRIPSTORY_LLM_TIMEOUT", "120"))
         self.min_interval = float(os.environ.get("TRIPSTORY_LLM_MIN_INTERVAL_SECONDS", "3"))
         self.max_retries = int(os.environ.get("TRIPSTORY_LLM_MAX_RETRIES", "2"))
         self.reasoning_effort = (
@@ -171,23 +171,44 @@ class LLMProvider:
                 )
                 try:
                     response = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
-                except requests.RequestException:
+                except requests.RequestException as exc:
+                    elapsed = round(time.monotonic() - started, 3)
+                    self._mark_request()
+                    if attempt >= self.max_retries:
+                        log_event(
+                            logger,
+                            40,
+                            "llm_request_failed",
+                            provider=self.provider,
+                            model=self.model,
+                            attempt=attempt + 1,
+                            max_retries=self.max_retries,
+                            elapsed_seconds=elapsed,
+                            exception_type=type(exc).__name__,
+                            outcome="request_exception",
+                        )
+                        logger.debug("LLM request exception", exc_info=True)
+                        raise
+                    delay = self._retry_delay(None, attempt)
                     log_event(
                         logger,
-                        40,
-                        "llm_request_failed",
+                        30,
+                        "llm_request_retry",
                         provider=self.provider,
                         model=self.model,
                         attempt=attempt + 1,
                         max_retries=self.max_retries,
-                        elapsed_seconds=round(time.monotonic() - started, 3),
-                        outcome="request_exception",
+                        retry_delay_seconds=round(delay, 3),
+                        elapsed_seconds=elapsed,
+                        exception_type=type(exc).__name__,
+                        outcome="retry",
                     )
                     logger.debug("LLM request exception", exc_info=True)
-                    raise
+                    time.sleep(delay)
+                    continue
                 elapsed = round(time.monotonic() - started, 3)
                 self._mark_request()
-                if response.status_code != 429:
+                if response.status_code not in {429, 500, 502, 503, 504}:
                     try:
                         response.raise_for_status()
                     except requests.RequestException:
@@ -205,6 +226,7 @@ class LLMProvider:
                         )
                         raise
                     data = response.json()
+                    logger.debug(f"LLM Response data: {data}")
                     content = data["choices"][0]["message"]["content"].strip()
                     log_event(
                         logger,
@@ -232,7 +254,7 @@ class LLMProvider:
                         max_retries=self.max_retries,
                         status_code=response.status_code,
                         elapsed_seconds=elapsed,
-                        outcome="rate_limited",
+                        outcome="retry_exhausted",
                     )
                     response.raise_for_status()
                 delay = self._retry_delay(response, attempt)
@@ -263,8 +285,8 @@ class LLMProvider:
         global _last_request_at
         _last_request_at = time.monotonic()
 
-    def _retry_delay(self, response: requests.Response, attempt: int) -> float:
-        retry_after = response.headers.get("Retry-After")
+    def _retry_delay(self, response: requests.Response | None, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
         try:
             wait_seconds = float(retry_after) if retry_after else 0.0
         except ValueError:

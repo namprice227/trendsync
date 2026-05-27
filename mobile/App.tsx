@@ -37,12 +37,15 @@ const busyPhases: TripPhase[] = ['uploading', 'planning', 'rendering'];
 const planningPhases: TripPhase[] = ['planning', 'rendering'];
 const defaultRenderOptions: RenderOptions = {
   aspect_ratio: 'original',
+  target_duration_seconds: 30,
   clip_order: [],
   favorite_clip_ids: [],
   burn_captions: false,
   include_title_card: true,
   include_music_bed: false,
 };
+
+const VIDEO_LENGTH_PRESETS = [15, 30, 45, 60, 90];
 
 const LANGUAGES = [
   { code: 'en', label: 'English' },
@@ -133,6 +136,38 @@ function MetricPill({
         <Text style={styles.metricValue}>{value}</Text>
         <Text style={styles.metricLabel}>{label}</Text>
       </View>
+    </View>
+  );
+}
+
+function SectionHeader({
+  icon,
+  title,
+  meta,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  meta?: string;
+}) {
+  return (
+    <View style={styles.sectionHeader}>
+      <View style={styles.sectionHeaderIcon}>
+        <Ionicons name={icon} size={16} color={colors.blue} />
+      </View>
+      <View style={styles.sectionHeaderCopy}>
+        <Text style={styles.sectionTitle}>{title}</Text>
+        {meta ? <Text style={styles.sectionMeta}>{meta}</Text> : null}
+      </View>
+    </View>
+  );
+}
+
+function Tag({ label, tone = 'neutral' }: { label: string; tone?: 'neutral' | 'info' | 'success' | 'warning' }) {
+  return (
+    <View style={[styles.tag, tone === 'info' && styles.tagInfo, tone === 'success' && styles.tagSuccess, tone === 'warning' && styles.tagWarning]}>
+      <Text style={[styles.tagText, tone === 'info' && styles.tagTextInfo, tone === 'success' && styles.tagTextSuccess, tone === 'warning' && styles.tagTextWarning]}>
+        {label}
+      </Text>
     </View>
   );
 }
@@ -350,24 +385,21 @@ function ClipIntelligence({ clips }: { clips: ClipAnalysis[] }) {
   if (!clips.length) return null;
   return (
     <View style={styles.insightPanel}>
-      <Text style={styles.sectionTitle}>Clip intelligence</Text>
+      <SectionHeader icon="analytics-outline" title="Clip intelligence" meta={`${clips.length} analyzed`} />
       {clips.map((clip, index) => (
         <View key={`${clip.filename}-${index}`} style={styles.insightItem}>
           <View style={styles.insightHead}>
             <Text style={styles.insightTitle}>{clip.filename}</Text>
-            <Text style={styles.insightBadge}>{clip.quality_label || 'unknown'}</Text>
+            <Tag label={clip.quality_label || 'unknown'} tone={clip.quality_label === 'dark' || clip.quality_label === 'soft or shaky' ? 'warning' : 'info'} />
           </View>
-          <Text style={styles.listItem}>{clip.summary || 'Analysis unavailable.'}</Text>
-          {clip.semantic_summary ? <Text style={styles.listItem}>Seen in clip: {clip.semantic_summary}</Text> : null}
-          {clip.locations_or_scenes?.length ? (
-            <Text style={styles.listItem}>Scenes: {clip.locations_or_scenes.join(', ')}</Text>
-          ) : null}
-          {clip.visible_subjects?.length ? (
-            <Text style={styles.listItem}>Subjects: {clip.visible_subjects.join(', ')}</Text>
-          ) : null}
+          <Text style={styles.listItem}>{clip.semantic_summary || clip.summary || 'Analysis unavailable.'}</Text>
+          <View style={styles.tagRow}>
+            {clip.locations_or_scenes?.slice(0, 3).map((scene) => <Tag key={scene} label={scene} />)}
+            {clip.visible_subjects?.slice(0, 3).map((subject) => <Tag key={subject} label={subject} tone="success" />)}
+          </View>
           {clip.best_moment_descriptions?.length ? (
             <Text style={styles.listItem}>
-              Smart moments: {clip.best_moment_descriptions.map((moment) => `${formatTimestamp(moment.timestamp)} ${moment.description}`).join(' · ')}
+              {clip.best_moment_descriptions.map((moment) => `${formatTimestamp(moment.timestamp)} ${moment.description}`).join(' · ')}
             </Text>
           ) : null}
           {clip.best_moment_timestamps?.length ? (
@@ -400,11 +432,17 @@ function ProjectLibrary({
   return (
     <View style={styles.insightPanel}>
       <View style={styles.insightHead}>
-        <Text style={styles.sectionTitle}>Projects</Text>
+        <SectionHeader icon="albums-outline" title="Projects" meta={`${projects.length} saved`} />
         <Pressable onPress={onNew} style={styles.iconButton}>
           <Ionicons name="add" size={17} color={colors.blue} />
         </Pressable>
       </View>
+      {!projects.length ? (
+        <View style={styles.emptyState}>
+          <Ionicons name="folder-open-outline" size={22} color={colors.subtle} />
+          <Text style={styles.emptyText}>No saved projects yet.</Text>
+        </View>
+      ) : null}
       {projects.slice(0, 5).map((project) => {
         const active = project.id === activeId;
         return (
@@ -458,11 +496,12 @@ function ContextScreen({
         <View style={[styles.studioPanel, desktop && styles.studioPanelDesktop]}>
           <ProjectLibrary projects={projects} activeId={session.id} onOpen={onOpenProject} onNew={onNewProject} />
           <View style={styles.heroPanel}>
-            <Text style={styles.eyebrow}>Trip brief</Text>
-            <Text style={styles.heroTitle}>Shape a recap people will actually want to watch.</Text>
-            <Text style={styles.heroCopy}>
-              Add the memory cues, upload the raw clips, then generate a story plan with voiceover and edit notes.
-            </Text>
+            <View style={styles.heroTopline}>
+              <Text style={styles.eyebrow}>Current project</Text>
+              <Tag label={session.phase.replaceAll('_', ' ')} tone={session.phase === 'complete' ? 'success' : session.phase === 'error' ? 'warning' : 'info'} />
+            </View>
+            <Text style={styles.heroTitle}>{context.destination || 'Untitled trip'}</Text>
+            <Text style={styles.heroCopy}>{context.highlights || context.places_visited || 'Add a destination, moments, and clips to build the edit.'}</Text>
           </View>
 
           <View style={styles.metricsGrid}>
@@ -489,10 +528,7 @@ function ContextScreen({
 
         <View style={[styles.panel, styles.formPanel]}>
           <View style={styles.panelHeading}>
-            <View>
-              <Text style={styles.title}>Story inputs</Text>
-              <Text style={styles.muted}>Keep it specific. Names, places, and tiny moments make the generated script feel personal.</Text>
-            </View>
+            <SectionHeader icon="create-outline" title="Story inputs" meta="Trip context and model settings" />
           </View>
           <View style={styles.formGrid}>
             {tripContextFields.map((field) => (
@@ -537,6 +573,7 @@ function PlanScreen({
   onGenerate: () => void;
   onRender: (options: RenderOptions) => void;
 }) {
+  const { width } = useWindowDimensions();
   const plan = session.story_plan;
   const busy = session.phase === 'planning' || session.phase === 'rendering';
   const generation = plan?.generation;
@@ -545,6 +582,7 @@ function PlanScreen({
   const editDecisions = Array.isArray(plan?.edit_decisions) ? plan.edit_decisions : [];
   const voiceoverSegments = Array.isArray(plan?.voiceover_segments) ? plan.voiceover_segments : [];
   const [options, setOptions] = useState<RenderOptions>({ ...defaultRenderOptions, ...(session.render_options || {}) });
+  const desktop = width >= 920;
 
   useEffect(() => {
     setOptions({ ...defaultRenderOptions, ...(session.render_options || {}) });
@@ -576,72 +614,145 @@ function PlanScreen({
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
-      <View style={styles.panel}>
-        <View style={styles.panelHeading}>
-          <View>
-            <Text style={styles.title}>{plan?.title || 'Narrative plan'}</Text>
-            <Text style={styles.muted}>{plan?.tone ? `${plan.tone} tone` : 'Generate a voiceover and edit structure from your trip brief.'}</Text>
+      <View style={[styles.planLayout, desktop && styles.planLayoutDesktop]}>
+        <View style={[styles.planMain, desktop && styles.planMainDesktop]}>
+          <View style={styles.panel}>
+            <View style={styles.panelHeading}>
+              <View style={styles.headingCopy}>
+                <Text style={styles.title}>{plan?.title || 'Narrative plan'}</Text>
+                <Text style={styles.muted}>{plan?.tone ? `${plan.tone} tone` : 'Waiting for story generation.'}</Text>
+              </View>
+              {plan?.language ? <MetricPill icon="language-outline" label="Language" value={String(plan.language).toUpperCase()} /> : null}
+              {generation ? (
+                <MetricPill
+                  icon={generation.llm_used ? 'sparkles-outline' : 'alert-circle-outline'}
+                  label="Story brain"
+                  value={generation.llm_used ? `${generation.llm_provider || 'LLM'}`.toUpperCase() : 'FALLBACK'}
+                />
+              ) : null}
+            </View>
+            {generation && !generation.llm_used ? (
+              <View style={[styles.statusStrip, styles.statusError]}>
+                <View style={styles.statusIcon}>
+                  <Ionicons name="warning-outline" size={16} color={colors.red} />
+                </View>
+                <View style={styles.statusCopy}>
+                  <Text style={styles.statusLabel}>LLM was not used</Text>
+                  <Text style={styles.statusAction}>{generation.fallback_reason || 'Check backend .env provider settings.'}</Text>
+                </View>
+              </View>
+            ) : null}
+            {busy && session.phase === 'planning' ? (
+              <View style={styles.waitPanel}>
+                <ActivityIndicator color={colors.blue} />
+                <Text style={styles.waitText}>Writing voiceover and edit notes.</Text>
+              </View>
+            ) : null}
+            {plan?.voiceover_script ? (
+              <>
+                <SectionHeader icon="mic-outline" title="Voiceover" meta={`${String(plan.voiceover_script).length} chars`} />
+                <Text style={styles.script}>{String(plan.voiceover_script)}</Text>
+              </>
+            ) : (
+              <View style={styles.emptyState}>
+                <Ionicons name="document-text-outline" size={22} color={colors.subtle} />
+                <Text style={styles.emptyText}>No voiceover script yet.</Text>
+              </View>
+            )}
           </View>
-          {plan?.language ? <MetricPill icon="language-outline" label="Language" value={String(plan.language).toUpperCase()} /> : null}
-          {generation ? (
-            <MetricPill
-              icon={generation.llm_used ? 'sparkles-outline' : 'alert-circle-outline'}
-              label="Story brain"
-              value={generation.llm_used ? `${generation.llm_provider || 'LLM'}`.toUpperCase() : 'FALLBACK'}
-            />
+
+          {narrativeArc.length ? (
+            <View style={styles.panel}>
+              <SectionHeader icon="git-branch-outline" title="Narrative arc" meta={`${narrativeArc.length} beats`} />
+              {narrativeArc.map((item, index) => (
+                <View key={`${item}-${index}`} style={styles.timelineItem}>
+                  <Text style={styles.timelineNumber}>{index + 1}</Text>
+                  <Text style={styles.timelineText}>{String(item)}</Text>
+                </View>
+              ))}
+            </View>
           ) : null}
         </View>
-        {generation && !generation.llm_used ? (
-          <View style={styles.statusStrip}>
-            <View style={styles.statusIcon}>
-              <Ionicons name="warning-outline" size={16} color={colors.red} />
-            </View>
-            <View style={styles.statusCopy}>
-              <Text style={styles.statusLabel}>LLM was not used</Text>
-              <Text style={styles.statusAction}>{generation.fallback_reason || 'Check backend .env provider settings.'}</Text>
-            </View>
-          </View>
-        ) : null}
-        {busy && session.phase === 'planning' ? (
-          <View style={styles.waitPanel}>
-            <ActivityIndicator color={colors.blue} />
-            <Text style={styles.waitText}>Writing voiceover and edit notes.</Text>
-          </View>
-        ) : null}
-        {plan?.voiceover_script ? (
-          <>
-            <Text style={styles.sectionTitle}>Voiceover</Text>
-            <Text style={styles.script}>{String(plan.voiceover_script)}</Text>
-          </>
-        ) : (
-          <Text style={styles.muted}>Generate a narrative plan to see the voiceover script.</Text>
-        )}
-      </View>
 
-      {narrativeArc.length ? (
-        <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Narrative arc</Text>
-          {narrativeArc.map((item, index) => (
-            <View key={`${item}-${index}`} style={styles.timelineItem}>
-              <Text style={styles.timelineNumber}>{index + 1}</Text>
-              <Text style={styles.timelineText}>{String(item)}</Text>
+        <View style={[styles.planSide, desktop && styles.planSideDesktop]}>
+          <View style={styles.panel}>
+            <SectionHeader icon="options-outline" title="Timeline and export" meta={`${options.target_duration_seconds || 30}s · ${options.aspect_ratio}`} />
+            <Text style={styles.fieldLabel}>Output length</Text>
+            <View style={styles.chipRow}>
+              {VIDEO_LENGTH_PRESETS.map((seconds) => {
+                const active = (options.target_duration_seconds || 30) === seconds;
+                return (
+                  <Pressable
+                    key={seconds}
+                    onPress={() => setOptions((current) => ({ ...current, target_duration_seconds: seconds }))}
+                    style={[styles.chip, active && styles.chipActive]}
+                  >
+                    <Text style={[styles.chipText, active && styles.chipTextActive]}>{seconds}s</Text>
+                  </Pressable>
+                );
+              })}
             </View>
-          ))}
+            <Text style={styles.fieldLabel}>Frame</Text>
+            <View style={styles.chipRow}>
+              {['original', 'portrait', 'landscape', 'square'].map((ratio) => {
+                const active = options.aspect_ratio === ratio;
+                return (
+                  <Pressable key={ratio} onPress={() => setOptions((current) => ({ ...current, aspect_ratio: ratio }))} style={[styles.chip, active && styles.chipActive]}>
+                    <Text style={[styles.chipText, active && styles.chipTextActive]}>{ratio}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Pressable
+              onPress={() => setOptions((current) => ({ ...current, include_title_card: !current.include_title_card }))}
+              style={styles.toggleRow}
+            >
+              <Ionicons name={options.include_title_card ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
+              <Text style={styles.listItem}>Opening title/date card</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setOptions((current) => ({ ...current, burn_captions: !current.burn_captions }))}
+              style={styles.toggleRow}
+            >
+              <Ionicons name={options.burn_captions ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
+              <Text style={styles.listItem}>Generate subtitle files</Text>
+            </Pressable>
+            {session.media_items.map((item, index) => {
+              const favorite = options.favorite_clip_ids.includes(item.id);
+              return (
+                <View key={item.id} style={styles.timelineControl}>
+                  <Pressable onPress={() => toggleFavorite(item.id)} style={styles.iconButton}>
+                    <Ionicons name={favorite ? 'star' : 'star-outline'} size={17} color={favorite ? colors.amber : colors.muted} />
+                  </Pressable>
+                  <View style={styles.projectRowCopy}>
+                    <Text style={styles.insightTitle}>{item.filename}</Text>
+                    <Text style={styles.projectMeta}>{item.analysis?.summary || `Clip ${index + 1}`}</Text>
+                  </View>
+                  <Pressable onPress={() => moveClip(item.id, -1)} style={styles.iconButton}>
+                    <Ionicons name="arrow-up" size={16} color={colors.graphite} />
+                  </Pressable>
+                  <Pressable onPress={() => moveClip(item.id, 1)} style={styles.iconButton}>
+                    <Ionicons name="arrow-down" size={16} color={colors.graphite} />
+                  </Pressable>
+                </View>
+              );
+            })}
+          </View>
         </View>
-      ) : null}
+      </View>
 
       {editNotes.length ? (
         <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Edit notes</Text>
+          <SectionHeader icon="reader-outline" title="Edit notes" meta={`${editNotes.length} notes`} />
           {editNotes.map((item, index) => (
-            <Text key={`${item}-${index}`} style={styles.listItem}>• {String(item)}</Text>
+            <Text key={`${item}-${index}`} style={styles.listItem}>{index + 1}. {String(item)}</Text>
           ))}
         </View>
       ) : null}
 
       {editDecisions.length ? (
         <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Smart edit decisions</Text>
+          <SectionHeader icon="cut-outline" title="Smart edit decisions" meta={`${editDecisions.length} segments`} />
           {editDecisions.map((decision, index) => (
             <View key={`${decision.clip || 'clip'}-${index}`} style={styles.timelineControl}>
               <Text style={styles.timelineNumber}>{index + 1}</Text>
@@ -659,54 +770,6 @@ function PlanScreen({
           ))}
         </View>
       ) : null}
-
-      <View style={styles.panel}>
-        <Text style={styles.sectionTitle}>Timeline and export</Text>
-        <View style={styles.chipRow}>
-          {['original', 'portrait', 'landscape', 'square'].map((ratio) => {
-            const active = options.aspect_ratio === ratio;
-            return (
-              <Pressable key={ratio} onPress={() => setOptions((current) => ({ ...current, aspect_ratio: ratio }))} style={[styles.chip, active && styles.chipActive]}>
-                <Text style={[styles.chipText, active && styles.chipTextActive]}>{ratio}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
-        <Pressable
-          onPress={() => setOptions((current) => ({ ...current, include_title_card: !current.include_title_card }))}
-          style={styles.toggleRow}
-        >
-          <Ionicons name={options.include_title_card ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
-          <Text style={styles.listItem}>Opening title/date card</Text>
-        </Pressable>
-        <Pressable
-          onPress={() => setOptions((current) => ({ ...current, burn_captions: !current.burn_captions }))}
-          style={styles.toggleRow}
-        >
-          <Ionicons name={options.burn_captions ? 'checkbox' : 'square-outline'} size={18} color={colors.blue} />
-          <Text style={styles.listItem}>Generate subtitle files</Text>
-        </Pressable>
-        {session.media_items.map((item, index) => {
-          const favorite = options.favorite_clip_ids.includes(item.id);
-          return (
-            <View key={item.id} style={styles.timelineControl}>
-              <Pressable onPress={() => toggleFavorite(item.id)} style={styles.iconButton}>
-                <Ionicons name={favorite ? 'star' : 'star-outline'} size={17} color={favorite ? colors.blue : colors.muted} />
-              </Pressable>
-              <View style={styles.projectRowCopy}>
-                <Text style={styles.insightTitle}>{item.filename}</Text>
-                <Text style={styles.projectMeta}>{item.analysis?.summary || `Clip ${index + 1}`}</Text>
-              </View>
-              <Pressable onPress={() => moveClip(item.id, -1)} style={styles.iconButton}>
-                <Ionicons name="arrow-up" size={16} color={colors.graphite} />
-              </Pressable>
-              <Pressable onPress={() => moveClip(item.id, 1)} style={styles.iconButton}>
-                <Ionicons name="arrow-down" size={16} color={colors.graphite} />
-              </Pressable>
-            </View>
-          );
-        })}
-      </View>
 
       <View style={styles.actionRow}>
         <PrimaryButton icon="refresh-outline" label="Regenerate" onPress={onGenerate} disabled={busy || session.media_items.length === 0} tone="light" />
@@ -999,12 +1062,15 @@ const styles = StyleSheet.create({
   },
   header: {
     paddingHorizontal: 22,
-    paddingTop: 14,
+    paddingTop: 12,
     paddingBottom: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.line,
+    backgroundColor: colors.surface,
   },
   headerCompact: {
     alignItems: 'stretch',
@@ -1021,7 +1087,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.ink,
+    backgroundColor: colors.blueDark,
   },
   brand: {
     color: colors.ink,
@@ -1044,7 +1110,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: radii.md,
-    backgroundColor: colors.surface,
+    backgroundColor: colors.surfaceRaised,
   },
   serverInput: {
     flex: 1,
@@ -1078,6 +1144,7 @@ const styles = StyleSheet.create({
   },
   shellChrome: {
     paddingHorizontal: 22,
+    paddingTop: 12,
     gap: 10,
   },
   phaseRail: {
@@ -1089,6 +1156,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.line,
+    ...shadow,
   },
   phaseItem: {
     flex: 1,
@@ -1103,7 +1171,7 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
   },
   phaseIconActive: {
     backgroundColor: colors.blue,
@@ -1125,8 +1193,8 @@ const styles = StyleSheet.create({
   statusStrip: {
     marginBottom: 10,
     borderRadius: radii.md,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
     borderWidth: 1,
     flexDirection: 'row',
     gap: 10,
@@ -1137,16 +1205,16 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
   },
   statusInfo: {
-    backgroundColor: '#edf6f7',
-    borderColor: '#c8dcdf',
+    backgroundColor: colors.blueSoft,
+    borderColor: '#c4dde2',
   },
   statusDone: {
-    backgroundColor: '#edf6ef',
-    borderColor: '#c9dfce',
+    backgroundColor: colors.greenSoft,
+    borderColor: '#c5ddcb',
   },
   statusError: {
-    backgroundColor: '#fff2ee',
-    borderColor: '#f0c5ba',
+    backgroundColor: colors.redSoft,
+    borderColor: '#ebc2ba',
   },
   statusIcon: {
     width: 34,
@@ -1154,7 +1222,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
   },
   statusCopy: {
     flex: 1,
@@ -1189,7 +1257,7 @@ const styles = StyleSheet.create({
     maxWidth: 1180,
     alignSelf: 'center',
     paddingHorizontal: 22,
-    paddingTop: 8,
+    paddingTop: 14,
     paddingBottom: 32,
     gap: 16,
   },
@@ -1208,13 +1276,19 @@ const styles = StyleSheet.create({
     flexShrink: 0,
   },
   heroPanel: {
-    minHeight: 230,
-    backgroundColor: colors.ink,
+    minHeight: 206,
+    backgroundColor: colors.blueDark,
     borderRadius: radii.md,
-    padding: 20,
-    gap: 14,
-    justifyContent: 'flex-end',
+    padding: 18,
+    gap: 12,
+    justifyContent: 'space-between',
     overflow: 'hidden',
+  },
+  heroTopline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
   },
   eyebrow: {
     color: '#a9d8dc',
@@ -1225,8 +1299,8 @@ const styles = StyleSheet.create({
   },
   heroTitle: {
     color: colors.white,
-    fontSize: 30,
-    lineHeight: 35,
+    fontSize: 28,
+    lineHeight: 33,
     fontWeight: '900',
   },
   heroCopy: {
@@ -1256,7 +1330,7 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
     borderRadius: radii.md,
     paddingHorizontal: 12,
-    backgroundColor: colors.surface,
+    backgroundColor: colors.surfaceRaised,
   },
   metricTextWrap: {
     flex: 1,
@@ -1277,8 +1351,8 @@ const styles = StyleSheet.create({
     minHeight: 178,
     borderRadius: radii.md,
     borderWidth: 1,
-    borderColor: colors.line,
-    backgroundColor: colors.mist,
+    borderColor: '#bfd9df',
+    backgroundColor: colors.blueSoft,
     padding: 18,
     justifyContent: 'center',
     gap: 10,
@@ -1292,7 +1366,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
   },
   uploadTitle: {
     color: colors.ink,
@@ -1325,6 +1399,10 @@ const styles = StyleSheet.create({
     gap: 14,
     flexWrap: 'wrap',
   },
+  headingCopy: {
+    flex: 1,
+    minWidth: 220,
+  },
   title: {
     color: colors.ink,
     fontSize: 23,
@@ -1336,6 +1414,33 @@ const styles = StyleSheet.create({
     fontSize: 16,
     lineHeight: 21,
     fontWeight: '900',
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  sectionHeaderIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.blueSoft,
+    borderWidth: 1,
+    borderColor: '#c4dde2',
+  },
+  sectionHeaderCopy: {
+    flex: 1,
+  },
+  sectionMeta: {
+    marginTop: 1,
+    color: colors.subtle,
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0,
   },
   muted: {
     color: colors.muted,
@@ -1376,7 +1481,7 @@ const styles = StyleSheet.create({
     color: colors.ink,
     fontSize: 14,
     fontWeight: '700',
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
   },
   inputTall: {
     minHeight: 104,
@@ -1393,7 +1498,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
     paddingHorizontal: 12,
   },
   chipActive: {
@@ -1429,7 +1534,7 @@ const styles = StyleSheet.create({
   },
   providerCardActive: {
     borderColor: colors.blue,
-    backgroundColor: '#edf6f7',
+    backgroundColor: colors.blueSoft,
   },
   providerIcon: {
     width: 30,
@@ -1476,7 +1581,7 @@ const styles = StyleSheet.create({
     flexGrow: 0,
   },
   buttonLight: {
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
     borderWidth: 1,
     borderColor: colors.line,
   },
@@ -1499,7 +1604,7 @@ const styles = StyleSheet.create({
     color: colors.ink,
   },
   waitPanel: {
-    backgroundColor: colors.mist,
+    backgroundColor: colors.blueSoft,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
@@ -1537,7 +1642,7 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: colors.line,
     paddingTop: 10,
-    gap: 5,
+    gap: 7,
   },
   insightHead: {
     flexDirection: 'row',
@@ -1558,6 +1663,47 @@ const styles = StyleSheet.create({
     lineHeight: 15,
     fontWeight: '900',
   },
+  tagRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  tag: {
+    minHeight: 26,
+    borderRadius: radii.round,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    paddingHorizontal: 9,
+    justifyContent: 'center',
+  },
+  tagInfo: {
+    borderColor: '#c4dde2',
+    backgroundColor: colors.blueSoft,
+  },
+  tagSuccess: {
+    borderColor: '#c5ddcb',
+    backgroundColor: colors.greenSoft,
+  },
+  tagWarning: {
+    borderColor: '#ead4b5',
+    backgroundColor: colors.amberSoft,
+  },
+  tagText: {
+    color: colors.graphite,
+    fontSize: 11,
+    lineHeight: 14,
+    fontWeight: '800',
+  },
+  tagTextInfo: {
+    color: colors.blueDark,
+  },
+  tagTextSuccess: {
+    color: colors.green,
+  },
+  tagTextWarning: {
+    color: colors.amber,
+  },
   iconButton: {
     width: 34,
     height: 34,
@@ -1566,14 +1712,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 1,
     borderColor: colors.line,
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
   },
   projectRow: {
     minHeight: 52,
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
     paddingHorizontal: 10,
     paddingVertical: 8,
     flexDirection: 'row',
@@ -1582,7 +1728,7 @@ const styles = StyleSheet.create({
   },
   projectRowActive: {
     borderColor: colors.blue,
-    backgroundColor: '#edf6f7',
+    backgroundColor: colors.blueSoft,
   },
   projectRowCopy: {
     flex: 1,
@@ -1604,7 +1750,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     borderWidth: 1,
     borderColor: colors.line,
-    backgroundColor: colors.white,
+    backgroundColor: colors.surfaceRaised,
     paddingHorizontal: 10,
     paddingVertical: 8,
     flexDirection: 'row',
@@ -1615,6 +1761,27 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 10,
     flexWrap: 'wrap',
+  },
+  planLayout: {
+    gap: 16,
+  },
+  planLayoutDesktop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  planMain: {
+    gap: 16,
+  },
+  planMainDesktop: {
+    flex: 1,
+    minWidth: 0,
+  },
+  planSide: {
+    gap: 16,
+  },
+  planSideDesktop: {
+    width: 380,
+    flexShrink: 0,
   },
   timelineItem: {
     flexDirection: 'row',
@@ -1653,8 +1820,8 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     borderRadius: radii.md,
     borderWidth: 1,
-    borderColor: '#f0c5ba',
-    backgroundColor: '#fff2ee',
+    borderColor: '#ebc2ba',
+    backgroundColor: colors.redSoft,
     paddingHorizontal: 12,
     paddingVertical: 9,
     flexDirection: 'row',
@@ -1667,5 +1834,23 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     fontWeight: '700',
+  },
+  emptyState: {
+    minHeight: 72,
+    borderRadius: radii.md,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    padding: 14,
+  },
+  emptyText: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '700',
+    textAlign: 'center',
   },
 });

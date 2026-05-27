@@ -62,7 +62,11 @@ LLM calls are serialized server-side to reduce `429 Too Many Requests` errors. Y
 ```bash
 TRIPSTORY_LLM_MIN_INTERVAL_SECONDS=5
 TRIPSTORY_LLM_MAX_RETRIES=3
+TRIPSTORY_LLM_TIMEOUT=120
+TRIPSTORY_STORY_MAX_TOKENS=4096
 ```
+
+If DeepSeek is configured but the Plan screen says the provider returned an empty response, increase `TRIPSTORY_STORY_MAX_TOKENS`. Reasoning models can spend part of the output budget before producing the final JSON. If the warning is a read timeout, increase `TRIPSTORY_LLM_TIMEOUT` and retry.
 
 Logging is enabled in the API and worker terminals by default:
 
@@ -88,9 +92,13 @@ TRIPSTORY_SESSION_DB=trip_sessions.sqlite3
 TRIPSTORY_SQLITE_TIMEOUT_SECONDS=20
 TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
 TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
+TRIPSTORY_FFMPEG_RENDER_TIMEOUT=300
+TRIPSTORY_FFMPEG_AUDIO_MIX_TIMEOUT=300
+TRIPSTORY_FFMPEG_BIN=
+TRIPSTORY_FFPROBE_BIN=
 ```
 
-The API and RQ worker both read and write SQLite. Connections enable WAL mode and a busy timeout so the local database can handle concurrent API polling and worker progress updates. ffmpeg probes are also bounded by timeouts; audio-level probing runs with `-nostdin`, `stdin=DEVNULL`, and audio-only mapping so a bad video stream or terminal job-control issue cannot occupy the worker indefinitely after restart.
+The API and RQ worker both read and write SQLite. Connections enable WAL mode and a busy timeout so the local database can handle concurrent API polling and worker progress updates. ffmpeg probes are also bounded by timeouts; media commands resolve `ffmpeg` and `ffprobe` from `PATH`, then from the active Python environment's `bin` directory. Audio-level probing runs with `-nostdin`, `stdin=DEVNULL`, and audio-only mapping so a bad video stream or terminal job-control issue cannot occupy the worker indefinitely after restart.
 
 Default provider models:
 
@@ -122,13 +130,15 @@ TRIPSTORY_VISION_MAX_FRAMES=3
 TRIPSTORY_VISION_MIN_INTERVAL_SECONDS=5
 ```
 
-Narration uses server-side OpenAI TTS when `OPENAI_API_KEY` is configured:
+Narration uses server-side TTS when configured. Recommended Gemini TTS setup:
 
 ```bash
-TRIPSTORY_TTS_PROVIDER=openai
-TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts
-TRIPSTORY_TTS_VOICE=coral
+TRIPSTORY_TTS_PROVIDER=gemini
+TRIPSTORY_TTS_MODEL=gemini-3.1-flash-tts-preview
+TRIPSTORY_TTS_VOICE=Kore
 ```
+
+Gemini TTS uses `GEMINI_API_KEY` and outputs `voiceover.wav`. OpenAI TTS remains available with `TRIPSTORY_TTS_PROVIDER=openai`, `OPENAI_API_KEY`, `gpt-4o-mini-tts`, and a voice such as `coral`.
 
 Clip speech transcription is optional and off by default because it sends extracted audio to OpenAI:
 

@@ -17,6 +17,7 @@ import numpy as np
 import requests
 
 from tripstory_logging import approximate_tokens, get_logger, log_event
+from media_tools import ffmpeg_bin, ffprobe_bin
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
@@ -58,9 +59,19 @@ def _run_json(command: list[str]) -> dict[str, Any]:
 
 
 def _probe(path: Path) -> dict[str, Any]:
+    ffprobe = ffprobe_bin()
+    if not ffprobe:
+        return {
+            "duration_seconds": 0.0,
+            "width": 0,
+            "height": 0,
+            "fps": 0.0,
+            "bit_rate": 0,
+            "has_audio": False,
+        }
     data = _run_json(
         [
-            "ffprobe",
+            ffprobe,
             "-v",
             "error",
             "-show_entries",
@@ -102,7 +113,10 @@ def _fps(value: Any) -> float:
 
 
 def _audio_levels(path: Path) -> dict[str, Any]:
-    command = ["ffmpeg", "-nostdin", "-hide_banner", "-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"]
+    ffmpeg = ffmpeg_bin()
+    if not ffmpeg:
+        return {"mean_volume_db": None, "max_volume_db": None}
+    command = [ffmpeg, "-nostdin", "-hide_banner", "-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"]
     try:
         result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=FFMPEG_AUDIO_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -244,9 +258,12 @@ def _quality_label(brightness: float | None, sharpness: float | None) -> str:
 
 
 def _extract_audio_sample(path: Path) -> Path | None:
+    ffmpeg = ffmpeg_bin()
+    if not ffmpeg:
+        return None
     target = Path(tempfile.gettempdir()) / f"tripstory_transcribe_{path.stem}.mp3"
     command = [
-        "ffmpeg",
+        ffmpeg,
         "-nostdin",
         "-y",
         "-i",

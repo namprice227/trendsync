@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,10 +22,12 @@ class TripStoryApiTest(unittest.TestCase):
             "TRIPSTORY_LLM_URL",
             "TRIPSTORY_LLM_API_KEY",
             "TRIPSTORY_LLM_MODEL",
+            "TRIPSTORY_LLM_TIMEOUT",
             "TRIPSTORY_LLM_MIN_INTERVAL_SECONDS",
             "TRIPSTORY_LLM_MAX_RETRIES",
             "TRIPSTORY_LLM_REASONING_EFFORT",
             "TRIPSTORY_LLM_THINKING",
+            "TRIPSTORY_STORY_MAX_TOKENS",
             "TRIPSTORY_DEEPSEEK_THINKING",
             "TRIPSTORY_DEEPSEEK_REASONING_EFFORT",
             "TRIPSTORY_VISION_PROVIDER",
@@ -72,6 +76,34 @@ class TripStoryApiTest(unittest.TestCase):
         os.environ.pop("TRIPSTORY_SESSION_STORE", None)
         self.temp_dir.cleanup()
 
+    def _write_test_video(self, path: Path, seconds: float = 3.0) -> None:
+        from media_tools import ffmpeg_bin
+
+        ffmpeg = ffmpeg_bin()
+        if not ffmpeg:
+            self.skipTest("ffmpeg is required for render integration tests")
+        subprocess.run(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc=size=320x240:rate=25:duration={seconds:.2f}",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(path),
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+
     def test_tripstory_mvp_flow_persists_and_renders(self) -> None:
         session = self.api_server._create_session()
         session_id = session["id"]
@@ -95,7 +127,7 @@ class TripStoryApiTest(unittest.TestCase):
         media_dir = self.media_root / session_id / "media"
         media_dir.mkdir(parents=True)
         clip_path = media_dir / "000_clip.mp4"
-        clip_path.write_bytes(b"fake mp4 bytes")
+        self._write_test_video(clip_path)
         media_item = {
             "id": "clip1",
             "filename": "clip.mp4",
@@ -569,6 +601,74 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertIn("[Clip clip1] 12s", user_payload["clip_manifest"][0])
         self.assertIn("snowy mountain", user_payload["clip_manifest"][0])
 
+    def test_story_generation_uses_configurable_output_budget(self) -> None:
+        from trip_story import generate_trip_story
+
+        captured = {}
+
+        class CapturingProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-flash"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                captured["max_tokens"] = max_tokens
+                return json.dumps(
+                    {
+                        "title": "Enough Budget",
+                        "language": "English",
+                        "edit_decisions": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "start_time": 0,
+                                "duration": 4,
+                                "reason": "Opening travel beat.",
+                            }
+                        ],
+                        "voiceover_segments": [
+                            {
+                                "clip_id": "clip1",
+                                "clip": "clip.mp4",
+                                "voiceover": "The trip begins with a quiet first step.",
+                            }
+                        ],
+                    }
+                )
+
+        os.environ["TRIPSTORY_STORY_MAX_TOKENS"] = "4096"
+        plan = generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [{"id": "clip1", "filename": "clip.mp4", "kind": "video", "size_bytes": 100, "analysis": {}}],
+            CapturingProvider(),
+        )
+
+        self.assertEqual(captured["max_tokens"], 4096)
+        self.assertTrue(plan["generation"]["llm_used"])
+
+    def test_story_generation_empty_configured_provider_reports_empty_response(self) -> None:
+        from trip_story import generate_trip_story
+
+        class EmptyProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-flash"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                return ""
+
+        plan = generate_trip_story(
+            {"destination": "Tromso", "language": "en"},
+            [{"id": "clip1", "filename": "clip.mp4", "kind": "video", "size_bytes": 100, "analysis": {}}],
+            EmptyProvider(),
+        )
+
+        reason = plan["generation"]["fallback_reason"]
+        self.assertFalse(plan["generation"]["llm_used"])
+        self.assertTrue(plan["generation"]["llm_configured"])
+        self.assertIn("empty response", reason)
+        self.assertNotIn("not configured", reason)
+
     def test_deepseek_payload_supports_thinking_and_reasoning_env(self) -> None:
         from llm_provider import LLMProvider
         from unittest.mock import patch
@@ -619,6 +719,111 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertEqual(provider.model, "gpt-4o-mini-tts")
         self.assertEqual(provider.voice, "coral")
         os.environ.pop("OPENAI_API_KEY", None)
+        os.environ["TRIPSTORY_TTS_PROVIDER"] = "gemini"
+        os.environ["GEMINI_API_KEY"] = "test-gemini-key"
+        provider = TTSProvider()
+        self.assertTrue(provider.configured)
+        self.assertEqual(provider.model, "gemini-3.1-flash-tts-preview")
+        self.assertEqual(provider.voice, "Kore")
+        os.environ.pop("TRIPSTORY_TTS_PROVIDER", None)
+        os.environ.pop("GEMINI_API_KEY", None)
+
+    def test_gemini_tts_writes_wave_audio(self) -> None:
+        from tts_provider import TTSProvider
+        from unittest.mock import patch
+
+        class FakeResponse:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "audio/pcm",
+                                            "data": base64.b64encode(b"\x00\x00\x01\x00").decode("ascii"),
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        captured: dict[str, object] = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            captured["json"] = kwargs.get("json")
+            return FakeResponse()
+
+        os.environ["TRIPSTORY_TTS_PROVIDER"] = "gemini"
+        os.environ["GEMINI_API_KEY"] = "gemini-secret"
+        os.environ["TRIPSTORY_TTS_MIN_INTERVAL_SECONDS"] = "0"
+        target = Path(self.temp_dir.name) / "voiceover.wav"
+        with patch("tts_provider.requests.post", side_effect=fake_post):
+            output_path = TTSProvider().synthesize("This is the narration.", target, instructions="Say warmly.")
+
+        self.assertEqual(output_path, str(target))
+        self.assertTrue(target.read_bytes().startswith(b"RIFF"))
+        self.assertEqual(captured["url"], "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent")
+        self.assertEqual(captured["headers"]["x-goog-api-key"], "gemini-secret")
+        payload = captured["json"]
+        self.assertEqual(payload["generationConfig"]["responseModalities"], ["AUDIO"])
+        self.assertEqual(payload["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"], "Kore")
+        os.environ.pop("TRIPSTORY_TTS_PROVIDER", None)
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("TRIPSTORY_TTS_MIN_INTERVAL_SECONDS", None)
+
+    def test_renderer_ffmpeg_commands_are_noninteractive_and_bounded(self) -> None:
+        from trip_renderer import _make_title_card
+        from unittest.mock import patch
+
+        target = Path(self.temp_dir.name) / "title.mp4"
+        with patch("trip_renderer.subprocess.run") as run:
+            _make_title_card(target, {"title": "Tromso"}, {"duration": "2 days"}, "landscape")
+
+        command = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(Path(command[0]).name, "ffmpeg")
+        self.assertEqual(command[1], "-nostdin")
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertGreater(kwargs["timeout"], 0)
+
+    def test_audio_mix_ffmpeg_commands_are_noninteractive_and_bounded(self) -> None:
+        from tts_provider import mix_narration
+        from unittest.mock import patch
+
+        with patch("tts_provider.audio_stream_exists", return_value=False), patch("tts_provider.subprocess.run") as run:
+            mix_narration(Path(self.temp_dir.name) / "video.mp4", Path(self.temp_dir.name) / "voiceover.wav", Path(self.temp_dir.name) / "mixed.mp4")
+
+        command = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(Path(command[0]).name, "ffmpeg")
+        self.assertEqual(command[1], "-nostdin")
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertGreater(kwargs["timeout"], 0)
+
+    def test_renderer_scales_timeline_to_target_duration(self) -> None:
+        from trip_renderer import _apply_target_duration
+
+        timeline = [
+            ({"id": "a"}, {"duration": 10}),
+            ({"id": "b"}, {"duration": 10}),
+            ({"id": "c"}, {"duration": 10}),
+        ]
+        adjusted = _apply_target_duration(timeline, {"target_duration_seconds": 17}, True, 6)
+
+        self.assertLessEqual(sum(decision["duration"] for _, decision in adjusted) + 2, 17.01)
+        self.assertTrue(all(decision["duration"] >= 1 for _, decision in adjusted))
 
     def test_llm_and_tts_logs_attempts_retries_without_secrets(self) -> None:
         from llm_provider import LLMProvider
@@ -676,6 +881,37 @@ class TripStoryApiTest(unittest.TestCase):
         os.environ.pop("TRIPSTORY_LLM_MAX_RETRIES", None)
         os.environ.pop("TRIPSTORY_TTS_MIN_INTERVAL_SECONDS", None)
         os.environ.pop("TRIPSTORY_TTS_MAX_RETRIES", None)
+
+    def test_llm_retries_read_timeout(self) -> None:
+        import requests
+        from llm_provider import LLMProvider
+        from unittest.mock import patch
+
+        class FakeResponse:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "Story JSON"}}]}
+
+        os.environ["DEEPSEEK_API_KEY"] = "sk-test-secret-llm"
+        os.environ["TRIPSTORY_LLM_TIMEOUT"] = "120"
+        os.environ["TRIPSTORY_LLM_MIN_INTERVAL_SECONDS"] = "0"
+        os.environ["TRIPSTORY_LLM_MAX_RETRIES"] = "1"
+        with patch("llm_provider.random.uniform", return_value=0), patch("llm_provider.time.sleep"):
+            with patch("llm_provider.requests.post", side_effect=[requests.ReadTimeout("slow"), FakeResponse()]) as post:
+                result = LLMProvider(provider="deepseek").chat([{"role": "user", "content": "private trip context"}])
+
+        self.assertEqual(result, "Story JSON")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args.kwargs["timeout"], 120)
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        os.environ.pop("TRIPSTORY_LLM_TIMEOUT", None)
+        os.environ.pop("TRIPSTORY_LLM_MIN_INTERVAL_SECONDS", None)
+        os.environ.pop("TRIPSTORY_LLM_MAX_RETRIES", None)
 
 
 if __name__ == "__main__":

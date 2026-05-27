@@ -1,29 +1,36 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from media_tools import ffmpeg_bin, ffprobe_bin
 from tts_provider import TTSProvider, mix_narration
 from tripstory_logging import get_logger, log_event
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
 logger = get_logger("renderer")
+FFMPEG_RENDER_TIMEOUT = int(os.environ.get("TRIPSTORY_FFMPEG_RENDER_TIMEOUT", "300"))
+TITLE_CARD_SECONDS = 2.0
 
 
 def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return ffmpeg_bin() is not None
 
 
 def _run(command: list[str]) -> None:
-    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(command, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=FFMPEG_RENDER_TIMEOUT)
 
 
 def _concat_with_ffmpeg(video_paths: list[str], output_path: str) -> None:
+    ffmpeg = ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not available. Set TRIPSTORY_FFMPEG_BIN or install ffmpeg in the active environment.")
     list_path = Path(output_path).with_suffix(".concat.txt")
     lines = []
     for path in video_paths:
@@ -32,14 +39,21 @@ def _concat_with_ffmpeg(video_paths: list[str], output_path: str) -> None:
     list_path.write_text("\n".join(lines), encoding="utf-8")
 
     command = [
-        "ffmpeg",
+        ffmpeg,
+        "-nostdin",
         "-y",
+        "-fflags",
+        "+genpts",
         "-f",
         "concat",
         "-safe",
         "0",
         "-i",
         str(list_path),
+        "-r",
+        "30",
+        "-fps_mode",
+        "cfr",
         "-c:v",
         "libx264",
         "-c:a",
@@ -62,11 +76,13 @@ def _aspect_filter(aspect_ratio: str) -> str:
         "square": (1080, 1080),
     }
     if aspect_ratio not in targets:
-        return "format=yuv420p"
+        return "setpts=PTS-STARTPTS,fps=30,format=yuv420p"
     width, height = targets[aspect_ratio]
     return (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        "setpts=PTS-STARTPTS,"
+        "fps=30,"
         "format=yuv420p"
     )
 
@@ -195,6 +211,9 @@ def _smart_timeline(
 
 
 def _make_title_card(output_path: Path, story_plan: dict[str, Any], context: dict[str, Any], aspect_ratio: str) -> str:
+    ffmpeg = ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not available. Set TRIPSTORY_FFMPEG_BIN or install ffmpeg in the active environment.")
     title = _escape_drawtext(str(story_plan.get("title") or context.get("destination") or "TripStory"))
     dates = _escape_drawtext(str(context.get("travel_dates") or context.get("duration") or ""))
     width, height = {
@@ -203,23 +222,43 @@ def _make_title_card(output_path: Path, story_plan: dict[str, Any], context: dic
         "square": (1080, 1080),
     }.get(aspect_ratio, (1280, 720))
     vf = (
+        "setpts=PTS-STARTPTS,fps=30,"
         f"drawtext=text='{title}':fontcolor=white:fontsize={max(42, width // 18)}:"
         f"x=(w-text_w)/2:y=(h-text_h)/2-48,"
         f"drawtext=text='{dates}':fontcolor=white@0.75:fontsize={max(24, width // 35)}:"
         f"x=(w-text_w)/2:y=(h+text_h)/2+36"
     )
     command = [
-        "ffmpeg",
+        ffmpeg,
+        "-nostdin",
         "-y",
         "-f",
         "lavfi",
         "-i",
-        f"color=c=0x111716:s={width}x{height}:d=2",
+        f"color=c=0x111716:s={width}x{height}:d={TITLE_CARD_SECONDS:.2f}",
+        "-f",
+        "lavfi",
+        "-t",
+        f"{TITLE_CARD_SECONDS:.2f}",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
         "-vf",
         vf,
-        "-an",
+        "-r",
+        "30",
+        "-fps_mode",
+        "cfr",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        f"{TITLE_CARD_SECONDS:.2f}",
         "-c:v",
         "libx264",
+        "-c:a",
+        "aac",
+        "-shortest",
         "-pix_fmt",
         "yuv420p",
         str(output_path),
@@ -235,7 +274,72 @@ def _decision_float(decision: dict[str, Any], key: str, fallback: float) -> floa
         return fallback
 
 
+def _target_duration_seconds(render_options: dict[str, Any]) -> float | None:
+    try:
+        value = float(render_options.get("target_duration_seconds") or 0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return max(6.0, min(180.0, value))
+
+
+def _decision_duration(decision: dict[str, Any], segment_seconds: float) -> float:
+    return max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds)))
+
+
+def _apply_target_duration(
+    timeline: list[tuple[dict[str, Any], dict[str, Any]]],
+    render_options: dict[str, Any],
+    include_title_card: bool,
+    segment_seconds: float,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    target = _target_duration_seconds(render_options)
+    if not target or not timeline:
+        return timeline
+    available = max(float(len(timeline)), target - (TITLE_CARD_SECONDS if include_title_card else 0.0))
+    current = [_decision_duration(decision, segment_seconds) for _, decision in timeline]
+    current_total = sum(current)
+    if current_total <= available:
+        return timeline
+    scale = available / current_total if current_total else 1.0
+    scaled = [max(1.0, min(10.0, duration * scale)) for duration in current]
+    if sum(scaled) > available:
+        even = max(1.0, available / len(scaled))
+        scaled = [even for _ in scaled]
+    adjusted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for (item, decision), duration in zip(timeline, scaled):
+        next_decision = dict(decision)
+        next_decision["duration"] = round(duration, 2)
+        adjusted.append((item, next_decision))
+    return adjusted
+
+
+def _media_duration(path: Path) -> float:
+    ffprobe = ffprobe_bin()
+    if not ffprobe or not path.exists():
+        return 0.0
+    command = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)]
+    try:
+        result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=FFMPEG_RENDER_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    try:
+        return float(result.stdout.strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def _assert_duration_is_bounded(path: Path, expected_seconds: float) -> None:
+    actual = _media_duration(path)
+    if actual and expected_seconds and actual > expected_seconds + 3.0:
+        raise RuntimeError(f"Rendered video duration {actual:.1f}s exceeds expected timeline {expected_seconds:.1f}s.")
+
+
 def _make_segment(item: dict[str, Any], decision: dict[str, Any], output_path: Path, aspect_ratio: str, segment_seconds: float) -> str:
+    ffmpeg = ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not available. Set TRIPSTORY_FFMPEG_BIN or install ffmpeg in the active environment.")
     source = str(item.get("path"))
     start = max(0.0, _decision_float(decision, "start_time", _segment_start(item, segment_seconds)))
     duration = _clip_duration(item)
@@ -243,27 +347,57 @@ def _make_segment(item: dict[str, Any], decision: dict[str, Any], output_path: P
     trim = min(requested, duration - start) if duration else requested
     trim = max(1.0, trim)
     vf = f"{_aspect_filter(aspect_ratio)},fade=t=in:st=0:d=0.18,fade=t=out:st={max(0.2, trim - 0.25):.2f}:d=0.2"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        str(start),
-        "-i",
-        source,
-        "-t",
-        f"{trim:.2f}",
-        "-vf",
-        vf,
-        "-af",
-        "afade=t=in:st=0:d=0.15,afade=t=out:st=0.85:d=0.15",
-        "-c:v",
-        "libx264",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
+    command = [ffmpeg, "-nostdin", "-y", "-fflags", "+genpts", "-ss", str(start), "-i", source]
+    if (item.get("analysis") or {}).get("has_audio"):
+        command.extend(
+            [
+                "-t",
+                f"{trim:.2f}",
+                "-vf",
+                vf,
+                "-af",
+                f"asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.15,afade=t=out:st={max(0.2, trim - 0.25):.2f}:d=0.2",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                f"{trim:.2f}",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-t",
+                f"{trim:.2f}",
+                "-vf",
+                vf,
+                "-r",
+                "30",
+                "-fps_mode",
+                "cfr",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ]
+        )
+    if (item.get("analysis") or {}).get("has_audio"):
+        command.extend(["-r", "30", "-fps_mode", "cfr"])
+    command.extend(["-reset_timestamps", "1", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(output_path)])
     _run(command)
     return str(output_path)
 
@@ -335,9 +469,9 @@ def _timeline_caption_blocks(
 ) -> list[tuple[float, float, str]]:
     segments = _matching_voiceover_segments(story_plan, timeline)
     blocks: list[tuple[float, float, str]] = []
-    cursor = 2.0 if include_title_card else 0.0
+    cursor = TITLE_CARD_SECONDS if include_title_card else 0.0
     for segment, (_, decision) in zip(segments, timeline):
-        duration = max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds)))
+        duration = _decision_duration(decision, segment_seconds)
         text = str(segment.get("voiceover") or segment.get("caption") or "").strip()
         if text:
             blocks.append((cursor, cursor + duration, text))
@@ -383,9 +517,9 @@ def _write_edit_decisions(
     output_path: Path,
 ) -> None:
     payload = []
-    cursor = 2.0
+    cursor = TITLE_CARD_SECONDS
     for index, (item, decision) in enumerate(timeline):
-        duration = max(1.0, min(10.0, _decision_float(decision, "duration", 6.0)))
+        duration = _decision_duration(decision, 6.0)
         voiceover = voiceover_segments[index] if index < len(voiceover_segments) else {}
         payload.append(
             {
@@ -421,24 +555,25 @@ def render_trip_video(
 ) -> str:
     """Create a holiday recap assembly from uploaded videos.
 
-    If ffmpeg is available, all uploaded videos are concatenated and re-encoded.
-    If ffmpeg is unavailable, the first uploaded video is copied as the render
-    output so the session still produces a usable artifact and voiceover plan.
+    Uploaded videos are trimmed into bounded, re-encoded segments before concat
+    so source timestamp problems cannot stretch the final recap.
     """
 
     render_options = render_options or {}
     context = context or {}
-    timeline = _smart_timeline(media_paths, media_items, story_plan, render_options)
+    segment_seconds = float(render_options.get("segment_seconds") or 6)
+    aspect_ratio = str(render_options.get("aspect_ratio") or "original")
+    include_title_card = bool(render_options.get("include_title_card", True))
+    timeline = _apply_target_duration(_smart_timeline(media_paths, media_items, story_plan, render_options), render_options, include_title_card, segment_seconds)
     video_paths = [str(item.get("path")) for item, _ in timeline]
     if not timeline:
         raise ValueError("Upload at least one video clip to render a recap video.")
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg is not available. Set TRIPSTORY_FFMPEG_BIN or install ffmpeg in the active environment.")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     assembly_path = output.with_name(f"{output.stem}_assembly{output.suffix}")
-    segment_seconds = float(render_options.get("segment_seconds") or 6)
-    aspect_ratio = str(render_options.get("aspect_ratio") or "original")
-    include_title_card = bool(render_options.get("include_title_card", True))
     render_started = time.monotonic()
     log_event(
         logger,
@@ -448,103 +583,75 @@ def render_trip_video(
         selected_clip_count=len(timeline),
         aspect_ratio=aspect_ratio,
         include_title_card=include_title_card,
+        target_duration_seconds=_target_duration_seconds(render_options),
         output_path=output.name,
     )
 
-    if _ffmpeg_available():
-        try:
-            if progress_callback:
-                progress_callback("rendering_segments", 35)
-            segment_paths = []
-            if include_title_card:
-                title_started = time.monotonic()
-                title_path = _make_title_card(output.with_name("000_title_card.mp4"), story_plan, context, aspect_ratio)
-                segment_paths.append(title_path)
-                log_event(
-                    logger,
-                    20,
-                    "render_title_card_created",
-                    stage="title_card",
-                    output_path=Path(title_path).name,
-                    elapsed_seconds=round(time.monotonic() - title_started, 3),
-                    outcome="success",
-                )
-            for index, (item, decision) in enumerate(timeline, start=1):
-                segment_started = time.monotonic()
-                source_start = max(0.0, _decision_float(decision, "start_time", _segment_start(item, segment_seconds)))
-                duration = max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds)))
-                segment_path = _make_segment(item, decision, output.with_name(f"{index:03d}_segment.mp4"), aspect_ratio, segment_seconds)
-                segment_paths.append(segment_path)
-                log_event(
-                    logger,
-                    20,
-                    "render_segment_created",
-                    stage="rendering_segments",
-                    segment_index=index,
-                    clip_id=item.get("id"),
-                    clip_name=item.get("filename"),
-                    source_start_seconds=round(source_start, 2),
-                    duration_seconds=round(duration, 2),
-                    output_path=Path(segment_path).name,
-                    elapsed_seconds=round(time.monotonic() - segment_started, 3),
-                    outcome="success",
-                )
-            if len(segment_paths) > 1:
-                concat_started = time.monotonic()
-                _concat_with_ffmpeg(segment_paths, str(assembly_path))
-                log_event(
-                    logger,
-                    20,
-                    "render_concat_complete",
-                    stage="concat",
-                    segment_count=len(segment_paths),
-                    output_path=assembly_path.name,
-                    elapsed_seconds=round(time.monotonic() - concat_started, 3),
-                    outcome="success",
-                )
-            else:
-                shutil.copyfile(segment_paths[0], assembly_path)
-                log_event(
-                    logger,
-                    20,
-                    "render_concat_skipped_single_segment",
-                    stage="concat",
-                    segment_count=len(segment_paths),
-                    output_path=assembly_path.name,
-                    outcome="success",
-                )
-        except Exception as exc:
-            log_event(
-                logger,
-                30,
-                "render_story_aware_fallback",
-                stage="rendering_segments",
-                exception_type=type(exc).__name__,
-                fallback_path="simple_assembly",
-                selected_clip_count=len(video_paths),
-                outcome="fallback",
-            )
-            logger.debug("Story-aware render exception", exc_info=True)
-            if len(video_paths) > 1:
-                _concat_with_ffmpeg(video_paths, str(assembly_path))
-            else:
-                shutil.copyfile(video_paths[0], assembly_path)
-    else:
+    if progress_callback:
+        progress_callback("rendering_segments", 35)
+    segment_paths = []
+    if include_title_card:
+        title_started = time.monotonic()
+        title_path = _make_title_card(output.with_name("000_title_card.mp4"), story_plan, context, aspect_ratio)
+        segment_paths.append(title_path)
         log_event(
             logger,
-            30,
-            "render_ffmpeg_unavailable_fallback",
-            stage="rendering_segments",
-            fallback_path="copy_first_clip",
-            selected_clip_count=len(video_paths),
-            output_path=output.name,
-            outcome="fallback",
+            20,
+            "render_title_card_created",
+            stage="title_card",
+            output_path=Path(title_path).name,
+            elapsed_seconds=round(time.monotonic() - title_started, 3),
+            outcome="success",
         )
-        shutil.copyfile(video_paths[0], output)
+    for index, (item, decision) in enumerate(timeline, start=1):
+        segment_started = time.monotonic()
+        source_start = max(0.0, _decision_float(decision, "start_time", _segment_start(item, segment_seconds)))
+        duration = _decision_duration(decision, segment_seconds)
+        segment_path = _make_segment(item, decision, output.with_name(f"{index:03d}_segment.mp4"), aspect_ratio, segment_seconds)
+        segment_paths.append(segment_path)
+        log_event(
+            logger,
+            20,
+            "render_segment_created",
+            stage="rendering_segments",
+            segment_index=index,
+            clip_id=item.get("id"),
+            clip_name=item.get("filename"),
+            source_start_seconds=round(source_start, 2),
+            duration_seconds=round(duration, 2),
+            output_path=Path(segment_path).name,
+            elapsed_seconds=round(time.monotonic() - segment_started, 3),
+            outcome="success",
+        )
+    if len(segment_paths) > 1:
+        concat_started = time.monotonic()
+        _concat_with_ffmpeg(segment_paths, str(assembly_path))
+        log_event(
+            logger,
+            20,
+            "render_concat_complete",
+            stage="concat",
+            segment_count=len(segment_paths),
+            output_path=assembly_path.name,
+            elapsed_seconds=round(time.monotonic() - concat_started, 3),
+            outcome="success",
+        )
+    else:
+        shutil.copyfile(segment_paths[0], assembly_path)
+        log_event(
+            logger,
+            20,
+            "render_concat_skipped_single_segment",
+            stage="concat",
+            segment_count=len(segment_paths),
+            output_path=assembly_path.name,
+            outcome="success",
+        )
 
-    total_seconds = sum(max(1.0, min(10.0, _decision_float(decision, "duration", segment_seconds))) for _, decision in timeline)
+    total_seconds = sum(_decision_duration(decision, segment_seconds) for _, decision in timeline)
     if include_title_card:
-        total_seconds += 2
+        total_seconds += TITLE_CARD_SECONDS
+    _assert_duration_is_bounded(assembly_path, total_seconds)
     voiceover_segments = _matching_voiceover_segments(story_plan, timeline)
     if progress_callback:
         progress_callback("writing_captions", 65)
@@ -600,7 +707,8 @@ def render_trip_video(
             if progress_callback:
                 progress_callback("mixing_audio", 85)
             mix_started = time.monotonic()
-            mix_narration(assembly_path, generated_narration, output)
+            mix_narration(assembly_path, generated_narration, output, duration_seconds=total_seconds)
+            _assert_duration_is_bounded(output, total_seconds)
             log_event(
                 logger,
                 20,
@@ -627,6 +735,7 @@ def render_trip_video(
             shutil.copyfile(assembly_path, output)
     elif assembly_path.exists():
         shutil.copyfile(assembly_path, output)
+        _assert_duration_is_bounded(output, total_seconds)
         log_event(
             logger,
             20,

@@ -33,7 +33,7 @@ flowchart LR
     worker --> ffmpeg[ffmpeg / ffprobe]
     worker --> llm[LLM providers<br/>DeepSeek / OpenAI / Gemini / custom]
     worker --> vision[Vision analysis<br/>Gemini or OpenAI-compatible]
-    worker --> tts[TTS / transcription<br/>OpenAI optional]
+    worker --> tts[TTS / transcription<br/>Gemini or OpenAI optional]
     api --> user
 ```
 
@@ -131,7 +131,11 @@ LLM calls are serialized server-side to avoid accidental concurrent requests. Tu
 ```bash
 TRIPSTORY_LLM_MIN_INTERVAL_SECONDS=3
 TRIPSTORY_LLM_MAX_RETRIES=2
+TRIPSTORY_LLM_TIMEOUT=120
+TRIPSTORY_STORY_MAX_TOKENS=4096
 ```
+
+DeepSeek reasoning models can return an empty `content` field when the output budget is too small for the story-planning JSON, and can take longer than smaller chat models. Keep `TRIPSTORY_STORY_MAX_TOKENS` at `4096` or higher if the Plan screen reports an empty provider response, and keep `TRIPSTORY_LLM_TIMEOUT` around `120` seconds if DeepSeek times out.
 
 Backend logs are structured as timestamped key/value JSON fields in the API and worker terminals. Optional logging controls:
 
@@ -151,7 +155,13 @@ Media probing uses explicit ffmpeg timeouts so broken clips cannot occupy the on
 ```bash
 TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
 TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
+TRIPSTORY_FFMPEG_RENDER_TIMEOUT=300
+TRIPSTORY_FFMPEG_AUDIO_MIX_TIMEOUT=300
+TRIPSTORY_FFMPEG_BIN=
+TRIPSTORY_FFPROBE_BIN=
 ```
+
+The renderer resolves `ffmpeg` and `ffprobe` from `PATH`, then from the active Python environment's `bin` directory. Set `TRIPSTORY_FFMPEG_BIN` and `TRIPSTORY_FFPROBE_BIN` only if your binaries live somewhere else.
 
 Watch live logs in the terminals running `python -m uvicorn ...` and `python worker.py`, or follow the optional file:
 
@@ -189,15 +199,17 @@ export TRIPSTORY_VISION_PROVIDER="gemini"
 export TRIPSTORY_ENABLE_VISION_ANALYSIS=1
 ```
 
-Narration uses server-side OpenAI TTS when `OPENAI_API_KEY` is present. Optional `.env` overrides:
+Narration uses server-side TTS when configured. Recommended Gemini TTS setup:
 
 ```bash
-TRIPSTORY_TTS_PROVIDER=openai
-TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts
-TRIPSTORY_TTS_VOICE=coral
+TRIPSTORY_TTS_PROVIDER=gemini
+TRIPSTORY_TTS_MODEL=gemini-3.1-flash-tts-preview
+TRIPSTORY_TTS_VOICE=Kore
 TRIPSTORY_TTS_MIN_INTERVAL_SECONDS=3
 TRIPSTORY_TTS_MAX_RETRIES=2
 ```
+
+Gemini TTS uses `GEMINI_API_KEY` and writes `voiceover.wav`. OpenAI TTS is still supported with `TRIPSTORY_TTS_PROVIDER=openai`, `OPENAI_API_KEY`, `gpt-4o-mini-tts`, and an OpenAI voice such as `coral`.
 
 Clip speech transcription is off by default because it sends extracted audio to OpenAI:
 
@@ -262,11 +274,12 @@ For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the proc
 - Expo mobile app for connecting to the API, uploading video files, entering trip context, choosing voiceover language, generating a story plan, and previewing the rendered output.
 - Vendor-neutral LLM client with OpenAI, Gemini, DeepSeek, custom OpenAI-compatible endpoints, and a deterministic local fallback when no API key or endpoint is configured.
 - Multilingual story-plan generation contract with title, language, tone, narrative arc, voiceover script, edit notes, and clip plan.
-- Server-side OpenAI text-to-speech narration and `ffmpeg` audio mixing under the final video when `OPENAI_API_KEY` is configured.
+- Server-side Gemini or OpenAI text-to-speech narration and `ffmpeg` audio mixing under the final video when TTS is configured.
 - Clip intelligence for uploaded videos: duration, resolution, scenes, blur/quality, face hits, audio levels, best-moment timestamps, scenic candidates, optional speech transcription, and optional sampled-frame visual summaries.
 - LLM-driven smart edit planning with concrete `edit_decisions`: clip ID, source start time, duration, role, transition, caption, audio strategy, and clip-grounded reasoning for every selected segment.
 - Timeline-aligned `voiceover_segments` that pair each selected clip with a narration line, caption, start time, duration, and purpose.
 - Story-aware rendering that follows the LLM edit timeline or user timeline, trims around chosen moments, adds fades, creates a title/date card, supports portrait/landscape/square exports, and saves segment-timed SRT/VTT subtitles plus `edit_decisions.json`.
+- Target render duration controls for short social cuts, with the backend scaling segment durations and validating the final media length.
 - RQ + Redis queueing for story generation and rendering, with a SQLite-backed jobs table and frontend-visible job progress.
 - SQLite-backed session/project persistence with JSON backup compatibility, project listing, share tokens, and optional API token authentication.
 - Upload hardening with file type checks, upload size limits, render progress, event logs, and server-side cleanup-ready project deletion.

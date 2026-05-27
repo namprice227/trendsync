@@ -17,7 +17,7 @@ TripStory turns uploaded trip videos into a short social recap:
 The intended split is:
 
 - DeepSeek: text reasoning, story planning, voiceover writing, edit decision planning.
-- Gemini: sampled-frame visual understanding.
+- Gemini: sampled-frame visual understanding and recommended text-to-speech narration.
 - OpenAI: optional speech transcription and optional text-to-speech narration.
 - Local fallback: still produces a usable plan when no LLM is configured.
 
@@ -28,7 +28,7 @@ The intended split is:
 - `media_intelligence.py`: video probing, OpenCV frame sampling, audio metrics, optional transcription, Gemini/OpenAI frame vision.
 - `trip_story.py`: prompt contract, fallback story generation, LLM response normalization, voiceover cleanup.
 - `trip_renderer.py`: ffmpeg timeline assembly, trimming, title card, captions, narration mixing.
-- `tts_provider.py`: OpenAI TTS client and ffmpeg audio mixing helper.
+- `tts_provider.py`: Gemini/OpenAI TTS client and ffmpeg audio mixing helper.
 - `mobile/App.tsx`: Expo app UI and workflow screens.
 - `mobile/src/api.ts`: frontend API client.
 - `mobile/src/types.ts`: frontend TypeScript shapes.
@@ -64,7 +64,7 @@ flowchart TB
         Probe[ffprobe / ffmpeg<br/>clip metrics + render]
         Vision[Gemini or OpenAI-compatible vision]
         LLM[DeepSeek / OpenAI / Gemini / custom LLM]
-        TTS[OpenAI TTS / transcription optional]
+        TTS[Gemini or OpenAI TTS / transcription optional]
     end
 
     UI <--> FastAPI
@@ -128,6 +128,8 @@ DEEPSEEK_API_KEY=your-real-deepseek-key
 TRIPSTORY_DEEPSEEK_MODEL=deepseek-v4-pro
 TRIPSTORY_DEEPSEEK_THINKING=enabled
 TRIPSTORY_DEEPSEEK_REASONING_EFFORT=high
+TRIPSTORY_LLM_TIMEOUT=120
+TRIPSTORY_STORY_MAX_TOKENS=4096
 
 GEMINI_API_KEY=your-real-gemini-key
 TRIPSTORY_VISION_PROVIDER=gemini
@@ -138,11 +140,13 @@ TRIPSTORY_ENABLE_VISION_ANALYSIS=1
 Optional narration:
 
 ```bash
-OPENAI_API_KEY=your-openai-key
-TRIPSTORY_TTS_PROVIDER=openai
-TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts
-TRIPSTORY_TTS_VOICE=coral
+GEMINI_API_KEY=your-real-gemini-key
+TRIPSTORY_TTS_PROVIDER=gemini
+TRIPSTORY_TTS_MODEL=gemini-3.1-flash-tts-preview
+TRIPSTORY_TTS_VOICE=Kore
 ```
+
+OpenAI TTS is still supported with `TRIPSTORY_TTS_PROVIDER=openai`, `OPENAI_API_KEY`, `TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts`, and an OpenAI voice such as `coral`.
 
 Rate limiting knobs:
 
@@ -180,6 +184,10 @@ Media subprocess limits:
 ```bash
 TRIPSTORY_FFMPEG_PROBE_TIMEOUT=30
 TRIPSTORY_FFMPEG_AUDIO_TIMEOUT=45
+TRIPSTORY_FFMPEG_RENDER_TIMEOUT=300
+TRIPSTORY_FFMPEG_AUDIO_MIX_TIMEOUT=300
+TRIPSTORY_FFMPEG_BIN=
+TRIPSTORY_FFPROBE_BIN=
 ```
 
 ## End-To-End Flow
@@ -300,11 +308,12 @@ Local deterministic analysis:
 
 ffmpeg/ffprobe subprocess rules:
 
-- Every ffmpeg/ffprobe call must have a timeout.
+- Every ffmpeg/ffprobe call must use `media_tools.py` for binary resolution and must have a timeout.
 - Child processes should use `-nostdin` when supported.
 - Python subprocess calls that do not need input should use `stdin=subprocess.DEVNULL`.
 - Audio-level probing should use `-vn` so `volumedetect` scans only audio and does not decode video frames.
 - A timeout should degrade to missing metadata rather than fail the whole upload unless the caller truly needs that output.
+- The renderer must not copy raw source videos as a success fallback. It should fail clearly if bounded segment rendering cannot complete, because raw phone video timestamps can create multi-hour output files.
 
 Optional external analysis:
 
@@ -464,6 +473,8 @@ TRIPSTORY_DEEPSEEK_THINKING=enabled
 TRIPSTORY_DEEPSEEK_REASONING_EFFORT=high
 ```
 
+Story generation uses `TRIPSTORY_STORY_MAX_TOKENS`, defaulting to `4096`. DeepSeek reasoning models can return HTTP 200 with an empty final `content` field when the output budget is too small for the strict JSON story plan; this is reported as an empty provider response, not as a missing key. Request timeouts and HTTP `429`/`5xx` responses are retried up to `TRIPSTORY_LLM_MAX_RETRIES`, and `TRIPSTORY_LLM_TIMEOUT` should stay high enough for reasoning responses.
+
 The chat client serializes calls with a lock and sleeps between requests to reduce 429s.
 
 ### 8. Render
@@ -495,7 +506,7 @@ Common output files:
 
 - `holiday_recap.mp4`
 - `holiday_recap_assembly.mp4`
-- `voiceover.mp3`
+- `voiceover.wav` for Gemini TTS or `voiceover.mp3` for OpenAI TTS
 - `captions.srt`
 - `captions.vtt`
 - `story_plan.json`
@@ -582,7 +593,7 @@ npm run typecheck
 - The queue is local RQ + Redis, not a full production orchestration system.
 - Transcription still depends on OpenAI when enabled.
 - Frame understanding still depends on Gemini by default.
-- TTS is OpenAI-only.
+- TTS supports Gemini and OpenAI, but only one provider is used per render.
 - Vision only samples a few frames per clip.
 - Scene detection is simple histogram comparison.
 - Face detection is basic Haar cascade, not modern face recognition.
@@ -693,7 +704,8 @@ timeout 20 .conda/trendsync-py312/bin/ffmpeg -nostdin -hide_banner -i trip_sessi
 
 - If this completes quickly but the worker is stuck, the issue is worker/process state, not audio analysis speed.
 - Check for `STAT T`/`Tl` on worker or ffmpeg.
-- Ensure the running worker has the current code. The hardened command includes `-nostdin`, `-vn`, `stdin=DEVNULL`, and `TRIPSTORY_FFMPEG_AUDIO_TIMEOUT`.
+- Ensure the running worker has the current code. The hardened media-analysis command includes `-nostdin`, `-vn`, `stdin=DEVNULL`, and `TRIPSTORY_FFMPEG_AUDIO_TIMEOUT`.
+- Renderer ffmpeg commands should also include `-nostdin`, `stdin=DEVNULL`, and `TRIPSTORY_FFMPEG_RENDER_TIMEOUT`; narration mixing uses `TRIPSTORY_FFMPEG_AUDIO_MIX_TIMEOUT`.
 - Bad source video timestamps can produce warnings like `non monotonically increasing dts`; using `-vn` avoids decoding the video stream during audio-level probing.
 
 If the Plan screen shows `FALLBACK`:
@@ -714,8 +726,9 @@ If voiceover is generic:
 
 If video renders but has no narration:
 
-- Check `TRIPSTORY_TTS_PROVIDER=openai`.
-- Check `OPENAI_API_KEY`.
+- Check `TRIPSTORY_TTS_PROVIDER`.
+- For Gemini TTS, check `GEMINI_API_KEY`, `TRIPSTORY_TTS_MODEL=gemini-3.1-flash-tts-preview`, and a Gemini voice such as `Kore`.
+- For OpenAI TTS, check `OPENAI_API_KEY`, `TRIPSTORY_TTS_MODEL=gpt-4o-mini-tts`, and a voice such as `coral`.
 - Check backend logs for TTS 429 or auth errors.
 - Rendering still succeeds without narration.
 

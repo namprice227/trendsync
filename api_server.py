@@ -296,6 +296,7 @@ class TripContextRequest(BaseModel):
 
 class RenderRequest(BaseModel):
     aspect_ratio: str = Field("original", max_length=40)
+    target_duration_seconds: int = Field(30, ge=6, le=180)
     clip_order: list[str] = Field(default_factory=list)
     favorite_clip_ids: list[str] = Field(default_factory=list)
     burn_captions: bool = False
@@ -920,7 +921,10 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
         session_dir = _session_dir(session_id)
         output_path = session_dir / "holiday_recap.mp4"
         story_path = session_dir / "story_plan.json"
-        narration_path = session_dir / "voiceover.mp3"
+        tts_provider = os.environ.get("TRIPSTORY_TTS_PROVIDER", "").strip().lower()
+        if not tts_provider and os.environ.get("GEMINI_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+            tts_provider = "gemini"
+        narration_path = session_dir / ("voiceover.wav" if tts_provider == "gemini" else "voiceover.mp3")
         captions_srt_path = session_dir / "captions.srt"
         captions_vtt_path = session_dir / "captions.vtt"
         edit_decisions_path = session_dir / "edit_decisions.json"
@@ -936,6 +940,7 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
             selected_timeline_clip_count=len(timeline_decisions) or len(clips),
             include_title_card=render_options.get("include_title_card", True),
             aspect_ratio=render_options.get("aspect_ratio", "original"),
+            target_duration_seconds=render_options.get("target_duration_seconds"),
             stage="render",
         )
 

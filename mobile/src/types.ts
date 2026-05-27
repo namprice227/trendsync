@@ -113,6 +113,7 @@ export type StoryPlan = {
 
 export type RenderOptions = {
   aspect_ratio: string;
+  target_duration_seconds: number;
   clip_order: string[];
   favorite_clip_ids: string[];
   burn_captions: boolean;
