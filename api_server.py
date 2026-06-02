@@ -1271,6 +1271,55 @@ def health() -> dict[str, str]:
     return {"status": "ok", "product": "TripStory"}
 
 
+@app.get("/eval/dashboard")
+def eval_dashboard(auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
+    """Returns metrics for evaluating TripStory pipeline performance and quality."""
+    owner = _owner_from_auth(auth)
+    if owner != "local" and not owner.startswith("admin"):
+        raise HTTPException(status_code=403, detail="Eval dashboard requires admin access.")
+
+    with _db_connection() as conn:
+        sessions = [
+            json.loads(row[0])
+            for row in conn.execute("SELECT data FROM sessions ORDER BY updated_at DESC LIMIT 100").fetchall()
+        ]
+
+    total_sessions = len(sessions)
+    completed_sessions = sum(1 for s in sessions if s.get("phase") == "complete")
+
+    # Calculate average generation times and render times
+    # Note: A real dashboard would query the jobs table, but for MVP we approximate from session state
+    avg_story_time = 0.0
+
+    # Narration restraint metric
+    restraint_scores = []
+    for s in sessions:
+        if s.get("story_plan") and s.get("render_options"):
+            target_duration = float(s["render_options"].get("target_duration_seconds") or 30.0)
+            segments = s["story_plan"].get("voiceover_segments") or []
+            total_vo_duration = sum(float(seg.get("duration") or 3.0) for seg in segments)
+            if target_duration > 0:
+                density = total_vo_duration / target_duration
+                restraint_scores.append({
+                    "session_id": s["id"],
+                    "density": round(density, 2),
+                    "flagged": density > 0.6  # Flag if talking more than 60% of the video
+                })
+
+    return {
+        "status": "ok",
+        "metrics": {
+            "total_sessions_analyzed": total_sessions,
+            "completed_sessions": completed_sessions,
+            "completion_rate": round(completed_sessions / total_sessions * 100, 1) if total_sessions else 0,
+        },
+        "narration_restraint": {
+            "average_density": round(sum(r["density"] for r in restraint_scores) / len(restraint_scores), 2) if restraint_scores else 0,
+            "flagged_sessions": [r for r in restraint_scores if r["flagged"]]
+        }
+    }
+
+
 @app.get("/sessions")
 def list_sessions(auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
     owner_id = _owner_from_auth(auth)

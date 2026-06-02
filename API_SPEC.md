@@ -83,6 +83,24 @@ Allows the user to manually edit the generated script before rendering.
 
 ## 4. Render & Export
 
+### `GET /eval/dashboard`
+Retrieves the evaluation dashboard statistics to measure narrative coherence and narration restraint.
+- **Response:**
+  ```json
+  {
+    "status": "ok",
+    "metrics": {
+      "total_sessions_analyzed": 15,
+      "completed_sessions": 12,
+      "completion_rate": 80.0
+    },
+    "narration_restraint": {
+      "average_density": 0.45,
+      "flagged_sessions": []
+    }
+  }
+  ```
+
 ### `POST /sessions/{session_id}/render`
 Triggers the final assembly (FFmpeg cutting, TTS generation, audio mixing).
 - **Request:** Empty body (uses the saved `story_plan`).
