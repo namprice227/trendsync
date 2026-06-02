@@ -578,11 +578,14 @@ npm run typecheck
 - Server-side API keys only.
 - DeepSeek/Gemini provider split.
 - Gemini frame summaries feed DeepSeek story planning.
+- Fast heuristic preprocessing merges low-value scenes to optimize VLM budgets.
 - Fallback path works without external LLM.
 - LLM output normalization prevents many blank-page crashes.
 - Voiceover metadata cleanup prevents technical narration.
 - Timeline-aligned voiceover segments and captions.
+- Explicit editing controls via "favorite" (pinned) and "excluded" clips.
 - Render follows planned clip order/start/duration.
+- Built-in Eval Dashboard metrics for checking narrative restraint.
 - Story generation and rendering run through RQ + Redis jobs.
 - Public sessions expose active job progress.
 - Session persistence survives API restart.
@@ -642,7 +645,6 @@ npm run typecheck
 
 - Add thumbnails to clip cards.
 - Let user reorder clips with drag/drop.
-- Let user edit each voiceover segment.
 - Let user regenerate only one segment.
 - Show why a clip was selected.
 - Show whether Gemini vision, heuristic analysis, or fallback was used.
