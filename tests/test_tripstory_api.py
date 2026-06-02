@@ -52,6 +52,8 @@ class TripStoryApiTest(unittest.TestCase):
             "TRIPSTORY_LOG_FILE",
             "TRIPSTORY_LOG_API_PAYLOADS",
             "TRIPSTORY_LOG_HTTP_REQUESTS",
+            "TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS",
+            "TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL",
         ):
             os.environ.pop(key, None)
 
@@ -74,6 +76,8 @@ class TripStoryApiTest(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("TRIPSTORY_MEDIA_DIR", None)
         os.environ.pop("TRIPSTORY_SESSION_STORE", None)
+        os.environ.pop("TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS", None)
+        os.environ.pop("TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL", None)
         self.temp_dir.cleanup()
 
     def _write_test_video(self, path: Path, seconds: float = 3.0) -> None:
@@ -334,6 +338,170 @@ class TripStoryApiTest(unittest.TestCase):
                 self.api_server.ProjectMetadataRequest(title="Wrong owner"),
                 auth={"owner_id": "owner-b"},
             )
+
+    def test_cloudflare_access_required_rejects_missing_identity(self) -> None:
+        from starlette.requests import Request
+
+        os.environ["TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS"] = "1"
+        os.environ["TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL"] = "1"
+        request = Request({"type": "http", "method": "GET", "path": "/sessions", "headers": []})
+
+        with self.assertRaises(self.api_server.HTTPException) as raised:
+            self.api_server._auth_context(
+                request,
+                authorization=None,
+                x_tripstory_token=None,
+                x_tripstory_user=None,
+                cf_access_authenticated_user_email=None,
+            )
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail, "Cloudflare Access identity is required.")
+
+    def test_cloudflare_access_email_owns_sessions_and_cannot_be_spoofed(self) -> None:
+        from starlette.requests import Request
+
+        os.environ["TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS"] = "1"
+        os.environ["TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL"] = "1"
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/sessions",
+                "headers": [(b"x-tripstory-owner", b"attacker@example.com")],
+            }
+        )
+        auth = self.api_server._auth_context(
+            request,
+            authorization=None,
+            x_tripstory_token=None,
+            x_tripstory_user=None,
+            cf_access_authenticated_user_email="Owner@Example.com",
+        )
+        other_auth = self.api_server._auth_context(
+            request,
+            authorization=None,
+            x_tripstory_token=None,
+            x_tripstory_user=None,
+            cf_access_authenticated_user_email="other@example.com",
+        )
+
+        created = self.api_server.create_session(auth=auth)
+        listed = self.api_server.list_sessions(auth=auth)
+        other_user = self.api_server.list_sessions(auth=other_auth)
+
+        self.assertEqual(created["owner_id"], "owner@example.com")
+        self.assertEqual([item["id"] for item in listed["sessions"]], [created["id"]])
+        self.assertEqual(other_user["sessions"], [])
+
+    def test_creative_brief_lifecycle_and_generation_gate(self) -> None:
+        session = self.api_server._create_session("owner-a")
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context["destination"] = "Tromso"
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            media_items=[
+                {
+                    "id": "clip1",
+                    "filename": "clip.mp4",
+                    "kind": "video",
+                    "path": str(self.media_root / session_id / "missing.mp4"),
+                    "url": f"/files/{session_id}/media/clip.mp4",
+                    "size_bytes": 10,
+                    "analysis": {
+                        "filename": "clip.mp4",
+                        "duration_seconds": 8,
+                        "semantic_source": "heuristic",
+                        "semantic_summary": "Snowy street and people walking under northern lights.",
+                        "quality_label": "usable",
+                        "smart_windows": [
+                            {
+                                "window_id": "win1",
+                                "start_time": 1,
+                                "duration": 4,
+                                "score": 0.9,
+                                "frame_timestamps": [1, 2, 3],
+                                "visual_evidence": "Snowy street and people walking under northern lights.",
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+
+        drafted = self.api_server.create_creative_brief(session_id, auth={"owner_id": "owner-a"})
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.generate_story(session_id, auth={"owner_id": "owner-a"})
+        approved = self.api_server.approve_creative_brief(
+            session_id,
+            self.api_server.CreativeBriefPatchRequest(
+                selected_direction_id="direction_1",
+                answers=[self.api_server.CreativeBriefAnswer(question_id="audience_intent", answer="For close friends.")],
+            ),
+            auth={"owner_id": "owner-a"},
+        )
+
+        self.assertEqual(drafted["creative_brief_status"], "draft")
+        self.assertEqual(approved["creative_brief_status"], "approved")
+        self.assertEqual(approved["creative_brief_answers"]["audience_intent"], "For close friends.")
+
+    def test_generate_story_uses_approved_creative_brief(self) -> None:
+        from unittest.mock import patch
+
+        session = self.api_server._create_session("owner-a")
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context["destination"] = "Tromso"
+        creative_brief = {
+            "title": "Tromso producer brief",
+            "summary": "Make it personal.",
+            "recommended_direction_id": "direction_1",
+            "selected_direction_id": "direction_1",
+            "directions": [{"id": "direction_1", "title": "Personal", "angle": "Friends in the snow."}],
+            "questions": [],
+        }
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            creative_brief=creative_brief,
+            creative_brief_status="approved",
+            media_items=[
+                {
+                    "id": "clip1",
+                    "filename": "clip.mp4",
+                    "kind": "video",
+                    "path": str(self.media_root / session_id / "missing.mp4"),
+                    "url": f"/files/{session_id}/media/clip.mp4",
+                    "size_bytes": 10,
+                    "analysis": {"filename": "clip.mp4", "semantic_source": "heuristic"},
+                }
+            ],
+        )
+
+        captured: dict[str, object] = {}
+
+        def fake_generate(context_arg, media_items_arg, provider_arg, render_options=None, creative_brief=None):
+            captured["creative_brief"] = creative_brief
+            return {
+                "title": "Plan",
+                "language": "English",
+                "tone": "warm",
+                "narrative_arc": ["Open"],
+                "voiceover_script": "A personal snowy memory.",
+                "voiceover_segments": [{"segment_id": "seg_001", "voiceover": "A personal snowy memory."}],
+                "edit_notes": [],
+                "clip_plan": [],
+                "edit_decisions": [],
+                "generation": {"llm_used": True},
+            }
+
+        with patch.object(self.api_server, "generate_trip_story", side_effect=fake_generate):
+            self.api_server._generate_story_background(session_id)
+
+        self.assertEqual(captured["creative_brief"], creative_brief)
+        updated = self.api_server._public_session(session_id)
+        self.assertEqual(updated["phase"], "ready_to_render")
 
     def test_duplicate_session_copies_metadata_context_story_and_media_files(self) -> None:
         session = self.api_server._create_session("owner-a")

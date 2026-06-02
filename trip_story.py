@@ -308,6 +308,279 @@ def _normalize_story_plan(plan: dict[str, Any], fallback: dict[str, Any]) -> dic
     return normalized
 
 
+def _brief_evidence(item: dict[str, Any], window: dict[str, Any] | None = None) -> dict[str, Any]:
+    analysis = item.get("analysis") or {}
+    evidence = _window_evidence_text(window, _clip_evidence(item)) if window else _clip_evidence(item)
+    return {
+        "clip_id": _as_text(item.get("id")),
+        "clip": _as_text(item.get("filename"), "clip"),
+        "window_id": _as_text((window or {}).get("window_id")),
+        "start_time": round(max(0.0, _as_float((window or {}).get("start_time"), 0.0)), 2),
+        "reason": evidence,
+        "quality": _as_text(analysis.get("quality_label"), "unknown"),
+    }
+
+
+def _fallback_creative_brief(
+    context: dict[str, Any],
+    media_items: list[dict[str, Any]],
+    provider: LLMProvider,
+    render_options: dict[str, Any] | None = None,
+    fallback_reason: str | None = None,
+) -> dict[str, Any]:
+    destination = context.get("destination") or "this trip"
+    audience = context.get("audience") or "friends and family"
+    mood = context.get("mood") or "warm, cinematic, personal"
+    candidate_evidence: list[dict[str, Any]] = []
+    avoid: list[str] = []
+    for item in media_items:
+        analysis = item.get("analysis") or {}
+        windows = [window for window in analysis.get("smart_windows") or [] if isinstance(window, dict)]
+        if windows:
+            candidate_evidence.extend(_brief_evidence(item, window) for window in windows[:2])
+        else:
+            candidate_evidence.append(_brief_evidence(item, None))
+        if analysis.get("avoid_reasons"):
+            avoid.extend(_as_text(reason) for reason in analysis.get("avoid_reasons") or [] if _as_text(reason))
+        quality = _as_text(analysis.get("quality_label"))
+        if quality in {"dark", "soft or shaky", "overexposed"}:
+            avoid.append(f"Use {item.get('filename', 'clip')} carefully because it is {quality}.")
+    candidate_evidence = candidate_evidence[:6]
+    beat_sources = candidate_evidence[:3] or [{"reason": "uploaded clips", "clip": "clip"}]
+    directions = [
+        {
+            "id": "direction_1",
+            "title": "Personal memory",
+            "angle": f"Frame {destination} as a memory built from the most specific observed moments.",
+            "tone": mood,
+            "audience": audience,
+            "why": "This direction is safest because it follows visible clip evidence instead of inventing a travel-ad story.",
+            "key_beats": [
+                "Open with the clearest arrival or atmosphere shot.",
+                "Move through the strongest people, place, food, or movement details.",
+                "Close on the feeling the trip should leave behind.",
+            ],
+            "supporting_evidence": beat_sources,
+        },
+        {
+            "id": "direction_2",
+            "title": "Place-first recap",
+            "angle": f"Let {destination} lead the story, with people and details as proof of being there.",
+            "tone": "observational and cinematic",
+            "audience": audience,
+            "why": "This direction works when the clips have scenic or landmark evidence.",
+            "key_beats": [
+                "Start with the strongest location cue.",
+                "Use motion or ambience to connect places.",
+                "End with the most memorable view or quiet detail.",
+            ],
+            "supporting_evidence": beat_sources,
+        },
+    ]
+    return {
+        "title": f"{destination} producer brief",
+        "summary": f"Plan a {int(round(_target_duration_seconds(render_options, context)))}-second recap for {audience}.",
+        "recommended_direction_id": "direction_1",
+        "selected_direction_id": "direction_1",
+        "directions": directions,
+        "questions": [
+            {
+                "id": "audience_intent",
+                "label": "Audience",
+                "question": "Who should this feel made for, and what should they understand by the end?",
+                "why": "Audience changes the narration from private memory to social recap.",
+                "answer": "",
+            },
+            {
+                "id": "emotional_center",
+                "label": "Feeling",
+                "question": "What is the main feeling: funny, peaceful, romantic, proud, nostalgic, or something else?",
+                "why": "The emotional center decides the hook and closing line.",
+                "answer": "",
+            },
+            {
+                "id": "must_use_or_avoid",
+                "label": "Must use",
+                "question": "Which moment must be included, and is there anything you do not want shown?",
+                "why": "This prevents the editor from choosing a technically strong but personally wrong moment.",
+                "answer": "",
+            },
+        ],
+        "must_use": candidate_evidence[:4],
+        "avoid": avoid[:5],
+        "missing_context": [
+            item
+            for item in [
+                "Add the personal reason this trip mattered." if not context.get("highlights") else "",
+                "Add must-use or avoid moments before approving." if not context.get("notes") else "",
+            ]
+            if item
+        ],
+        "generation": {
+            "llm_used": False,
+            "llm_provider": provider.provider,
+            "llm_model": provider.model,
+            "llm_configured": provider.configured,
+            "fallback_reason": fallback_reason or "LLM provider is not configured. TripStory drafted a local producer brief.",
+        },
+    }
+
+
+def _normalize_creative_brief(plan: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(fallback)
+    normalized.update(plan if isinstance(plan, dict) else {})
+    normalized["title"] = _as_text(normalized.get("title"), fallback["title"])
+    normalized["summary"] = _as_text(normalized.get("summary"), fallback["summary"])
+    normalized["recommended_direction_id"] = _as_text(normalized.get("recommended_direction_id"), fallback["recommended_direction_id"])
+    normalized["selected_direction_id"] = _as_text(normalized.get("selected_direction_id"), normalized["recommended_direction_id"])
+    directions = []
+    for index, item in enumerate(_as_list(normalized.get("directions"), fallback["directions"])):
+        if not isinstance(item, dict):
+            item = {"angle": _as_text(item)}
+        direction_id = _as_text(item.get("id"), f"direction_{index + 1}")
+        directions.append(
+            {
+                "id": direction_id,
+                "title": _as_text(item.get("title"), f"Direction {index + 1}"),
+                "angle": _as_text(item.get("angle"), "Tell the trip through the clearest observed moments."),
+                "tone": _as_text(item.get("tone"), "warm and personal"),
+                "audience": _as_text(item.get("audience"), "friends and family"),
+                "why": _as_text(item.get("why"), "This direction is supported by the clip evidence."),
+                "key_beats": [_as_text(beat) for beat in _as_list(item.get("key_beats"), []) if _as_text(beat)],
+                "supporting_evidence": [
+                    evidence if isinstance(evidence, dict) else {"reason": _as_text(evidence)}
+                    for evidence in _as_list(item.get("supporting_evidence"), [])
+                ],
+            }
+        )
+    normalized["directions"] = directions[:3] or fallback["directions"]
+    if normalized["selected_direction_id"] not in {item["id"] for item in normalized["directions"]}:
+        normalized["selected_direction_id"] = normalized["recommended_direction_id"]
+    questions = []
+    for index, item in enumerate(_as_list(normalized.get("questions"), fallback["questions"])):
+        if not isinstance(item, dict):
+            item = {"question": _as_text(item)}
+        questions.append(
+            {
+                "id": _as_text(item.get("id"), f"question_{index + 1}"),
+                "label": _as_text(item.get("label"), f"Question {index + 1}"),
+                "question": _as_text(item.get("question"), "What should the editor know before planning?"),
+                "why": _as_text(item.get("why"), "This answer improves the creative brief."),
+                "answer": _as_text(item.get("answer")),
+            }
+        )
+    normalized["questions"] = questions[:3] or fallback["questions"]
+    normalized["must_use"] = [
+        item if isinstance(item, dict) else {"reason": _as_text(item)}
+        for item in _as_list(normalized.get("must_use"), fallback.get("must_use", []))
+    ][:6]
+    normalized["avoid"] = [_as_text(item) for item in _as_list(normalized.get("avoid"), fallback.get("avoid", [])) if _as_text(item)][:6]
+    normalized["missing_context"] = [
+        _as_text(item)
+        for item in _as_list(normalized.get("missing_context"), fallback.get("missing_context", []))
+        if _as_text(item)
+    ][:6]
+    return normalized
+
+
+def generate_creative_brief(
+    context: dict[str, Any],
+    media_items: list[dict[str, Any]],
+    provider: LLMProvider | None = None,
+    render_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    provider = provider or LLMProvider()
+    fallback = _fallback_creative_brief(context, media_items, provider, render_options)
+    media_manifest = _clip_manifest(media_items)
+    smart_windows = _smart_window_manifest(media_items)
+    system = (
+        "You are an AI producer for a travel-video editing tool. Draft a creative brief before final "
+        "story generation. Do not write final voiceover. Ask only questions that materially improve the edit. "
+        "Ground every proposal in observed clip evidence. Return strict JSON only."
+    )
+    user = {
+        "trip_context": context,
+        "clip_manifest": media_manifest,
+        "smart_windows": smart_windows,
+        "required_shape": {
+            "title": "string",
+            "summary": "string",
+            "recommended_direction_id": "direction_1",
+            "selected_direction_id": "direction_1",
+            "directions": [
+                {
+                    "id": "direction_1",
+                    "title": "string",
+                    "angle": "string",
+                    "tone": "string",
+                    "audience": "string",
+                    "why": "string",
+                    "key_beats": ["string"],
+                    "supporting_evidence": [{"clip_id": "string", "clip": "string", "window_id": "string", "reason": "string"}],
+                }
+            ],
+            "questions": [{"id": "string", "label": "string", "question": "string", "why": "string", "answer": ""}],
+            "must_use": [{"clip_id": "string", "clip": "string", "window_id": "string", "reason": "string"}],
+            "avoid": ["string"],
+            "missing_context": ["string"],
+        },
+        "requirements": [
+            "Return exactly 2 or 3 directions.",
+            "Return exactly 3 focused questions.",
+            "Each direction must cite real clips or smart windows when evidence exists.",
+            "Questions should cover audience, emotional center, and must-use or avoid moments.",
+            "Do not write final narration, captions, edit_decisions, or voiceover_segments.",
+        ],
+    }
+    if not provider.configured:
+        return fallback
+    try:
+        started = time.monotonic()
+        content = provider.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            ],
+            max_tokens=max(1024, min(_story_max_tokens(), 3072)),
+        )
+        if not content:
+            return _fallback_creative_brief(context, media_items, provider, render_options, "LLM returned an empty creative brief.")
+        parsed = _parse_llm_story_json(content)
+        brief = _normalize_creative_brief(parsed, fallback)
+        brief["generation"] = {
+            "llm_used": True,
+            "llm_provider": provider.provider,
+            "llm_model": provider.model,
+            "llm_configured": provider.configured,
+            "fallback_reason": None,
+        }
+        log_event(
+            logger,
+            20,
+            "creative_brief_complete",
+            provider=provider.provider,
+            model=provider.model,
+            clip_count=len(media_items),
+            direction_count=len(brief.get("directions") or []),
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            outcome="llm",
+            stage="creative_brief",
+        )
+        return brief
+    except Exception as exc:
+        log_event(
+            logger,
+            30,
+            "creative_brief_fallback",
+            provider=provider.provider,
+            model=provider.model,
+            exception_type=type(exc).__name__,
+            outcome="local_fallback",
+            stage="creative_brief",
+        )
+        return _fallback_creative_brief(context, media_items, provider, render_options, f"Creative brief LLM failed: {type(exc).__name__}.")
+
+
 def _looks_like_editor_metadata(text: str) -> bool:
     return any(pattern.search(text or "") for pattern in TECHNICAL_VOICEOVER_PATTERNS)
 
@@ -833,6 +1106,7 @@ def generate_trip_story(
     media_items: list[dict[str, Any]],
     provider: LLMProvider | None = None,
     render_options: dict[str, Any] | None = None,
+    creative_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = provider or LLMProvider()
     language = _language_name(context.get("language"))
@@ -865,6 +1139,7 @@ def generate_trip_story(
     user = {
         "target_language": language,
         "trip_context": context,
+        "approved_creative_brief": creative_brief or None,
         "clip_manifest": media_manifest,
         "smart_windows": smart_windows,
         "manifest_rules": [
@@ -896,6 +1171,8 @@ def generate_trip_story(
             "Stay vendor neutral and do not mention a specific AI model.",
         ],
     }
+    if creative_brief:
+        user["requirements"].insert(0, "Follow the approved_creative_brief. Treat its selected direction, answers, must-use evidence, and avoid list as user-approved creative direction.")
 
     try:
         started = time.monotonic()

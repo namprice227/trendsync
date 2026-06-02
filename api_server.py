@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from llm_provider import LLMProvider
 from media_intelligence import analyze_clip, vision_semantics_source
 from trip_renderer import render_trip_video
-from trip_story import generate_trip_story
+from trip_story import generate_creative_brief, generate_trip_story
 from tripstory_logging import configure_logging, get_logger, http_request_logging_enabled, log_event
 
 
@@ -67,6 +67,25 @@ ACTIVE_JOB_STATES = {
     "mixing_audio",
 }
 DEFAULT_STALE_JOB_SECONDS = int(os.environ.get("TRIPSTORY_STALE_JOB_SECONDS", str(int(os.environ.get("TRIPSTORY_JOB_TIMEOUT_SECONDS", "3600")) + 300)))
+PUBLIC_API_URL = os.environ.get("TRIPSTORY_PUBLIC_API_URL", "").strip().rstrip("/")
+
+
+def _csv_env(name: str, default: str) -> list[str]:
+    raw = os.environ.get(name, default)
+    values = [value.strip().rstrip("/") for value in raw.split(",") if value.strip()]
+    return values or [default]
+
+
+CORS_ORIGINS = _csv_env("TRIPSTORY_CORS_ORIGINS", "*")
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_owner_id(owner: str) -> str:
+    safe_owner = "".join(ch if ch.isalnum() or ch in ("-", "_", "@", ".") else "_" for ch in owner.strip())[:120]
+    return safe_owner.lower() or "local"
 
 PHASE_SCREENS = {
     "collecting_context": "context",
@@ -86,8 +105,8 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials="*" not in CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -266,6 +285,7 @@ def _auth_context(
     authorization: str | None = Header(default=None),
     x_tripstory_token: str | None = Header(default=None),
     x_tripstory_user: str | None = Header(default=None),
+    cf_access_authenticated_user_email: str | None = Header(default=None, alias="Cf-Access-Authenticated-User-Email"),
 ) -> dict[str, str]:
     expected = os.environ.get("TRIPSTORY_AUTH_TOKEN", "").strip()
     provided = (x_tripstory_token or "").strip()
@@ -275,9 +295,13 @@ def _auth_context(
             provided = token.strip()
     if expected and provided != expected:
         raise HTTPException(status_code=401, detail="Invalid TripStory API token.")
+    access_email = (cf_access_authenticated_user_email or "").strip()
+    if _truthy_env("TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS") and not access_email:
+        raise HTTPException(status_code=401, detail="Cloudflare Access identity is required.")
+    if access_email and _truthy_env("TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL"):
+        return {"owner_id": _safe_owner_id(access_email)}
     owner = x_tripstory_user or request.headers.get("x-tripstory-owner") or "local"
-    safe_owner = "".join(ch if ch.isalnum() or ch in ("-", "_", "@", ".") else "_" for ch in owner)[:120]
-    return {"owner_id": safe_owner or "local"}
+    return {"owner_id": _safe_owner_id(owner)}
 
 
 class TripContextRequest(BaseModel):
@@ -317,6 +341,17 @@ class VoiceoverSegmentUpdate(BaseModel):
 
 class VoiceoverSegmentsPatchRequest(BaseModel):
     segments: list[VoiceoverSegmentUpdate] = Field(..., min_length=1, max_length=100)
+
+
+class CreativeBriefAnswer(BaseModel):
+    question_id: str = Field(..., min_length=1, max_length=80)
+    answer: str = Field("", max_length=700)
+
+
+class CreativeBriefPatchRequest(BaseModel):
+    selected_direction_id: str | None = Field(None, max_length=80)
+    answers: list[CreativeBriefAnswer] = Field(default_factory=list, max_length=12)
+    notes: str | None = Field(None, max_length=1200)
 
 
 def _now() -> float:
@@ -367,6 +402,10 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
         "media_items": [],
         "recorded_clips": [],
         "clip_analysis": [],
+        "creative_brief": None,
+        "creative_brief_status": None,
+        "creative_brief_answers": {},
+        "selected_creative_direction_id": None,
         "story_plan": None,
         "script": None,
         "final_video_url": None,
@@ -401,6 +440,11 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     session["media_items"] = list(raw.get("media_items") or [])
     session["recorded_clips"] = list(raw.get("recorded_clips") or [])
     session["clip_analysis"] = list(raw.get("clip_analysis") or [])
+    session["creative_brief"] = raw.get("creative_brief") if isinstance(raw.get("creative_brief"), dict) else None
+    status = raw.get("creative_brief_status")
+    session["creative_brief_status"] = status if status in {"draft", "approved", "stale"} else None
+    session["creative_brief_answers"] = raw.get("creative_brief_answers") if isinstance(raw.get("creative_brief_answers"), dict) else {}
+    session["selected_creative_direction_id"] = raw.get("selected_creative_direction_id")
     session["events"] = list(raw.get("events") or [])
     render_options = RenderRequest().model_dump()
     render_options.update(raw.get("render_options") or {})
@@ -865,6 +909,48 @@ def _owner_from_auth(auth: Any) -> str:
     return auth.get("owner_id", "local") if isinstance(auth, dict) else "local"
 
 
+def _creative_brief_stale_updates(session: dict[str, Any]) -> dict[str, Any]:
+    if session.get("creative_brief") and session.get("creative_brief_status") == "approved":
+        return {
+            "creative_brief_status": "stale",
+            "next_action": "Refresh or re-approve the producer brief before generating the story plan.",
+        }
+    return {}
+
+
+def _apply_creative_brief_patch(session: dict[str, Any], request: CreativeBriefPatchRequest | None) -> tuple[dict[str, Any], dict[str, str], str | None, str | None]:
+    brief = copy.deepcopy(session.get("creative_brief") or {})
+    if not brief:
+        raise HTTPException(status_code=409, detail="Draft a producer brief before editing it.")
+    existing_answers = {
+        str(key): str(value)
+        for key, value in (session.get("creative_brief_answers") or {}).items()
+    }
+    selected_direction_id = session.get("selected_creative_direction_id") or brief.get("selected_direction_id") or brief.get("recommended_direction_id")
+    notes = str((brief.get("notes") or "")).strip() or None
+    if request:
+        if request.selected_direction_id is not None:
+            selected_direction_id = request.selected_direction_id.strip() or selected_direction_id
+        for answer in request.answers:
+            existing_answers[answer.question_id] = " ".join(answer.answer.split()).strip()
+        if request.notes is not None:
+            notes = " ".join(request.notes.split()).strip() or None
+    direction_ids = {str(item.get("id")) for item in brief.get("directions") or [] if isinstance(item, dict)}
+    if selected_direction_id and direction_ids and selected_direction_id not in direction_ids:
+        raise HTTPException(status_code=422, detail="Selected direction is not part of this producer brief.")
+    brief["selected_direction_id"] = selected_direction_id
+    if notes:
+        brief["notes"] = notes
+    elif "notes" in brief:
+        brief.pop("notes", None)
+    for question in brief.get("questions") or []:
+        if isinstance(question, dict):
+            question_id = str(question.get("id") or "")
+            if question_id in existing_answers:
+                question["answer"] = existing_answers[question_id]
+    return brief, existing_answers, selected_direction_id, notes
+
+
 def _create_session(owner_id: str = "local") -> dict[str, Any]:
     session = _default_session()
     session["owner_id"] = owner_id
@@ -948,6 +1034,10 @@ def _duplicate_session(source_session_id: str, owner_id: str) -> dict[str, Any]:
             duplicate_dir,
         ),
         clip_analysis=copy.deepcopy(source.get("clip_analysis") or []),
+        creative_brief=copy.deepcopy(source.get("creative_brief")),
+        creative_brief_status=source.get("creative_brief_status"),
+        creative_brief_answers=copy.deepcopy(source.get("creative_brief_answers") or {}),
+        selected_creative_direction_id=source.get("selected_creative_direction_id"),
         story_plan=copy.deepcopy(source.get("story_plan")),
         script=source.get("script"),
         final_video_url=_rewrite_duplicate_asset_refs(source.get("final_video_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
@@ -1052,7 +1142,8 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
         else:
             _job_progress(job_id, session_id, "planning", f"Using local fallback because {provider.provider} is not configured", 45)
             _event(session_id, f"Using local fallback because {provider.provider} is not configured", 45, level="warning")
-        plan = generate_trip_story(context, media_items, provider, render_options=render_options)
+        creative_brief = session.get("creative_brief") if session.get("creative_brief_status") == "approved" else None
+        plan = generate_trip_story(context, media_items, provider, render_options=render_options, creative_brief=creative_brief)
         generation = plan.get("generation") or {}
         _event(
             session_id,
@@ -1150,7 +1241,8 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
             provider_name = selected_provider if selected_provider and selected_provider != "local" else None
             provider = LLMProvider(provider=provider_name, model=context.get("llm_model") or None)
             media_items_for_plan = _ensure_current_clip_analysis(session_id, list(session.get("media_items") or []), context)
-            story_plan = generate_trip_story(context, media_items_for_plan, provider, render_options=render_options)
+            creative_brief = session.get("creative_brief") if session.get("creative_brief_status") == "approved" else None
+            story_plan = generate_trip_story(context, media_items_for_plan, provider, render_options=render_options, creative_brief=creative_brief)
             _update_session(session_id, story_plan=story_plan, script=story_plan.get("voiceover_script"))
         timeline_decisions = story_plan.get("edit_decisions") or []
         log_event(
@@ -1271,6 +1363,11 @@ def health() -> dict[str, str]:
     return {"status": "ok", "product": "TripStory"}
 
 
+@app.head("/health")
+def health_head() -> Response:
+    return Response(status_code=200)
+
+
 @app.get("/sessions")
 def list_sessions(auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
     owner_id = _owner_from_auth(auth)
@@ -1330,6 +1427,93 @@ def duplicate_session(session_id: str, auth: dict[str, str] = Depends(_auth_cont
     return _duplicate_session(session_id, _owner_from_auth(auth))
 
 
+@app.post("/sessions/{session_id}/creative-brief")
+def create_creative_brief(session_id: str, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    media_items = list(session.get("media_items") or [])
+    if not media_items:
+        raise HTTPException(status_code=409, detail="Upload media before drafting a producer brief.")
+    context = dict(session.get("trip_context") or {})
+    render_options = dict(session.get("render_options") or RenderRequest().model_dump())
+    media_items = _ensure_current_clip_analysis(session_id, media_items, context)
+    selected_provider = (context.get("llm_provider") or "").strip().lower()
+    provider_name = selected_provider if selected_provider and selected_provider != "local" else None
+    provider = LLMProvider(provider=provider_name, model=context.get("llm_model") or None)
+    brief = generate_creative_brief(context, media_items, provider, render_options=render_options)
+    selected_direction_id = brief.get("selected_direction_id") or brief.get("recommended_direction_id")
+    updated = _update_session(
+        session_id,
+        creative_brief=brief,
+        creative_brief_status="draft",
+        creative_brief_answers={},
+        selected_creative_direction_id=selected_direction_id,
+        progress_label="Producer brief drafted",
+        next_action="Review the creative direction, answer the producer questions, then approve the brief.",
+        error=None,
+    )
+    log_event(
+        logger,
+        20,
+        "creative_brief_drafted",
+        session_id=session_id,
+        provider=provider.provider,
+        model=provider.model,
+        llm_used=(brief.get("generation") or {}).get("llm_used"),
+        direction_count=len(brief.get("directions") or []),
+        stage="creative_brief",
+        outcome="success",
+    )
+    return _public_session(updated["id"])
+
+
+@app.patch("/sessions/{session_id}/creative-brief")
+def update_creative_brief(
+    session_id: str,
+    request: CreativeBriefPatchRequest,
+    auth: dict[str, str] = Depends(_auth_context),
+) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    brief, answers, selected_direction_id, _notes = _apply_creative_brief_patch(session, request)
+    status = "draft" if session.get("creative_brief_status") == "approved" else session.get("creative_brief_status") or "draft"
+    updated = _update_session(
+        session_id,
+        creative_brief=brief,
+        creative_brief_status=status,
+        creative_brief_answers=answers,
+        selected_creative_direction_id=selected_direction_id,
+        progress_label="Producer brief updated",
+        next_action="Approve the producer brief before generating the story plan.",
+        error=None,
+    )
+    return _public_session(updated["id"])
+
+
+@app.post("/sessions/{session_id}/creative-brief/approve")
+def approve_creative_brief(
+    session_id: str,
+    request: CreativeBriefPatchRequest | None = None,
+    auth: dict[str, str] = Depends(_auth_context),
+) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    brief, answers, selected_direction_id, _notes = _apply_creative_brief_patch(session, request)
+    if not selected_direction_id:
+        raise HTTPException(status_code=422, detail="Select a creative direction before approving the brief.")
+    updated = _update_session(
+        session_id,
+        creative_brief=brief,
+        creative_brief_status="approved",
+        creative_brief_answers=answers,
+        selected_creative_direction_id=selected_direction_id,
+        progress_label="Producer brief approved",
+        next_action="Generate the story plan from the approved producer brief.",
+        error=None,
+    )
+    return _public_session(updated["id"])
+
+
 @app.post("/sessions/{session_id}/context")
 def save_context(session_id: str, request: TripContextRequest, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
     session = _public_session(session_id)
@@ -1342,16 +1526,17 @@ def save_context(session_id: str, request: TripContextRequest, auth: dict[str, s
         if phase == "ready_to_plan"
         else "Upload media and add where you went before generating the story."
     )
-    return _update_session(
-        session_id,
-        phase=phase,
-        progress_label="Trip context saved",
-        next_action=next_action,
-        trip_context=context,
-        llm_provider=context.get("llm_provider") or "local",
-        llm_model=context.get("llm_model") or os.environ.get("TRIPSTORY_LLM_MODEL", "local-fallback"),
-        error=None,
-    )
+    session_updates = {
+        "phase": phase,
+        "progress_label": "Trip context saved",
+        "next_action": next_action,
+        "trip_context": context,
+        "llm_provider": context.get("llm_provider") or "local",
+        "llm_model": context.get("llm_model") or os.environ.get("TRIPSTORY_LLM_MODEL", "local-fallback"),
+        "error": None,
+    }
+    session_updates.update(_creative_brief_stale_updates(session))
+    return _update_session(session_id, **session_updates)
 
 
 @app.post("/sessions/{session_id}/media")
@@ -1410,16 +1595,17 @@ async def upload_media(
 
     clip_analysis = [item["analysis"] for item in media_items if item.get("analysis")]
     phase = "ready_to_plan" if context.get("destination") else "collecting_context"
-    return _update_session(
-        session_id,
-        phase=phase,
-        progress_label=f"{len(media_items)} media item{'s' if len(media_items) != 1 else ''} uploaded and analyzed",
-        next_action="Review the clip intelligence, add trip context, then generate the narrative plan.",
-        media_items=media_items,
-        recorded_clips=clips,
-        clip_analysis=clip_analysis,
-        error=None,
-    )
+    session_updates = {
+        "phase": phase,
+        "progress_label": f"{len(media_items)} media item{'s' if len(media_items) != 1 else ''} uploaded and analyzed",
+        "next_action": "Review the clip intelligence, add trip context, then draft a producer brief.",
+        "media_items": media_items,
+        "recorded_clips": clips,
+        "clip_analysis": clip_analysis,
+        "error": None,
+    }
+    session_updates.update(_creative_brief_stale_updates(session))
+    return _update_session(session_id, **session_updates)
 
 
 @app.post("/sessions/{session_id}/generate-story")
@@ -1431,6 +1617,8 @@ def generate_story(
     _ensure_owner(session, _owner_from_auth(auth))
     if not session.get("media_items"):
         raise HTTPException(status_code=409, detail="Upload media before generating the story.")
+    if session.get("creative_brief") and session.get("creative_brief_status") != "approved":
+        raise HTTPException(status_code=409, detail="Approve or refresh the producer brief before generating the story.")
     _update_session(
         session_id,
         phase="planning",
@@ -1569,12 +1757,13 @@ def get_job(session_id: str, job_id: str, auth: dict[str, str] = Depends(_auth_c
 
 
 @app.post("/sessions/{session_id}/share")
-def share_session(session_id: str, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
+def share_session(session_id: str, request: Request, auth: dict[str, str] = Depends(_auth_context)) -> dict[str, Any]:
     session = _public_session(session_id)
     _ensure_owner(session, _owner_from_auth(auth))
     token = session.get("share_token") or uuid.uuid4().hex
     updated = _update_session(session_id, share_token=token)
-    return {"share_token": token, "share_url": f"/share/{token}", "session": updated}
+    base_url = PUBLIC_API_URL or str(request.base_url).rstrip("/")
+    return {"share_token": token, "share_url": f"{base_url}/share/{token}", "session": updated}
 
 
 @app.get("/share/{share_token}")
