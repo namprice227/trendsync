@@ -1,0 +1,21 @@
+[Unit]
+Description=TripStory Cloudflare tunnel for api.mangasmith.com
+After=network.target tripstory-api.service
+Wants=tripstory-api.service
+
+[Service]
+Type=simple
+User=@TRIPSTORY_USER@
+Group=@TRIPSTORY_GROUP@
+WorkingDirectory=@PROD_ROOT@/app
+Environment=TRIPSTORY_ENV_FILE=/etc/tripstory/tripstory.env
+ExecStart=@PROD_ROOT@/app/scripts/run_cloudflare_tunnel.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/log/tripstory /tmp
+
+[Install]
+WantedBy=multi-user.target

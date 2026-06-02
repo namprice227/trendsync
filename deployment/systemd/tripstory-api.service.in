@@ -1,0 +1,21 @@
+[Unit]
+Description=TripStory FastAPI backend
+After=network.target tripstory-redis.service
+Wants=tripstory-redis.service
+
+[Service]
+Type=simple
+User=@TRIPSTORY_USER@
+Group=@TRIPSTORY_GROUP@
+WorkingDirectory=@PROD_ROOT@/app
+EnvironmentFile=/etc/tripstory/tripstory.env
+ExecStart=@PROD_ROOT@/env/bin/python -m uvicorn api_server:app --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/tripstory /var/log/tripstory /tmp
+
+[Install]
+WantedBy=multi-user.target

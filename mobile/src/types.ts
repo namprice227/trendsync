@@ -133,6 +133,54 @@ export type StoryPlan = {
   };
 };
 
+export type CreativeBriefEvidence = {
+  clip_id?: string;
+  clip?: string;
+  window_id?: string;
+  start_time?: number;
+  reason?: string;
+  quality?: string;
+};
+
+export type CreativeBriefDirection = {
+  id: string;
+  title: string;
+  angle: string;
+  tone?: string;
+  audience?: string;
+  why?: string;
+  key_beats?: string[];
+  supporting_evidence?: CreativeBriefEvidence[];
+};
+
+export type CreativeBriefQuestion = {
+  id: string;
+  label: string;
+  question: string;
+  why?: string;
+  answer?: string;
+};
+
+export type CreativeBrief = {
+  title: string;
+  summary: string;
+  recommended_direction_id?: string;
+  selected_direction_id?: string;
+  directions: CreativeBriefDirection[];
+  questions: CreativeBriefQuestion[];
+  must_use?: CreativeBriefEvidence[];
+  avoid?: string[];
+  missing_context?: string[];
+  notes?: string;
+  generation?: {
+    llm_used?: boolean;
+    llm_provider?: string;
+    llm_model?: string;
+    llm_configured?: boolean;
+    fallback_reason?: string | null;
+  };
+};
+
 export type RenderOptions = {
   aspect_ratio: string;
   target_duration_seconds: number;
@@ -188,6 +236,10 @@ export type TripSession = {
   media_items: MediaItem[];
   recorded_clips: string[];
   clip_analysis: ClipAnalysis[];
+  creative_brief?: CreativeBrief | null;
+  creative_brief_status?: 'draft' | 'approved' | 'stale' | null;
+  creative_brief_answers?: Record<string, string>;
+  selected_creative_direction_id?: string | null;
   story_plan?: StoryPlan | null;
   script?: string | null;
   final_video_url?: string | null;
@@ -200,3 +252,11 @@ export type TripSession = {
   llm_provider: string;
   llm_model: string;
 };
+export type AppView = 'dashboard' | 'project';
+export type ProjectFilter = 'all' | 'drafting' | 'ready' | 'rendering' | 'complete' | 'error';
+export type ProjectSort = 'recent' | 'name' | 'status';
+export type ProjectAction = 'rename' | 'duplicate' | 'share' | 'delete';
+
+// --- CapCut-style editor layout types ---
+export type SidebarTab = 'media' | 'story' | 'intelligence' | 'brief';
+export type PropertiesTab = 'context' | 'export' | 'script';

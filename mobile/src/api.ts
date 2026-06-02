@@ -1,5 +1,11 @@
 import type { JobSummary, ProjectSummary, RenderOptions, TripContext, TripSession } from './types';
 
+export type CreativeBriefPatch = {
+  selected_direction_id?: string | null;
+  answers?: Array<{ question_id: string; answer: string }>;
+  notes?: string | null;
+};
+
 export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '');
 }
@@ -29,6 +35,13 @@ export function mediaUrl(baseUrl: string, path?: string | null): string | null {
   return joinUrl(baseUrl, path);
 }
 
+export function absoluteUrl(baseUrl: string, pathOrUrl: string): string {
+  if (pathOrUrl.startsWith('http://') || pathOrUrl.startsWith('https://')) {
+    return pathOrUrl;
+  }
+  return joinUrl(baseUrl, pathOrUrl);
+}
+
 export async function createSession(baseUrl: string): Promise<TripSession> {
   const response = await fetch(joinUrl(baseUrl, '/sessions'), { method: 'POST' });
   return readJson<TripSession>(response);
@@ -56,6 +69,29 @@ export async function updateProjectMetadata(baseUrl: string, sessionId: string, 
 
 export async function duplicateSession(baseUrl: string, sessionId: string): Promise<TripSession> {
   const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/duplicate`), { method: 'POST' });
+  return readJson<TripSession>(response);
+}
+
+export async function draftCreativeBrief(baseUrl: string, sessionId: string): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/creative-brief`), { method: 'POST' });
+  return readJson<TripSession>(response);
+}
+
+export async function updateCreativeBrief(baseUrl: string, sessionId: string, patch: CreativeBriefPatch): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/creative-brief`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  return readJson<TripSession>(response);
+}
+
+export async function approveCreativeBrief(baseUrl: string, sessionId: string, patch: CreativeBriefPatch): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/creative-brief/approve`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
   return readJson<TripSession>(response);
 }
 

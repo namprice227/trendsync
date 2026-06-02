@@ -1,13 +1,13 @@
 {
   "expo": {
-    "name": "TrendFlow",
-    "slug": "trendflow-mobile",
+    "name": "TripStory",
+    "slug": "tripstory-mobile",
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
-    "scheme": "trendflow",
+    "scheme": "tripstory",
     "android": {
-      "package": "ai.trendflow.mobile",
+      "package": "ai.tripstory.mobile",
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO"
@@ -17,8 +17,8 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "TrendFlow needs camera access to guide and record each shot.",
-          "microphonePermission": "TrendFlow needs microphone access to record synced video clips.",
+          "cameraPermission": "TripStory needs camera access to record clips.",
+          "microphonePermission": "TripStory needs microphone access to record audio.",
           "recordAudioAndroid": true
         }
       ],
