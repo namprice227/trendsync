@@ -862,11 +862,20 @@ def generate_trip_story(
         "narrative_arc, voiceover_script, voiceover_segments, edit_notes, clip_plan, edit_decisions. "
         "The voiceover must be in the requested language."
     )
+    # Incorporate pinned and excluded scenes (Milestone 2)
+    excluded_clip_ids = render_options.get("excluded_clip_ids", []) if render_options else []
+    pinned_clip_ids = render_options.get("favorite_clip_ids", []) if render_options else []
+
+    # Filter the manifest to remove explicitly excluded clips
+    filtered_media_manifest = [item for item in media_manifest if not any(item.startswith(exc_id) for exc_id in excluded_clip_ids)]
+    filtered_smart_windows = [win for win in smart_windows if win.get("clip_id") not in excluded_clip_ids]
+
     user = {
         "target_language": language,
         "trip_context": context,
-        "clip_manifest": media_manifest,
-        "smart_windows": smart_windows,
+        "pinned_favorite_clip_ids": pinned_clip_ids,
+        "clip_manifest": filtered_media_manifest,
+        "smart_windows": filtered_smart_windows,
         "manifest_rules": [
             "Each manifest line is compact: clip id, duration, creative visual cue, people/motion/audio hints, best timestamps, and avoid hints.",
             "Use smart_windows as the primary editing evidence. Each window has a stable window_id, start_time, duration, score, sampled frame_timestamps, and visual_evidence.",
@@ -877,6 +886,7 @@ def generate_trip_story(
             "Make the story feel personal, not like a generic travel ad.",
             "Assume clips may be imperfect phone footage.",
             f"Write for a {int(round(target_seconds))}-second rendered video.",
+            "You MUST include ALL clips listed in the pinned_favorite_clip_ids in your final edit_decisions.",
             f"The title card uses 2 seconds when enabled, so edit_decisions should total about {voiceover_seconds:.1f} seconds.",
             f"Return about {target_segment_count} voiceover_segments, using repeated clips only when needed to fill the selected duration.",
             "Choose exact windows from smart_windows first. Prefer high score windows with concrete visual_evidence. Avoid weak/dark/shaky windows when alternatives exist.",

@@ -44,6 +44,7 @@ const defaultRenderOptions: RenderOptions = {
   target_duration_seconds: 30,
   clip_order: [],
   favorite_clip_ids: [],
+  excluded_clip_ids: [],
   burn_captions: false,
   include_title_card: true,
   include_music_bed: false,
@@ -954,12 +955,28 @@ function PlanScreen({
   const toggleFavorite = (clipId: string) => {
     setOptions((current) => {
       const currentFavorites = new Set(current.favorite_clip_ids || []);
+      const currentExcluded = new Set(current.excluded_clip_ids || []);
       if (currentFavorites.has(clipId)) {
         currentFavorites.delete(clipId);
       } else {
         currentFavorites.add(clipId);
+        currentExcluded.delete(clipId); // Ensure mutually exclusive
       }
-      return { ...current, favorite_clip_ids: Array.from(currentFavorites) };
+      return { ...current, favorite_clip_ids: Array.from(currentFavorites), excluded_clip_ids: Array.from(currentExcluded) };
+    });
+  };
+
+  const toggleExclude = (clipId: string) => {
+    setOptions((current) => {
+      const currentExcluded = new Set(current.excluded_clip_ids || []);
+      const currentFavorites = new Set(current.favorite_clip_ids || []);
+      if (currentExcluded.has(clipId)) {
+        currentExcluded.delete(clipId);
+      } else {
+        currentExcluded.add(clipId);
+        currentFavorites.delete(clipId); // Ensure mutually exclusive
+      }
+      return { ...current, excluded_clip_ids: Array.from(currentExcluded), favorite_clip_ids: Array.from(currentFavorites) };
     });
   };
 
@@ -1114,14 +1131,18 @@ function PlanScreen({
               <Text style={styles.listItem}>Generate subtitle files</Text>
             </Pressable>
             {session.media_items.map((item, index) => {
-              const favorite = options.favorite_clip_ids.includes(item.id);
+              const favorite = options.favorite_clip_ids?.includes(item.id);
+              const excluded = options.excluded_clip_ids?.includes(item.id);
               return (
                 <View key={item.id} style={styles.timelineControl}>
                   <Pressable onPress={() => toggleFavorite(item.id)} style={styles.iconButton}>
                     <Ionicons name={favorite ? 'star' : 'star-outline'} size={17} color={favorite ? colors.amber : colors.muted} />
                   </Pressable>
-                  <View style={styles.projectRowCopy}>
-                    <Text style={styles.insightTitle}>{item.filename}</Text>
+                  <Pressable onPress={() => toggleExclude(item.id)} style={styles.iconButton}>
+                    <Ionicons name={excluded ? 'close-circle' : 'close-circle-outline'} size={17} color={excluded ? colors.red : colors.muted} />
+                  </Pressable>
+                  <View style={[styles.projectRowCopy, excluded && { opacity: 0.5 }]}>
+                    <Text style={[styles.insightTitle, excluded && { textDecorationLine: 'line-through' }]}>{item.filename}</Text>
                     <Text style={styles.projectMeta}>{item.analysis?.summary || `Clip ${index + 1}`}</Text>
                   </View>
                   <Pressable onPress={() => moveClip(item.id, -1)} style={styles.iconButton}>
