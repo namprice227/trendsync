@@ -186,6 +186,7 @@ export type RenderOptions = {
   target_duration_seconds: number;
   clip_order: string[];
   favorite_clip_ids: string[];
+  excluded_clip_ids: string[];
   burn_captions: boolean;
   include_title_card: boolean;
   include_music_bed: boolean;

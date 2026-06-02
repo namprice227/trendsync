@@ -2,6 +2,14 @@
 
 TripStory AI turns a pile of holiday clips into a polished travel recap plan and stitched video.
 
+## Companion Documents
+For deep technical and product context regarding the architecture design, refer to:
+- [PRD.md](PRD.md): Product vision, target audience, and MVP milestones.
+- [SCHEMA.md](SCHEMA.md): Core JSON contracts (Scene Memory, Story Plan).
+- [PROMPTS.md](PROMPTS.md): VLM and LLM system prompts.
+- [API_SPEC.md](API_SPEC.md): REST API contracts.
+- [EVAL_PLAN.md](EVAL_PLAN.md): Evaluation metrics for narrative coherence and narration restraint.
+
 The new product flow is:
 
 1. Upload clips and videos from a trip.
@@ -301,5 +309,6 @@ For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the proc
 3. Improve rendering: add true xfade transitions, music library selection, map cards, subtitle burn-in, and a timeline preview.
 4. Improve narration controls: add voice selection, playback, subtitles styling, and per-language narration tuning.
 5. Improve media understanding: extract thumbnails, true landmark recognition, GPS/date metadata when available, and stronger story-aware highlight selection.
-6. Build editing controls in mobile: reorder clips, mark favorites, edit the script, choose tone/language, select output aspect ratio, and preview timeline changes before render.
-7. Prepare for production: move long-running work to a queue, add upload limits and resumable uploads, add auth, add deployment docs, and add monitoring/logging.
+6. Build editing controls in mobile: **[Implemented]** reorder clips, mark favorites, exclude clips, edit the script, choose tone/language, select output aspect ratio.
+7. Evaluate output: **[Implemented]** Evaluate generated narratives via the `/eval/dashboard` for narration density.
+8. Prepare for production: move long-running work to a queue, add upload limits and resumable uploads, add auth, add deployment docs, and add monitoring/logging.

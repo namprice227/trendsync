@@ -196,7 +196,9 @@ def _sample_visuals(path: Path, duration: float) -> dict[str, Any]:
         motion_score = float(np.mean(cv2.absdiff(small, prev_gray))) if prev_gray is not None else 0.0
         scene_delta = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)) if prev_hist is not None else 0.0
         if scene_delta > 0.55:
-            scene_timestamps.append(round(timestamp, 2))
+            # Merge very low-value scenes (less than 1.5 seconds long)
+            if not scene_timestamps or (timestamp - scene_timestamps[-1] >= 1.5):
+                scene_timestamps.append(round(timestamp, 2))
 
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
         face_count += len(faces)

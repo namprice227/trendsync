@@ -324,6 +324,7 @@ class RenderRequest(BaseModel):
     target_duration_seconds: int = Field(30, ge=6, le=180)
     clip_order: list[str] = Field(default_factory=list)
     favorite_clip_ids: list[str] = Field(default_factory=list)
+    excluded_clip_ids: list[str] = Field(default_factory=list)
     burn_captions: bool = False
     include_title_card: bool = True
     include_music_bed: bool = False
