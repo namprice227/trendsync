@@ -101,7 +101,7 @@ const styles = StyleSheet.create({
     height: 280,
   },
   mobileTimeline: {
-    height: 140,
+    height: 180,
     borderTopWidth: 1,
     borderTopColor: colors.line,
     backgroundColor: colors.surface,

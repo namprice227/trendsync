@@ -1,9 +1,23 @@
-import type { JobSummary, ProjectSummary, RenderOptions, TripContext, TripSession } from './types';
+import type { JobSummary, ProjectSummary, RenderOptions, TimelineSegmentUpdate, TripContext, TripSession } from './types';
 
 export type CreativeBriefPatch = {
   selected_direction_id?: string | null;
   answers?: Array<{ question_id: string; answer: string }>;
   notes?: string | null;
+};
+
+export type UploadAsset = {
+  uri: string;
+  name?: string | null;
+  mimeType?: string | null;
+  file?: File | null;
+  size?: number | null;
+};
+
+export type UploadMediaProgress = {
+  loadedBytes: number;
+  totalBytes: number | null;
+  percent: number | null;
 };
 
 export function normalizeBaseUrl(baseUrl: string): string {
@@ -18,15 +32,90 @@ async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    const detail =
-      typeof data?.detail === 'string'
-        ? data.detail
-        : Array.isArray(data?.detail)
-          ? data.detail.map((item: { msg?: string; loc?: string[] }) => `${item.loc?.join('.') || 'request'}: ${item.msg || 'invalid'}`).join('; ')
-          : `Request failed (${response.status})`;
-    throw new Error(detail);
+    throw new Error(apiErrorMessage(data, response.status));
   }
   return data as T;
+}
+
+function apiErrorMessage(data: any, status: number): string {
+  return typeof data?.detail === 'string'
+    ? data.detail
+    : Array.isArray(data?.detail)
+      ? data.detail.map((item: { msg?: string; loc?: string[] }) => `${item.loc?.join('.') || 'request'}: ${item.msg || 'invalid'}`).join('; ')
+      : `Request failed (${status})`;
+}
+
+function parseResponseJson(text: string): any {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Server returned an invalid JSON response');
+  }
+}
+
+function estimatedUploadBytes(assets: UploadAsset[]): number | null {
+  const total = assets.reduce((sum, asset) => {
+    const size = typeof asset.file?.size === 'number' ? asset.file.size : asset.size;
+    return typeof size === 'number' && Number.isFinite(size) ? sum + size : sum;
+  }, 0);
+  return total > 0 ? total : null;
+}
+
+function uploadForm<T>(
+  url: string,
+  form: FormData,
+  estimatedTotalBytes: number | null,
+  onProgress?: (progress: UploadMediaProgress) => void
+): Promise<T> {
+  if (typeof XMLHttpRequest === 'undefined') {
+    return fetch(url, {
+      method: 'POST',
+      body: form,
+      headers: { Accept: 'application/json' },
+    }).then((response) => readJson<T>(response));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let latestLoaded = 0;
+    let latestTotal = estimatedTotalBytes;
+
+    const reportProgress = (loadedBytes: number, totalBytes: number | null) => {
+      latestLoaded = loadedBytes;
+      latestTotal = totalBytes;
+      const percent = totalBytes ? Math.min(100, Math.round((loadedBytes / totalBytes) * 100)) : null;
+      onProgress?.({ loadedBytes, totalBytes, percent });
+    };
+
+    request.open('POST', url);
+    request.setRequestHeader('Accept', 'application/json');
+    request.upload.onprogress = (event) => {
+      const totalBytes = event.lengthComputable ? event.total : estimatedTotalBytes;
+      reportProgress(event.loaded, totalBytes);
+    };
+    request.upload.onload = () => {
+      reportProgress(latestTotal || latestLoaded, latestTotal);
+    };
+    request.onload = () => {
+      let data: any;
+      try {
+        data = parseResponseJson(request.responseText || '');
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(apiErrorMessage(data, request.status)));
+        return;
+      }
+      resolve(data as T);
+    };
+    request.onerror = () => reject(new Error('Upload failed because the network request could not be completed'));
+    request.onabort = () => reject(new Error('Upload canceled'));
+    request.ontimeout = () => reject(new Error('Upload timed out'));
+    request.send(form);
+  });
 }
 
 export function mediaUrl(baseUrl: string, path?: string | null): string | null {
@@ -116,7 +205,8 @@ export async function saveTripContext(
 export async function uploadMedia(
   baseUrl: string,
   sessionId: string,
-  assets: Array<{ uri: string; name?: string | null; mimeType?: string | null; file?: File | null }>
+  assets: UploadAsset[],
+  onProgress?: (progress: UploadMediaProgress) => void
 ): Promise<TripSession> {
   const form = new FormData();
   for (const asset of assets) {
@@ -131,16 +221,15 @@ export async function uploadMedia(
     }
   }
 
-  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/media`), {
-    method: 'POST',
-    body: form,
-    headers: { Accept: 'application/json' },
-  });
-  return readJson<TripSession>(response);
+  return uploadForm<TripSession>(joinUrl(baseUrl, `/sessions/${sessionId}/media`), form, estimatedUploadBytes(assets), onProgress);
 }
 
-export async function generateStory(baseUrl: string, sessionId: string): Promise<TripSession> {
-  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/generate-story`), { method: 'POST' });
+export async function generateStory(baseUrl: string, sessionId: string, options?: RenderOptions): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/generate-story`), {
+    method: 'POST',
+    headers: options ? { 'Content-Type': 'application/json' } : undefined,
+    body: options ? JSON.stringify(options) : undefined,
+  });
   return readJson<TripSession>(response);
 }
 
@@ -162,6 +251,20 @@ export async function updateVoiceoverSegments(
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ segments }),
+  });
+  return readJson<TripSession>(response);
+}
+
+export async function updateTimelineSegments(
+  baseUrl: string,
+  sessionId: string,
+  segments: TimelineSegmentUpdate[],
+  segmentOrder: string[]
+): Promise<TripSession> {
+  const response = await fetch(joinUrl(baseUrl, `/sessions/${sessionId}/timeline`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ segments, segment_order: segmentOrder }),
   });
   return readJson<TripSession>(response);
 }

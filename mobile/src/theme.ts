@@ -93,7 +93,7 @@ export const layout = {
   propertiesWidth: 320,
 
   // Bottom timeline
-  timelineHeight: 180,
+  timelineHeight: 240,
 
   // Breakpoints
   desktopMin: 1024,

@@ -10,9 +10,11 @@ For deep technical and product context regarding the architecture design, refer 
 - [API_SPEC.md](API_SPEC.md): REST API contracts.
 - [EVAL_PLAN.md](EVAL_PLAN.md): Evaluation metrics for narrative coherence and narration restraint.
 
-The new product flow is:
+The current product flow is:
 
 1. Upload clips and videos from a trip.
+   - The editor shows upload progress in the Media tab.
+   - Uploaded clips are analyzed and kept as source media; they do not appear in the edit timeline until a story plan selects clip moments.
 2. Answer context questions:
    - Where did you go?
    - How long was the trip?
@@ -20,8 +22,9 @@ The new product flow is:
    - Who was there?
    - What moments mattered most?
    - What language and tone should the voiceover use?
-3. Generate a multilingual narrative arc, edit notes, and voiceover script.
-4. Render a simple final recap video from the uploaded clips.
+3. Optionally draft and approve an AI producer brief from the clip intelligence.
+4. Generate a multilingual story plan from persisted scene memory. This creates story beats, narration lines, voiceover segments, captions, and the `edit_decisions` timeline.
+5. Render the final playable recap video from the generated story plan.
 
 The LLM layer is vendor-neutral. By default the app works with a deterministic fallback, and the backend can use OpenAI, Gemini, or DeepSeek from server-side environment variables.
 
@@ -78,6 +81,7 @@ sequenceDiagram
 | `worker.py` | RQ worker entrypoint for queued story and render jobs |
 | `llm_provider.py` | Vendor-neutral OpenAI-compatible chat client |
 | `media_intelligence.py` | ffprobe/ffmpeg/OpenCV clip analysis and optional frame vision/transcription |
+| `scene_memory.py` | Evidence-linked scene memory artifact builder |
 | `trip_story.py` | Multilingual narrative and voiceover generation |
 | `trip_renderer.py` | Lightweight video assembly from uploaded clips |
 | `tripstory_logging.py` | Structured API/worker logging helpers |
@@ -132,7 +136,7 @@ cp .env.example .env
 
 Edit `.env`, set `TRIPSTORY_LLM_PROVIDER=deepseek`, fill in `DEEPSEEK_API_KEY`, and fill in `GEMINI_API_KEY` for video-frame understanding. The API loads `.env` on startup. The frontend never receives or submits provider API keys.
 
-Story generation uses the backend provider from `.env` by default. The Plan screen shows `Story brain` as `OPENAI`, `GEMINI`, or `DEEPSEEK` when the LLM produced the voiceover and smart edit decisions; if it shows `FALLBACK`, the panel explains which provider/key setting is missing or which API error occurred.
+Story generation uses the backend provider from `.env` by default. Generated plans include a `generation` block that records whether the plan came from the configured LLM provider or the deterministic local fallback. If the UI or logs report a fallback, check the provider/key settings or the recorded fallback reason.
 
 LLM calls are serialized server-side to avoid accidental concurrent requests. Tune retry/rate behavior with:
 
@@ -143,7 +147,7 @@ TRIPSTORY_LLM_TIMEOUT=120
 TRIPSTORY_STORY_MAX_TOKENS=4096
 ```
 
-DeepSeek reasoning models can return an empty `content` field when the output budget is too small for the story-planning JSON, and can take longer than smaller chat models. Keep `TRIPSTORY_STORY_MAX_TOKENS` at `4096` or higher if the Plan screen reports an empty provider response, and keep `TRIPSTORY_LLM_TIMEOUT` around `120` seconds if DeepSeek times out.
+DeepSeek reasoning models can return an empty `content` field when the output budget is too small for the story-planning JSON, and can take longer than smaller chat models. Keep `TRIPSTORY_STORY_MAX_TOKENS` at `4096` or higher if the story job reports an empty provider response, and keep `TRIPSTORY_LLM_TIMEOUT` around `120` seconds if DeepSeek times out.
 
 Backend logs are structured as timestamped key/value JSON fields in the API and worker terminals. Optional logging controls:
 
@@ -255,12 +259,21 @@ npm run web -- --clear --port 8081
 
 Default API URL:
 
-- iOS/Web: `http://localhost:8010`
+- Local iOS/Web: `http://localhost:8010`
 - Android emulator: `http://10.0.2.2:8010`
+- Expo web on another hostname, including LAN or Tailscale: same protocol and hostname on port `8010`, for example `http://100.68.189.117:8010` when the frontend is opened at `http://100.68.189.117:8081`.
+
+If `TRIPSTORY_CORS_ORIGINS` is restricted in `.env`, add the exact frontend origin you open in the browser, such as:
+
+```bash
+TRIPSTORY_CORS_ORIGINS=https://mangasmith.com,https://www.mangasmith.com,http://100.68.189.117:8081
+```
+
+Restart the API after changing CORS settings.
 
 ## Current Output
 
-TripStory renders a stitched recap video, analyzes uploaded clips, saves the generated story plan beside it as JSON, and mixes generated narration into the video when server-side TTS is configured.
+TripStory renders a stitched recap video, analyzes uploaded clips, saves `scene_memory.json` and the generated story plan beside it as JSON, and mixes generated narration into the video when server-side TTS is configured. Source clips are listed in the Media tab; the preview player currently focuses on the final rendered video.
 
 ## Operations Notes
 
@@ -279,19 +292,20 @@ For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the proc
 ## Implemented Now
 
 - FastAPI session API with health check, session creation, context save, media upload, story generation, and render endpoints.
-- Expo mobile app for connecting to the API, uploading video files, entering trip context, choosing voiceover language, generating a story plan, and previewing the rendered output.
+- Expo mobile app for connecting to the API, uploading video files with progress feedback, entering trip context, drafting a producer brief, choosing voiceover language, generating a story plan, and previewing the rendered output.
 - Vendor-neutral LLM client with OpenAI, Gemini, DeepSeek, custom OpenAI-compatible endpoints, and a deterministic local fallback when no API key or endpoint is configured.
 - Multilingual story-plan generation contract with title, language, tone, narrative arc, voiceover script, edit notes, and clip plan.
 - Server-side Gemini or OpenAI text-to-speech narration and `ffmpeg` audio mixing under the final video when TTS is configured.
 - Clip intelligence for uploaded videos: duration, resolution, scenes, blur/quality, face hits, audio levels, best-moment timestamps, scenic candidates, optional speech transcription, and optional sampled-frame visual summaries.
+- Persisted scene memory with transcript, visual summary, evidence, narrative role candidates, energy/confidence scores, risks, and a downloadable `scene_memory.json` artifact.
 - LLM-driven smart edit planning with concrete `edit_decisions`: clip ID, source start time, duration, role, transition, caption, audio strategy, and clip-grounded reasoning for every selected segment.
-- Timeline-aligned `voiceover_segments` that pair each selected clip with a narration line, caption, start time, duration, and purpose.
-- Story-aware rendering that follows the LLM edit timeline or user timeline, trims around chosen moments, adds fades, creates a title/date card, supports portrait/landscape/square exports, and saves segment-timed SRT/VTT subtitles plus `edit_decisions.json`.
+- Separate normalized `story_beats`, `narration_lines`, and timeline-aligned `voiceover_segments` that make the generated plan inspectable and reusable.
+- Story-aware rendering that follows generated `edit_decisions`, trims around chosen moments, adds fades, creates a title/date card, supports portrait/landscape/square exports, and saves segment-timed SRT/VTT subtitles plus `edit_decisions.json`.
 - Target render duration controls for short social cuts, with the backend scaling segment durations and validating the final media length.
 - RQ + Redis queueing for story generation and rendering, with a SQLite-backed jobs table and frontend-visible job progress.
 - SQLite-backed session/project persistence with JSON backup compatibility, project listing, share tokens, and optional API token authentication.
 - Upload hardening with file type checks, upload size limits, render progress, event logs, and server-side cleanup-ready project deletion.
-- Mobile project library, favorite clip markers, timeline ordering controls, export controls, share action, and render progress display.
+- Mobile project library, favorite/exclude/reorder clip controls, scene pin/exclude controls, generated timeline timing/reorder/script editing, export controls, share action, upload progress, and render progress display.
 - Backend smoke test covering session creation, context save, upload, story generation, render, and persistence reload.
 
 ## Remaining Production Gaps
@@ -299,16 +313,16 @@ For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the proc
 - Full identity provider login, password reset, billing, teams, and production-grade role management. The MVP has owner headers and optional API token auth.
 - A fully distributed production workflow system. The MVP uses RQ + Redis locally with SQLite job state.
 - Dedicated landmark-recognition model. The MVP can use sampled-frame visual summaries and context hints, but it does not run a specialist landmark classifier.
-- Native mobile camera capture, offline/resumable uploads, drag-and-drop gestures, native share sheets, and a full nonlinear editor.
+- Native mobile camera capture, offline/resumable uploads, drag-and-drop gestures, source-clip preview before render, native share sheets, and a full nonlinear editor.
 - The older TrendFlow TikTok analysis modules are not folded into the TripStory product beyond remaining available as separate legacy modules.
 
 ## Development Roadmap
 
 1. Stabilize the TripStory MVP: keep the backend smoke flow and mobile typecheck passing, and add a small manual QA checklist for real device uploads.
 2. Upgrade persistence/auth for deployment: replace owner headers with real account sessions, add roles, and move background work to a queue.
-3. Improve rendering: add true xfade transitions, music library selection, map cards, subtitle burn-in, and a timeline preview.
+3. Improve rendering and preview: add source-clip playback before render, true xfade transitions, music library selection, map cards, subtitle burn-in, and a timeline preview.
 4. Improve narration controls: add voice selection, playback, subtitles styling, and per-language narration tuning.
 5. Improve media understanding: extract thumbnails, true landmark recognition, GPS/date metadata when available, and stronger story-aware highlight selection.
-6. Build editing controls in mobile: **[Implemented]** reorder clips, mark favorites, exclude clips, edit the script, choose tone/language, select output aspect ratio.
-7. Evaluate output: **[Implemented]** Evaluate generated narratives via the `/eval/dashboard` for narration density.
-8. Prepare for production: move long-running work to a queue, add upload limits and resumable uploads, add auth, add deployment docs, and add monitoring/logging.
+6. Build editing controls in mobile: **[Partially implemented]** mark favorites, reorder/exclude clips, pin/exclude scenes, edit generated segment scripts, adjust segment start/duration, reorder generated segments, choose tone/language, and select output aspect ratio. Still needed: source-clip playback, drag gestures, and richer timeline preview.
+7. Evaluate output: add a TripStory API evaluation endpoint or script for narration density and narrative restraint.
+8. Prepare for production: move upload analysis to a queue, add resumable uploads, add auth, add deployment docs, and add monitoring/logging.

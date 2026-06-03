@@ -9,23 +9,29 @@ export function ActionBar({
   session,
   options,
   hasScriptChanges,
+  hasTimelineChanges,
   savingScripts,
+  savingTimeline,
   onSaveContext,
   onDraftBrief,
   onGenerate,
   onRender,
   onSaveScripts,
+  onSaveTimeline,
   onShare,
 }: {
   session: TripSession;
   options: RenderOptions;
   hasScriptChanges: boolean;
+  hasTimelineChanges: boolean;
   savingScripts: boolean;
+  savingTimeline: boolean;
   onSaveContext: () => void;
   onDraftBrief: () => void;
   onGenerate: () => void;
   onRender: () => void;
   onSaveScripts: () => void;
+  onSaveTimeline: () => void;
   onShare: () => void;
 }) {
   const busy = planningPhases.includes(session.phase);
@@ -57,6 +63,17 @@ export function ActionBar({
         />
       ) : null}
 
+      {/* Timeline save */}
+      {hasTimelineChanges ? (
+        <PrimaryButton
+          icon={savingTimeline ? 'hourglass-outline' : 'time-outline'}
+          label={savingTimeline ? 'Saving...' : 'Save timeline'}
+          onPress={onSaveTimeline}
+          disabled={busy || savingTimeline}
+          tone="light"
+        />
+      ) : null}
+
       {/* Generate */}
       {hasMedia && (!hasBrief || briefApproved) ? (
         <PrimaryButton
@@ -73,7 +90,7 @@ export function ActionBar({
           icon="film-outline"
           label="Render"
           onPress={onRender}
-          disabled={busy || savingScripts || hasScriptChanges || !hasStory || !hasClips}
+          disabled={busy || savingScripts || savingTimeline || hasScriptChanges || hasTimelineChanges || !hasStory || !hasClips}
         />
       ) : null}
 

@@ -456,6 +456,9 @@ def _matching_voiceover_segments(
         matched.append(
             {
                 "segment_id": segment.get("segment_id") or decision.get("segment_id") or f"seg_{index + 1:03d}",
+                "line_id": segment.get("line_id") or f"line_{index + 1:02d}",
+                "beat_id": segment.get("beat_id") or decision.get("beat_id") or f"beat_{index + 1:02d}",
+                "scene_id": segment.get("scene_id") or decision.get("scene_id") or "",
                 "clip_id": segment.get("clip_id") or decision.get("clip_id") or item.get("id"),
                 "clip": segment.get("clip") or decision.get("clip") or item.get("filename"),
                 "window_id": segment.get("window_id") or decision.get("window_id") or "",
@@ -538,6 +541,9 @@ def _write_edit_decisions(
         payload.append(
             {
                 "segment_id": decision.get("segment_id") or voiceover.get("segment_id") or f"seg_{index + 1:03d}",
+                "beat_id": decision.get("beat_id") or voiceover.get("beat_id") or f"beat_{index + 1:02d}",
+                "scene_id": decision.get("scene_id") or voiceover.get("scene_id") or "",
+                "scene_ids": decision.get("scene_ids") or ([decision.get("scene_id")] if decision.get("scene_id") else []),
                 "window_id": decision.get("window_id") or voiceover.get("window_id") or "",
                 "source_clip_id": item.get("id"),
                 "source_clip": item.get("filename"),
@@ -569,6 +575,30 @@ def _story_plan_for_timeline(
         adjusted_decisions.append(next_decision)
     adjusted["edit_decisions"] = adjusted_decisions
     adjusted["voiceover_segments"] = _matching_voiceover_segments(story_plan, timeline)
+    adjusted["story_beats"] = [
+        {
+            "beat_id": decision.get("beat_id") or f"beat_{index + 1:02d}",
+            "purpose": decision.get("role") or "story beat",
+            "scene_ids": decision.get("scene_ids") or ([decision.get("scene_id")] if decision.get("scene_id") else []),
+            "reason": decision.get("reason") or "Selected for the render timeline.",
+            "estimated_duration_sec": _decision_duration(decision, 6.0),
+            "transition_in": "continue" if index else "cold_open",
+            "transition_out": decision.get("transition") or "cut",
+        }
+        for index, decision in enumerate(adjusted_decisions)
+    ]
+    adjusted["narration_lines"] = [
+        {
+            "line_id": segment.get("line_id") or f"line_{index + 1:02d}",
+            "beat_id": segment.get("beat_id") or f"beat_{index + 1:02d}",
+            "text": segment.get("voiceover") or "",
+            "duration_estimate_sec": segment.get("duration") or 4.0,
+            "grounded_scene_ids": [segment.get("scene_id")] if segment.get("scene_id") else [],
+            "confidence": 0.75,
+        }
+        for index, segment in enumerate(adjusted["voiceover_segments"])
+        if segment.get("voiceover")
+    ]
     adjusted["voiceover_script"] = " ".join(
         str(segment.get("voiceover") or "").strip()
         for segment in adjusted["voiceover_segments"]

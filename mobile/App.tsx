@@ -28,12 +28,13 @@ import {
   saveTripContext,
   shareSession,
   updateCreativeBrief,
+  updateTimelineSegments,
   updateProjectMetadata,
   updateVoiceoverSegments,
   uploadMedia,
 } from './src/api';
 import { colors, radii, layout } from './src/theme';
-import type { ProjectSummary, RenderOptions, TripContext, TripSession, AppView } from './src/types';
+import type { ProjectSummary, RenderOptions, TimelineSegmentUpdate, TripContext, TripSession, AppView, UploadProgress } from './src/types';
 import { PrimaryButton } from './src/components/PrimaryButton';
 import { DashboardScreen } from './src/screens/DashboardScreen';
 import { EditorScreen } from './src/screens/EditorScreen';
@@ -188,6 +189,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [creatingProject, setCreatingProject] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
 
   const refreshProjects = useCallback(async (baseUrl: string) => {
     const items = await listSessions(baseUrl);
@@ -353,22 +355,40 @@ export default function App() {
   );
 
   const onUpload = useCallback(async () => {
-    if (!session) return;
+    if (!session || uploadProgress) return;
     const result = await DocumentPicker.getDocumentAsync({
       type: 'video/*',
       copyToCacheDirectory: true,
       multiple: true,
     });
     if (result.canceled || !result.assets?.length) return;
+    const fileCount = result.assets.length;
     try {
       setError(null);
-      const updated = await uploadMedia(apiUrl, session.id, result.assets);
+      setUploadProgress({
+        phase: 'uploading',
+        fileCount,
+        loadedBytes: 0,
+        totalBytes: null,
+        percent: 0,
+      });
+      const updated = await uploadMedia(apiUrl, session.id, result.assets, (progress) => {
+        setUploadProgress({
+          phase: progress.percent !== null && progress.percent >= 100 ? 'processing' : 'uploading',
+          fileCount,
+          loadedBytes: progress.loadedBytes,
+          totalBytes: progress.totalBytes,
+          percent: progress.percent,
+        });
+      });
       setSession(updated);
       await refreshProjects(apiUrl);
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : 'Upload failed');
+    } finally {
+      setUploadProgress(null);
     }
-  }, [apiUrl, refreshProjects, session]);
+  }, [apiUrl, refreshProjects, session, uploadProgress]);
 
   const onDraftCreativeBrief = useCallback(async (context: TripContext) => {
     if (!session || planningPhases.includes(session.phase)) return;
@@ -411,11 +431,11 @@ export default function App() {
     }
   }, [apiUrl, refreshProjects, session]);
 
-  const onGenerate = useCallback(async () => {
+  const onGenerate = useCallback(async (options?: RenderOptions) => {
     if (!session || planningPhases.includes(session.phase)) return;
     try {
       setError(null);
-      const updated = await generateStory(apiUrl, session.id);
+      const updated = await generateStory(apiUrl, session.id, options);
       setSession(updated);
     } catch (generateError) {
       setError(generateError instanceof Error ? generateError.message : 'Story generation failed');
@@ -442,6 +462,19 @@ export default function App() {
       await refreshProjects(apiUrl);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Could not save segment scripts');
+      throw saveError;
+    }
+  }, [apiUrl, refreshProjects, session]);
+
+  const onSaveTimelineSegments = useCallback(async (segments: TimelineSegmentUpdate[], segmentOrder: string[]) => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await updateTimelineSegments(apiUrl, session.id, segments, segmentOrder);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save timeline edits');
       throw saveError;
     }
   }, [apiUrl, refreshProjects, session]);
@@ -532,6 +565,7 @@ export default function App() {
         <EditorScreen
           apiUrl={apiUrl}
           session={session}
+          uploadProgress={uploadProgress}
           onSaveContext={onSaveContext}
           onUpload={onUpload}
           onDraftCreativeBrief={onDraftCreativeBrief}
@@ -540,6 +574,7 @@ export default function App() {
           onGenerate={onGenerate}
           onRender={onRender}
           onSaveVoiceoverSegments={onSaveVoiceoverSegments}
+          onSaveTimelineSegments={onSaveTimelineSegments}
           onShare={onShare}
         />
       </KeyboardAvoidingView>

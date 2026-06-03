@@ -1,46 +1,143 @@
-# TripStory Core Prompts
+# TripStory Prompt Architecture
 
-This document outlines the core system prompts used in the TripStory pipeline. By separating these prompts into two distinct stages, we optimize for compute (GPU) efficiency and narrative quality.
+The product is staged. Scene understanding creates evidence-linked memory first; story planning selects beats second; narration writes from those selected beats; edit assembly maps lines back to source windows.
 
-## 1. Vision Intelligence Prompt (Scene Understanding)
-**Goal:** Run sparsely (e.g., 1 frame per detected scene cut) on a smaller, fast VLM. The output forms the `visual_evidence` in the `SCHEMA.md` manifest.
+## 1. Scene Understanding
 
-**System Prompt:**
-> You are an expert video archivist. Your job is to describe the contents of a single video frame with absolute literal accuracy.
->
-> Focus strictly on visible evidence:
-> - Who or what is the main subject?
-> - What action is happening?
-> - Where is the location (e.g., "indoors in a kitchen", "outdoors on a mountain")?
-> - What is the lighting and camera angle?
->
-> Do not invent a story, do not guess emotions unless explicitly visible (e.g., "smiling"), and do not use flowery language. Keep your description to 1-2 concise sentences.
+Goal: convert one analyzed source window into grounded scene memory.
 
----
+System constraints:
 
-## 2. Story Planner Prompt (Narration & Editing)
-**Goal:** Run on a fast, capable text-only LLM (e.g., DeepSeek, Llama 3). Takes the compiled JSON manifest and outputs the structured `story_plan`.
+- Describe only observable visual or audio evidence.
+- Prefer transcript and live audio evidence when present.
+- Mark uncertainty in `risks`; do not hide it in the summary.
+- Extract narrative usefulness, not just objects.
+- Return strict JSON only.
 
-**System Prompt:**
-> You are a senior travel film editor and story producer. Your task is to build a concise, emotionally coherent holiday recap narrative from a provided JSON manifest of raw clips.
->
-> **CRITICAL RULES:**
-> 1. **Grounding:** You must make concrete edit decisions based *only* on the observed clip evidence provided in the JSON manifest (e.g., `visual_evidence`, `quality_score`). Never invent visuals that are not in the manifest.
-> 2. **Structure:** The video must have a logical narrative arc: a strong hook, a middle that explores the context, and a concluding outro.
-> 3. **Narration Restraint:** Voiceover must be audience-facing TikTok/Reels narration. It must sound natural, human, and conversational.
->    - **DO NOT** read metadata (e.g., never say "In this high-quality clip..." or "Here we see a 5-second scene...").
->    - Keep each voiceover segment punchy: one short sentence (8-18 words) with a strong hook.
-> 4. **Mapping:** Every item in `edit_decisions` must map exactly 1:1 to an item in `voiceover_segments` via the `segment_id`.
-> 5. **Output Format:** You must return strictly valid JSON matching the provided schema, with no markdown formatting or conversational filler outside the JSON block.
+Required output shape:
 
-**User Prompt Template:**
-> **Target Language:** {language}
-> **Target Duration:** {target_seconds} seconds
->
-> **User Context:**
-> {user_context_json}
->
-> **Available Clip Manifest:**
-> {clip_manifest_json}
->
-> Generate the story plan JSON now.
+```json
+{
+  "scene_id": "string",
+  "who_is_present": ["string"],
+  "what_is_happening": "string",
+  "where_it_happens": "string",
+  "what_is_said": "string",
+  "tone": "string",
+  "narrative_role_candidates": ["hook", "setup", "progression", "payoff", "b_roll"],
+  "ambient_audio_should_be_preserved": true,
+  "evidence": [
+    {"type": "transcript", "value": "string"},
+    {"type": "visual", "value": "string"}
+  ],
+  "risks": ["string"]
+}
+```
+
+Current implementation note: `scene_memory.py` builds the canonical local scene-memory artifact from `media_intelligence.py` analysis and smart windows. External VLM output enriches the same fields when configured.
+
+## 2. Story Planner
+
+Goal: choose the smallest useful set of scenes for the target duration before narration is written.
+
+System constraints:
+
+- `scene_memories` is the primary source of truth.
+- Use `smart_windows` only to map selected scenes to source timestamps.
+- Honor `pinned_favorite_clip_ids` and `pinned_scene_ids` when present.
+- Avoid `excluded_clip_ids` and `excluded_scene_ids` unless every available option was excluded.
+- Prefer transition quality and story clarity over exhaustive coverage.
+- Return strict JSON only.
+
+Planner output:
+
+```json
+{
+  "story_beats": [
+    {
+      "beat_id": "beat_01",
+      "purpose": "hook",
+      "scene_ids": ["clip1_scene_001"],
+      "reason": "clear arrival energy and grounded transcript",
+      "estimated_duration_sec": 5,
+      "transition_in": "cold_open",
+      "transition_out": "move_into_setup"
+    }
+  ],
+  "excluded_scenes": [
+    {
+      "scene_id": "clip3_scene_001",
+      "reason": "redundant with a stronger market scene"
+    }
+  ],
+  "risk_notes": ["clip2 has useful ambience but weak visual confidence"]
+}
+```
+
+## 3. Narration Writer
+
+Goal: write sparse creator-style voiceover from selected beats only.
+
+System constraints:
+
+- Use only evidence from selected `story_beats` and their grounded scenes.
+- Do not narrate every visual detail.
+- Keep each line short and spoken.
+- Do not include timestamps, filenames, scene counts, face counts, resolution, or quality labels in audience-facing text.
+- Use soft language when evidence is uncertain.
+- Avoid documentary tone unless requested.
+
+Writer output:
+
+```json
+{
+  "narration_lines": [
+    {
+      "line_id": "line_01",
+      "beat_id": "beat_01",
+      "text": "We finally got there, and the whole place was already buzzing.",
+      "duration_estimate_sec": 4,
+      "grounded_scene_ids": ["clip1_scene_001"],
+      "confidence": 0.84
+    }
+  ],
+  "voiceover_script": "We finally got there, and the whole place was already buzzing."
+}
+```
+
+## 4. Edit Assembly
+
+Goal: map narration lines to source clip windows.
+
+System constraints:
+
+- Prefer the selected scene's `source_window_id`.
+- Preserve useful live audio under narration.
+- Avoid rapid overcutting unless the selected style demands it.
+- Keep `edit_decisions` and `voiceover_segments` aligned by `segment_id`.
+
+Output shape:
+
+```json
+{
+  "edit_decisions": [
+    {
+      "segment_id": "seg_001",
+      "beat_id": "beat_01",
+      "scene_id": "clip1_scene_001",
+      "clip_id": "clip1",
+      "clip": "market.mp4",
+      "window_id": "win_001",
+      "start_time": 2,
+      "duration": 5,
+      "role": "hook",
+      "reason": "the pinned scene has the clearest market arrival energy",
+      "transition": "hard_cut",
+      "caption": "Bangkok market",
+      "audio_strategy": "duck original ambience under narration"
+    }
+  ]
+}
+```
+
+Current implementation note: `trip_story.py` asks a text model for `story_beats`, `narration_lines`, `voiceover_segments`, and `edit_decisions` in one JSON response for MVP latency, but it stores and normalizes them as separate inspectable layers.

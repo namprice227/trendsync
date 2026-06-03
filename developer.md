@@ -6,13 +6,14 @@ This document explains how the current TripStory workflow works, where each piec
 
 TripStory turns uploaded trip videos into a short social recap:
 
-1. User enters trip context.
-2. User uploads raw video clips.
-3. Backend analyzes clips.
-4. Gemini vision summarizes sampled video frames.
-5. DeepSeek writes the story plan, edit decisions, and voiceover segments.
-6. Renderer trims clips, orders them, writes captions, optionally generates narration, and exports the final video.
-7. Expo web/mobile app displays the plan and final output.
+1. User creates or opens a project.
+2. User uploads raw video clips. The frontend shows browser upload progress in the Media tab.
+3. Backend saves and analyzes clips before returning them to the project.
+4. Gemini vision can summarize sampled video frames when configured.
+5. User enters trip context and can optionally draft/approve an AI producer brief.
+6. DeepSeek or another configured LLM writes the story plan, edit decisions, and voiceover segments.
+7. Renderer trims clips from generated edit decisions, writes captions, optionally generates narration, and exports the final video.
+8. Expo web/mobile app displays source media, generated plan, editable segment scripts, and final output.
 
 The intended split is:
 
@@ -88,7 +89,10 @@ The API and worker intentionally share the same SQLite database. The API creates
 stateDiagram-v2
     [*] --> collecting_context
     collecting_context --> uploading: user uploads clips
-    uploading --> planning: generate story
+    collecting_context --> ready_to_plan: context saved after media exists
+    uploading --> collecting_context: upload analyzed, missing destination
+    uploading --> ready_to_plan: upload analyzed, destination exists
+    ready_to_plan --> planning: generate story
     planning --> ready_to_render: story job succeeds
     planning --> error: story job fails/stales
     ready_to_render --> rendering: render video
@@ -106,9 +110,9 @@ stateDiagram-v2
     queued --> analyzing: worker starts story job
     queued --> preparing: worker starts render job
     analyzing --> planning
-    planning --> completed
+    planning --> complete
     preparing --> rendering
-    rendering --> completed
+    rendering --> complete
     queued --> failed
     analyzing --> failed
     planning --> failed
@@ -235,7 +239,7 @@ sequenceDiagram
     Redis->>W: deliver job
     W->>DB: attempts += 1, state=analyzing/preparing
     W->>DB: job_progress updates
-    W->>DB: state=completed or failed
+    W->>DB: state=complete or failed
     UI->>API: GET /sessions/{id}
     API-->>UI: active job fields + session phase/screen/progress
 ```
@@ -271,6 +275,12 @@ Important: API keys are never accepted from the frontend. Keys only come from se
 
 Upload is handled in `api_server.py`.
 
+The active frontend upload path is:
+
+- `mobile/App.tsx` opens `expo-document-picker`.
+- `mobile/src/api.ts` sends the multipart upload with `XMLHttpRequest` when available so the browser can report upload bytes.
+- `mobile/src/components/SidebarMediaTab.tsx` shows percent/byte progress while bytes are being sent, then a processing state while the API saves and analyzes clips.
+
 Allowed video suffixes:
 
 - `.mp4`
@@ -284,6 +294,8 @@ For every uploaded video:
 2. Size and type are checked.
 3. `analyze_clip()` in `media_intelligence.py` runs.
 4. Analysis is stored on the media item and copied into `clip_analysis`.
+
+The API response only adds clips to `media_items` after analysis finishes. In the UI those clips are source media only. The edit timeline remains empty until story generation produces `story_plan.edit_decisions`.
 
 ### 4. Clip Intelligence
 
@@ -339,9 +351,19 @@ If vision fails, the backend falls back to heuristic summaries. The app should s
 
 ### 5. Story Planning
 
-Story planning is in `trip_story.py`.
+Story planning is in `trip_story.py`, with scene memory built in `scene_memory.py`.
 
-The backend does not send raw `analysis` objects to DeepSeek. It first builds a compact `clip_manifest`.
+The backend does not send raw `analysis` objects to DeepSeek. It first builds persisted scene memory and compact planner inputs:
+
+- `scene_memories`: evidence-linked scene objects with transcript, visual summary, time range, role candidates, story energy, confidence, and risks.
+- `clip_manifest`: compact clip-level context.
+- `smart_windows`: source-window timing and visual evidence for edit assembly.
+
+The full scene memory artifact is saved as:
+
+```text
+trip_sessions/<session_id>/scene_memory.json
+```
 
 Manifest example:
 
@@ -349,7 +371,7 @@ Manifest example:
 [Clip clip1] 12s | snowy mountain trail with friends nearby | people:visible | motion:high | audio:ambient | best:4.2s,8.8s
 ```
 
-The manifest keeps the information DeepSeek needs for planning:
+The compact manifest keeps supporting information the planner needs:
 
 - clip id
 - duration
@@ -370,7 +392,7 @@ The manifest intentionally drops high-token or low-value fields:
 - full transcripts
 - detector implementation details
 
-This is the main token-control layer. If story generation starts getting expensive again, inspect `_clip_manifest_line()` before changing the model prompt.
+Scene memory is the main story-control layer; compact manifests are the token-control layer. If story generation starts getting expensive again, inspect `compact_scene_manifest()` and `_clip_manifest_line()` before changing the model prompt.
 
 The LLM is asked to return strict JSON:
 
@@ -378,16 +400,41 @@ The LLM is asked to return strict JSON:
 - `language`
 - `tone`
 - `narrative_arc`
+- `story_beats`
+- `narration_lines`
 - `voiceover_script`
 - `voiceover_segments`
 - `edit_notes`
 - `clip_plan`
 - `edit_decisions`
 
+`story_beats` are the selected moment plan. Each item should include:
+
+- `beat_id`
+- `purpose`
+- `scene_ids`
+- `reason`
+- `estimated_duration_sec`
+- `transition_in`
+- `transition_out`
+
+`narration_lines` are the writer output. Each item should include:
+
+- `line_id`
+- `beat_id`
+- `text`
+- `duration_estimate_sec`
+- `grounded_scene_ids`
+- `confidence`
+
 `edit_decisions` are the editor-facing timeline. Each item should include:
 
+- `segment_id`
+- `beat_id`
+- `scene_id`
 - `clip_id`
 - `clip`
+- `window_id`
 - `start_time`
 - `duration`
 - `role`
@@ -398,8 +445,13 @@ The LLM is asked to return strict JSON:
 
 `voiceover_segments` are audience-facing narration. They must align with `edit_decisions`. Each item should include:
 
+- `segment_id`
+- `line_id`
+- `beat_id`
+- `scene_id`
 - `clip_id`
 - `clip`
+- `window_id`
 - `start_time`
 - `duration`
 - `voiceover`
@@ -407,6 +459,15 @@ The LLM is asked to return strict JSON:
 - `purpose`
 
 The backend normalizes malformed model output. If the model returns strings where arrays are expected, or wrong types for durations, the normalizer repairs those into stable shapes.
+
+Regeneration controls flow through `RenderRequest`:
+
+- `favorite_clip_ids`
+- `excluded_clip_ids`
+- `pinned_scene_ids`
+- `excluded_scene_ids`
+
+Excluded clips/scenes are filtered out before the planner call unless every available option was excluded. Pinned clip and scene IDs are still sent as explicit planner constraints.
 
 ### 6. Voiceover Cleanup
 
@@ -514,27 +575,44 @@ Common output files:
 
 ### 9. Frontend
 
-The Expo app in `mobile/App.tsx` has four main screens:
+The active Expo app in `mobile/App.tsx` has two top-level views:
 
-- Context
-- Upload/media
-- Plan
-- Output
+- Dashboard: project library, search/filter/sort, rename, duplicate, share, delete, and new project.
+- Project editor: top bar, left sidebar, center preview, generated timeline strip, and right properties/action panel.
 
-The UI shows:
+The editor sidebar has these tabs:
+
+- Media: source clips, favorite markers, upload action, upload progress.
+- Story: generated title, narrative arc, edit notes, and provider/fallback badge.
+- Intel: clip intelligence and visual analysis summaries.
+- Brief: AI producer brief drafting, answers, approval, and story generation.
+
+The right properties panel has these tabs:
+
+- Context: trip context, language, and provider/model override.
+- Export: target duration, aspect ratio, title card, subtitle files.
+- Script: full generated voiceover script.
+
+The generated timeline strip only shows `story_plan.edit_decisions`. Uploaded clips do not appear there before story generation.
+
+The UI also shows:
 
 - API connection field
 - project library
 - trip context form
 - language and provider picker
 - upload action
+- upload progress
 - clip intelligence
-- story brain/provider status
+- story/provider fallback status
 - generated voiceover
 - narrative arc
 - smart edit decisions
-- timeline/export controls
+- generated segment script editing
+- export controls
 - rendered video preview
+
+Source clips are currently listed in Media but are not yet playable in the main preview before render.
 
 The frontend never sees provider API keys.
 
@@ -565,6 +643,16 @@ cd mobile
 npm run web -- --clear --port 8081
 ```
 
+On Expo web, `defaultApiUrl()` points to the same browser hostname on port `8010`. If the browser is opened through LAN or Tailscale, for example `http://100.68.189.117:8081`, the API URL becomes `http://100.68.189.117:8010`.
+
+If `.env` restricts CORS, `TRIPSTORY_CORS_ORIGINS` must include the exact frontend origin:
+
+```bash
+TRIPSTORY_CORS_ORIGINS=https://mangasmith.com,https://www.mangasmith.com,http://100.68.189.117:8081
+```
+
+Restart the API after changing `.env`.
+
 Tests:
 
 ```bash
@@ -579,15 +667,18 @@ npm run typecheck
 - DeepSeek/Gemini provider split.
 - Gemini frame summaries feed DeepSeek story planning.
 - Fast heuristic preprocessing merges low-value scenes to optimize VLM budgets.
+- Persisted scene memory separates grounding evidence from planning/writing outputs.
 - Fallback path works without external LLM.
 - LLM output normalization prevents many blank-page crashes.
 - Voiceover metadata cleanup prevents technical narration.
 - Timeline-aligned voiceover segments and captions.
-- Explicit editing controls via "favorite" (pinned) and "excluded" clips.
-- Render follows planned clip order/start/duration.
-- Built-in Eval Dashboard metrics for checking narrative restraint.
+- Favorite/excluded clip markers and scene pin/exclude controls feed planning/render options.
+- Generated timeline segment editing for narration, captions, order, source start, and duration.
+- Render follows generated clip order/start/duration from `edit_decisions`.
+- Evaluation plan and legacy evaluator helpers for checking narrative restraint.
 - Story generation and rendering run through RQ + Redis jobs.
 - Public sessions expose active job progress.
+- Frontend upload progress distinguishes byte upload from server-side processing.
 - Session persistence survives API restart.
 
 ## Current Limitations
@@ -603,8 +694,11 @@ npm run typecheck
 - No dedicated landmark classifier.
 - No music library or beat-sync editing.
 - No waveform view or visual timeline editor.
+- No source-clip playback in the main preview before render.
+- Source clip reorder/exclude and scene pin/exclude controls are exposed in the active editor, and generated segments can be reordered or trimmed with timeline controls. Drag gestures and source preview are still missing.
 - Render transitions are simple fades, not full nonlinear editing.
 - Long uploads are not resumable.
+- Upload analysis still runs in the API request path before the upload response completes.
 - The mobile app is Expo web/mobile, not a polished native editor yet.
 
 ## Good Next Improvements
@@ -644,7 +738,8 @@ npm run typecheck
 ### Better UX
 
 - Add thumbnails to clip cards.
-- Let user reorder clips with drag/drop.
+- Add source-clip playback in the preview before render.
+- Let user reorder generated segments with drag/drop.
 - Let user regenerate only one segment.
 - Show why a clip was selected.
 - Show whether Gemini vision, heuristic analysis, or fallback was used.
@@ -652,6 +747,7 @@ npm run typecheck
 
 ### Better Production Architecture
 
+- Move upload analysis from the API request path into queued worker jobs.
 - Move from local RQ to a deployment-grade queue/worker setup when scaling beyond one machine.
 - Replace JSON-in-SQLite session storage with relational tables for sessions, media items, story plans, jobs, and render artifacts.
 - Add deeper render/job substates if local ASR/VLM/TTS are added.
@@ -710,7 +806,7 @@ timeout 20 .conda/trendsync-py312/bin/ffmpeg -nostdin -hide_banner -i trip_sessi
 - Renderer ffmpeg commands should also include `-nostdin`, `stdin=DEVNULL`, and `TRIPSTORY_FFMPEG_RENDER_TIMEOUT`; narration mixing uses `TRIPSTORY_FFMPEG_AUDIO_MIX_TIMEOUT`.
 - Bad source video timestamps can produce warnings like `non monotonically increasing dts`; using `-vn` avoids decoding the video stream during audio-level probing.
 
-If the Plan screen shows `FALLBACK`:
+If the Story tab provider badge shows `FALLBACK`, or logs say the story plan used local fallback:
 
 - Check `TRIPSTORY_LLM_PROVIDER`.
 - Check `DEEPSEEK_API_KEY`.
@@ -740,6 +836,13 @@ If the web page is blank:
 - Check browser console.
 - Check API URL in the top bar.
 - Restart Expo with `npm run web -- --clear --port 8081`.
+
+If browser fetches fail with CORS errors:
+
+- Check the frontend origin in the browser address bar, including port.
+- Add that exact origin to `TRIPSTORY_CORS_ORIGINS`.
+- Restart the API so `api_server.py` reloads `.env`.
+- Verify with `curl -i -H 'Origin: <frontend-origin>' http://<api-host>:8010/sessions`.
 
 If backend tests call real APIs:
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from llm_provider import LLMProvider
 from media_intelligence import analyze_clip, vision_semantics_source
+from scene_memory import build_scene_memories
 from trip_renderer import render_trip_video
 from trip_story import generate_creative_brief, generate_trip_story
 from tripstory_logging import configure_logging, get_logger, http_request_logging_enabled, log_event
@@ -325,6 +326,8 @@ class RenderRequest(BaseModel):
     clip_order: list[str] = Field(default_factory=list)
     favorite_clip_ids: list[str] = Field(default_factory=list)
     excluded_clip_ids: list[str] = Field(default_factory=list)
+    pinned_scene_ids: list[str] = Field(default_factory=list)
+    excluded_scene_ids: list[str] = Field(default_factory=list)
     burn_captions: bool = False
     include_title_card: bool = True
     include_music_bed: bool = False
@@ -342,6 +345,17 @@ class VoiceoverSegmentUpdate(BaseModel):
 
 class VoiceoverSegmentsPatchRequest(BaseModel):
     segments: list[VoiceoverSegmentUpdate] = Field(..., min_length=1, max_length=100)
+
+
+class TimelineSegmentUpdate(BaseModel):
+    segment_id: str = Field(..., min_length=1, max_length=80)
+    start_time: float = Field(..., ge=0, le=86400)
+    duration: float = Field(..., ge=1, le=10)
+
+
+class TimelinePatchRequest(BaseModel):
+    segments: list[TimelineSegmentUpdate] = Field(..., min_length=1, max_length=100)
+    segment_order: list[str] = Field(default_factory=list, max_length=100)
 
 
 class CreativeBriefAnswer(BaseModel):
@@ -403,6 +417,7 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
         "media_items": [],
         "recorded_clips": [],
         "clip_analysis": [],
+        "scene_memories": [],
         "creative_brief": None,
         "creative_brief_status": None,
         "creative_brief_answers": {},
@@ -411,6 +426,7 @@ def _default_session(session_id: str | None = None) -> dict[str, Any]:
         "script": None,
         "final_video_url": None,
         "voiceover_audio_url": None,
+        "scene_memory_url": None,
         "story_json_url": None,
         "edit_decisions_url": None,
         "caption_srt_url": None,
@@ -441,6 +457,7 @@ def _normalize_session(raw: dict[str, Any]) -> dict[str, Any]:
     session["media_items"] = list(raw.get("media_items") or [])
     session["recorded_clips"] = list(raw.get("recorded_clips") or [])
     session["clip_analysis"] = list(raw.get("clip_analysis") or [])
+    session["scene_memories"] = list(raw.get("scene_memories") or [])
     session["creative_brief"] = raw.get("creative_brief") if isinstance(raw.get("creative_brief"), dict) else None
     status = raw.get("creative_brief_status")
     session["creative_brief_status"] = status if status in {"draft", "approved", "stale"} else None
@@ -576,6 +593,17 @@ def _safe_name(name: str, fallback: str) -> str:
 
 def _public_url(session_id: str, path: str | Path) -> str:
     return f"/files/{session_id}/{Path(path).name}"
+
+
+def _scene_memory_artifact_path(session_id: str) -> Path:
+    return _session_dir(session_id) / "scene_memory.json"
+
+
+def _build_scene_memory_artifact(session_id: str, media_items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    scene_memories = build_scene_memories(media_items, project_id=session_id)
+    path = _scene_memory_artifact_path(session_id)
+    path.write_text(json.dumps(scene_memories, ensure_ascii=False, indent=2), encoding="utf-8")
+    return scene_memories, _public_url(session_id, path)
 
 
 def _project_destination(session: dict[str, Any]) -> str:
@@ -860,6 +888,8 @@ def _ensure_story_segment_ids(story_plan: dict[str, Any]) -> dict[str, Any]:
 
     for index, decision in enumerate(edit_decisions):
         decision["segment_id"] = str(decision.get("segment_id") or _stable_segment_id(index))
+        decision["beat_id"] = str(decision.get("beat_id") or f"beat_{index + 1:02d}")
+        decision["scene_id"] = str(decision.get("scene_id") or "")
         decision["window_id"] = str(decision.get("window_id") or "")
 
     segments_by_id = {
@@ -875,6 +905,9 @@ def _ensure_story_segment_ids(story_plan: dict[str, Any]) -> dict[str, Any]:
             segment = voiceover_segments[index]
         segment = dict(segment or {})
         segment["segment_id"] = segment_id
+        segment["line_id"] = segment.get("line_id") or f"line_{index + 1:02d}"
+        segment["beat_id"] = segment.get("beat_id") or decision.get("beat_id") or f"beat_{index + 1:02d}"
+        segment["scene_id"] = segment.get("scene_id") or decision.get("scene_id") or ""
         segment["clip_id"] = segment.get("clip_id") or decision.get("clip_id")
         segment["clip"] = segment.get("clip") or decision.get("clip")
         segment["window_id"] = segment.get("window_id") or decision.get("window_id") or ""
@@ -888,11 +921,38 @@ def _ensure_story_segment_ids(story_plan: dict[str, Any]) -> dict[str, Any]:
     if not edit_decisions:
         for index, segment in enumerate(voiceover_segments):
             segment["segment_id"] = str(segment.get("segment_id") or _stable_segment_id(index))
+            segment["line_id"] = segment.get("line_id") or f"line_{index + 1:02d}"
+            segment["beat_id"] = segment.get("beat_id") or f"beat_{index + 1:02d}"
+            segment["scene_id"] = str(segment.get("scene_id") or "")
             segment["window_id"] = str(segment.get("window_id") or "")
             aligned_segments.append(segment)
 
     plan["edit_decisions"] = edit_decisions
     plan["voiceover_segments"] = aligned_segments or voiceover_segments
+    plan["story_beats"] = plan.get("story_beats") or [
+        {
+            "beat_id": decision.get("beat_id") or f"beat_{index + 1:02d}",
+            "purpose": decision.get("role") or "story beat",
+            "scene_ids": decision.get("scene_ids") or ([decision.get("scene_id")] if decision.get("scene_id") else []),
+            "reason": decision.get("reason") or "Selected by the story planner.",
+            "estimated_duration_sec": decision.get("duration") or 5.5,
+            "transition_in": "continue" if index else "cold_open",
+            "transition_out": decision.get("transition") or "cut",
+        }
+        for index, decision in enumerate(edit_decisions)
+    ]
+    plan["narration_lines"] = [
+        {
+            "line_id": segment.get("line_id") or f"line_{index + 1:02d}",
+            "beat_id": segment.get("beat_id") or f"beat_{index + 1:02d}",
+            "text": segment.get("voiceover") or "",
+            "duration_estimate_sec": segment.get("duration") or 4.0,
+            "grounded_scene_ids": [segment.get("scene_id")] if segment.get("scene_id") else [],
+            "confidence": 0.75,
+        }
+        for index, segment in enumerate(plan["voiceover_segments"])
+        if segment.get("voiceover")
+    ]
     plan["voiceover_script"] = " ".join(
         str(segment.get("voiceover") or "").strip()
         for segment in plan["voiceover_segments"]
@@ -1014,19 +1074,22 @@ def _duplicate_session(source_session_id: str, owner_id: str) -> dict[str, Any]:
 
     source_title = _project_title(source)
     duplicate_title = f"{source_title} copy"[:200]
+    duplicate_media_items = _rewrite_duplicate_asset_refs(
+        copy.deepcopy(source.get("media_items") or []),
+        source_session_id,
+        duplicate_id,
+        source_dir,
+        duplicate_dir,
+    )
+    duplicate_scene_memories, duplicate_scene_memory_url = _build_scene_memory_artifact(duplicate_id, duplicate_media_items)
+
     duplicate.update(
         owner_id=owner_id,
         created_at=now,
         updated_at=now,
         metadata={"title": duplicate_title},
         trip_context=copy.deepcopy(source.get("trip_context") or _default_context()),
-        media_items=_rewrite_duplicate_asset_refs(
-            copy.deepcopy(source.get("media_items") or []),
-            source_session_id,
-            duplicate_id,
-            source_dir,
-            duplicate_dir,
-        ),
+        media_items=duplicate_media_items,
         recorded_clips=_rewrite_duplicate_asset_refs(
             copy.deepcopy(source.get("recorded_clips") or []),
             source_session_id,
@@ -1035,6 +1098,7 @@ def _duplicate_session(source_session_id: str, owner_id: str) -> dict[str, Any]:
             duplicate_dir,
         ),
         clip_analysis=copy.deepcopy(source.get("clip_analysis") or []),
+        scene_memories=duplicate_scene_memories,
         creative_brief=copy.deepcopy(source.get("creative_brief")),
         creative_brief_status=source.get("creative_brief_status"),
         creative_brief_answers=copy.deepcopy(source.get("creative_brief_answers") or {}),
@@ -1043,6 +1107,7 @@ def _duplicate_session(source_session_id: str, owner_id: str) -> dict[str, Any]:
         script=source.get("script"),
         final_video_url=_rewrite_duplicate_asset_refs(source.get("final_video_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
         voiceover_audio_url=_rewrite_duplicate_asset_refs(source.get("voiceover_audio_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
+        scene_memory_url=duplicate_scene_memory_url,
         story_json_url=_rewrite_duplicate_asset_refs(source.get("story_json_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
         edit_decisions_url=_rewrite_duplicate_asset_refs(source.get("edit_decisions_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
         caption_srt_url=_rewrite_duplicate_asset_refs(source.get("caption_srt_url"), source_session_id, duplicate_id, source_dir, duplicate_dir),
@@ -1099,10 +1164,13 @@ def _ensure_current_clip_analysis(session_id: str, media_items: list[dict[str, A
         )
         refreshed = True
     if refreshed:
+        scene_memories, scene_memory_url = _build_scene_memory_artifact(session_id, media_items)
         _update_session(
             session_id,
             media_items=media_items,
             clip_analysis=[item["analysis"] for item in media_items if item.get("analysis")],
+            scene_memories=scene_memories,
+            scene_memory_url=scene_memory_url,
         )
     return media_items
 
@@ -1120,6 +1188,11 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
         context = dict(session.get("trip_context") or {})
         render_options = dict(session.get("render_options") or RenderRequest().model_dump())
         media_items = _ensure_current_clip_analysis(session_id, media_items, context)
+        session = _public_session(session_id)
+        scene_memories = list(session.get("scene_memories") or [])
+        if not scene_memories:
+            scene_memories, scene_memory_url = _build_scene_memory_artifact(session_id, media_items)
+            _update_session(session_id, scene_memories=scene_memories, scene_memory_url=scene_memory_url)
         selected_provider = (context.get("llm_provider") or "").strip().lower()
         provider_name = selected_provider if selected_provider and selected_provider != "local" else None
         provider = LLMProvider(
@@ -1144,7 +1217,14 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
             _job_progress(job_id, session_id, "planning", f"Using local fallback because {provider.provider} is not configured", 45)
             _event(session_id, f"Using local fallback because {provider.provider} is not configured", 45, level="warning")
         creative_brief = session.get("creative_brief") if session.get("creative_brief_status") == "approved" else None
-        plan = generate_trip_story(context, media_items, provider, render_options=render_options, creative_brief=creative_brief)
+        plan = generate_trip_story(
+            context,
+            media_items,
+            provider,
+            render_options=render_options,
+            creative_brief=creative_brief,
+            scene_memories=scene_memories,
+        )
         generation = plan.get("generation") or {}
         _event(
             session_id,
@@ -1159,6 +1239,7 @@ def _generate_story_background(session_id: str, job_id: str | None = None) -> No
             next_action="Review the voiceover and render the recap video.",
             story_plan=plan,
             script=plan.get("voiceover_script"),
+            scene_memories=scene_memories,
             llm_model=provider.model,
             llm_provider=provider.provider,
             progress_percent=100,
@@ -1242,8 +1323,19 @@ def _render_background(session_id: str, job_id: str | None = None) -> None:
             provider_name = selected_provider if selected_provider and selected_provider != "local" else None
             provider = LLMProvider(provider=provider_name, model=context.get("llm_model") or None)
             media_items_for_plan = _ensure_current_clip_analysis(session_id, list(session.get("media_items") or []), context)
+            scene_memories = list(_public_session(session_id).get("scene_memories") or [])
+            if not scene_memories:
+                scene_memories, scene_memory_url = _build_scene_memory_artifact(session_id, media_items_for_plan)
+                _update_session(session_id, scene_memories=scene_memories, scene_memory_url=scene_memory_url)
             creative_brief = session.get("creative_brief") if session.get("creative_brief_status") == "approved" else None
-            story_plan = generate_trip_story(context, media_items_for_plan, provider, render_options=render_options, creative_brief=creative_brief)
+            story_plan = generate_trip_story(
+                context,
+                media_items_for_plan,
+                provider,
+                render_options=render_options,
+                creative_brief=creative_brief,
+                scene_memories=scene_memories,
+            )
             _update_session(session_id, story_plan=story_plan, script=story_plan.get("voiceover_script"))
         timeline_decisions = story_plan.get("edit_decisions") or []
         log_event(
@@ -1595,6 +1687,7 @@ async def upload_media(
             clips.append(str(target))
 
     clip_analysis = [item["analysis"] for item in media_items if item.get("analysis")]
+    scene_memories, scene_memory_url = _build_scene_memory_artifact(session_id, media_items)
     phase = "ready_to_plan" if context.get("destination") else "collecting_context"
     session_updates = {
         "phase": phase,
@@ -1603,6 +1696,8 @@ async def upload_media(
         "media_items": media_items,
         "recorded_clips": clips,
         "clip_analysis": clip_analysis,
+        "scene_memories": scene_memories,
+        "scene_memory_url": scene_memory_url,
         "error": None,
     }
     session_updates.update(_creative_brief_stale_updates(session))
@@ -1612,6 +1707,7 @@ async def upload_media(
 @app.post("/sessions/{session_id}/generate-story")
 def generate_story(
     session_id: str,
+    request: RenderRequest | None = None,
     auth: dict[str, str] = Depends(_auth_context),
 ) -> dict[str, Any]:
     session = _public_session(session_id)
@@ -1620,6 +1716,8 @@ def generate_story(
         raise HTTPException(status_code=409, detail="Upload media before generating the story.")
     if session.get("creative_brief") and session.get("creative_brief_status") != "approved":
         raise HTTPException(status_code=409, detail="Approve or refresh the producer brief before generating the story.")
+    if request is not None:
+        _update_session(session_id, render_options=request.model_dump())
     _update_session(
         session_id,
         phase="planning",
@@ -1682,6 +1780,18 @@ def update_voiceover_segments(
 
     plan["voiceover_segments"] = edited_segments
     plan["edit_decisions"] = edited_decisions
+    plan["narration_lines"] = [
+        {
+            "line_id": segment.get("line_id") or f"line_{index + 1:02d}",
+            "beat_id": segment.get("beat_id") or f"beat_{index + 1:02d}",
+            "text": segment.get("voiceover") or "",
+            "duration_estimate_sec": segment.get("duration") or 4.0,
+            "grounded_scene_ids": [segment.get("scene_id")] if segment.get("scene_id") else [],
+            "confidence": 0.75,
+        }
+        for index, segment in enumerate(edited_segments)
+        if segment.get("voiceover")
+    ]
     plan["voiceover_script"] = " ".join(
         str(segment.get("voiceover") or "").strip()
         for segment in edited_segments
@@ -1716,6 +1826,166 @@ def update_voiceover_segments(
         segment_count=len(request.segments),
         stale_render=stale_render,
         stage="story_review",
+        outcome="success",
+    )
+    return _public_session(updated["id"])
+
+
+@app.patch("/sessions/{session_id}/timeline")
+def update_timeline_segments(
+    session_id: str,
+    request: TimelinePatchRequest,
+    auth: dict[str, str] = Depends(_auth_context),
+) -> dict[str, Any]:
+    session = _public_session(session_id)
+    _ensure_owner(session, _owner_from_auth(auth))
+    if session.get("phase") in {"planning", "rendering"}:
+        raise HTTPException(status_code=409, detail="Wait for the current job to finish before editing the timeline.")
+    story_plan = session.get("story_plan")
+    if not isinstance(story_plan, dict):
+        raise HTTPException(status_code=409, detail="Generate a narrative plan before editing the timeline.")
+
+    plan = _ensure_story_segment_ids(story_plan)
+    edit_decisions = [
+        dict(item)
+        for item in (plan.get("edit_decisions") or [])
+        if isinstance(item, dict)
+    ]
+    voiceover_segments = [
+        dict(item)
+        for item in (plan.get("voiceover_segments") or [])
+        if isinstance(item, dict)
+    ]
+    existing_ids = [
+        str(decision.get("segment_id"))
+        for decision in edit_decisions
+        if decision.get("segment_id")
+    ]
+    update_map = {item.segment_id: item for item in request.segments}
+    unknown_ids = sorted(set(update_map) - set(existing_ids))
+    if unknown_ids:
+        raise HTTPException(status_code=422, detail=f"Unknown segment_id: {', '.join(unknown_ids)}")
+
+    order = [str(item).strip() for item in request.segment_order if str(item).strip()]
+    if order:
+        if len(order) != len(set(order)):
+            raise HTTPException(status_code=422, detail="segment_order contains duplicate segment_id values.")
+        missing = sorted(set(existing_ids) - set(order))
+        extra = sorted(set(order) - set(existing_ids))
+        if missing or extra:
+            detail = []
+            if missing:
+                detail.append(f"missing: {', '.join(missing)}")
+            if extra:
+                detail.append(f"unknown: {', '.join(extra)}")
+            raise HTTPException(status_code=422, detail=f"segment_order must include each timeline segment exactly once ({'; '.join(detail)}).")
+    else:
+        order = existing_ids
+
+    decisions_by_id = {
+        str(decision.get("segment_id")): decision
+        for decision in edit_decisions
+        if decision.get("segment_id")
+    }
+    segments_by_id = {
+        str(segment.get("segment_id")): segment
+        for segment in voiceover_segments
+        if segment.get("segment_id")
+    }
+    beats_by_id = {
+        str(beat.get("beat_id")): beat
+        for beat in (plan.get("story_beats") or [])
+        if isinstance(beat, dict) and beat.get("beat_id")
+    }
+
+    edited_decisions: list[dict[str, Any]] = []
+    edited_segments: list[dict[str, Any]] = []
+    for index, segment_id in enumerate(order):
+        decision = dict(decisions_by_id[segment_id])
+        segment = dict(segments_by_id.get(segment_id) or {})
+        update = update_map.get(segment_id)
+        if update:
+            decision["start_time"] = round(float(update.start_time), 2)
+            decision["duration"] = round(float(update.duration), 2)
+        segment["segment_id"] = segment_id
+        segment["line_id"] = segment.get("line_id") or f"line_{index + 1:02d}"
+        segment["beat_id"] = segment.get("beat_id") or decision.get("beat_id") or f"beat_{index + 1:02d}"
+        segment["scene_id"] = segment.get("scene_id") or decision.get("scene_id") or ""
+        segment["clip_id"] = segment.get("clip_id") or decision.get("clip_id")
+        segment["clip"] = segment.get("clip") or decision.get("clip")
+        segment["window_id"] = segment.get("window_id") or decision.get("window_id") or ""
+        segment["start_time"] = decision.get("start_time", segment.get("start_time", 0.0))
+        segment["duration"] = decision.get("duration", segment.get("duration", 0.0))
+        segment["voiceover"] = segment.get("voiceover") or decision.get("caption") or ""
+        segment["caption"] = segment.get("caption") or decision.get("caption") or segment.get("voiceover") or ""
+        segment["purpose"] = segment.get("purpose") or decision.get("role") or "story beat"
+        decision["beat_id"] = decision.get("beat_id") or segment.get("beat_id") or f"beat_{index + 1:02d}"
+        decision["scene_id"] = decision.get("scene_id") or segment.get("scene_id") or ""
+        edited_decisions.append(decision)
+        edited_segments.append(segment)
+
+    plan["edit_decisions"] = edited_decisions
+    plan["voiceover_segments"] = edited_segments
+    plan["story_beats"] = [
+        {
+            **dict(beats_by_id.get(str(decision.get("beat_id"))) or {}),
+            "beat_id": decision.get("beat_id") or f"beat_{index + 1:02d}",
+            "purpose": decision.get("role") or (beats_by_id.get(str(decision.get("beat_id"))) or {}).get("purpose") or "story beat",
+            "scene_ids": decision.get("scene_ids") or ([decision.get("scene_id")] if decision.get("scene_id") else []),
+            "reason": decision.get("reason") or (beats_by_id.get(str(decision.get("beat_id"))) or {}).get("reason") or "Selected by the story planner.",
+            "estimated_duration_sec": decision.get("duration") or 4.0,
+            "transition_in": "continue" if index else "cold_open",
+            "transition_out": decision.get("transition") or (beats_by_id.get(str(decision.get("beat_id"))) or {}).get("transition_out") or "cut",
+        }
+        for index, decision in enumerate(edited_decisions)
+    ]
+    plan["narration_lines"] = [
+        {
+            "line_id": segment.get("line_id") or f"line_{index + 1:02d}",
+            "beat_id": segment.get("beat_id") or f"beat_{index + 1:02d}",
+            "text": segment.get("voiceover") or "",
+            "duration_estimate_sec": segment.get("duration") or 4.0,
+            "grounded_scene_ids": [segment.get("scene_id")] if segment.get("scene_id") else [],
+            "confidence": 0.75,
+        }
+        for index, segment in enumerate(edited_segments)
+        if segment.get("voiceover")
+    ]
+    plan["voiceover_script"] = " ".join(
+        str(segment.get("voiceover") or "").strip()
+        for segment in edited_segments
+        if str(segment.get("voiceover") or "").strip()
+    ).strip() or str(plan.get("voiceover_script") or "")
+
+    stale_render = bool(session.get("final_video_url")) or session.get("phase") == "complete"
+    session_updates: dict[str, Any] = {
+        "story_plan": plan,
+        "script": plan["voiceover_script"],
+        "progress_label": "Timeline updated",
+        "next_action": "Review the adjusted sections and render the recap video.",
+        "error": None,
+        "progress_percent": 100,
+    }
+    if stale_render:
+        session_updates.update(
+            phase="ready_to_render",
+            final_video_url=None,
+            voiceover_audio_url=None,
+            story_json_url=None,
+            edit_decisions_url=None,
+            caption_srt_url=None,
+            caption_vtt_url=None,
+        )
+    updated = _update_session(session_id, **session_updates)
+    log_event(
+        logger,
+        20,
+        "timeline_segments_updated",
+        session_id=session_id,
+        segment_count=len(request.segments),
+        reordered=order != existing_ids,
+        stale_render=stale_render,
+        stage="timeline_review",
         outcome="success",
     )
     return _public_session(updated["id"])

@@ -1,116 +1,335 @@
 # TripStory API Specification
 
-This document defines the REST API surface for the TripStory backend (`api_server.py`). It follows an asynchronous, job-based architecture to handle long-running media processing tasks without blocking the client.
+This document describes the current FastAPI surface implemented in `api_server.py`.
+Routes are mounted at the API root, not under `/api/v1`.
 
-## Base URL
-`/api/v1`
+## Auth And Ownership
 
----
+Local development works without auth. When `TRIPSTORY_AUTH_TOKEN` is set, requests must include either:
 
-## 1. Session Management
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-TripStory-Token: <token>
+```
+
+Project ownership is derived from `X-TripStory-User` or `x-tripstory-owner` in local mode. In Cloudflare Access mode, ownership can come from `Cf-Access-Authenticated-User-Email` when the corresponding environment flags are enabled.
+
+## Health
+
+### `GET /health`
+
+Returns:
+
+```json
+{"status":"ok","product":"TripStory"}
+```
+
+### `HEAD /health`
+
+Returns HTTP 200.
+
+## Sessions And Projects
+
+### `GET /sessions`
+
+Lists projects for the authenticated owner.
+
+Returns:
+
+```json
+{
+  "sessions": [
+    {
+      "id": "session-id",
+      "title": "Trip title",
+      "destination": "Kyoto",
+      "phase": "ready_to_render",
+      "updated_at": 1710000000.0,
+      "media_count": 3,
+      "final_video_url": "/files/session-id/holiday_recap.mp4",
+      "share_token": "optional-token"
+    }
+  ]
+}
+```
 
 ### `POST /sessions`
+
 Creates a new project session.
-- **Request:** Empty body.
-- **Response:**
-  ```json
-  {
-    "session_id": "uuid",
-    "status": "created",
-    "created_at": "timestamp"
-  }
-  ```
+
+Returns the full public session object.
 
 ### `GET /sessions/{session_id}`
-Retrieves the current state of a session, including job progress. This is the primary polling endpoint for the frontend UI.
-- **Response:**
-  ```json
-  {
-    "session_id": "uuid",
-    "phase": "uploading | analyzing | planning | rendering | complete | error",
-    "progress_percent": 45,
-    "active_job_state": "queued | started | finished | failed",
-    "active_job_step": "detecting_scenes",
-    "error": null,
-    "context": { ... },
-    "story_plan": { ... }
-  }
-  ```
 
-### `PATCH /sessions/{session_id}/context`
-Updates user-provided trip context.
-- **Request Body:** Match `User Trip Context` schema in `SCHEMA.md`.
+Returns the full public session object, including:
 
----
+- `phase`
+- `screen`
+- `progress_percent`
+- `trip_context`
+- `media_items`
+- `scene_memories`
+- `scene_memory_url`
+- `creative_brief`
+- `story_plan`
+- render artifact URLs
+- `active_job`, when a story or render job is queued/running
 
-## 2. Media Upload
+### `PATCH /sessions/{session_id}/metadata`
+
+Updates project metadata.
+
+Request:
+
+```json
+{"title":"Spring family edit"}
+```
+
+Returns the full public session object.
+
+### `POST /sessions/{session_id}/duplicate`
+
+Copies a project, including media files, story plan, render options, and render artifacts. The share token is not copied.
+
+Returns the duplicated session.
+
+### `DELETE /sessions/{session_id}`
+
+Deletes the project, its jobs, and its media directory.
+
+Returns:
+
+```json
+{"status":"deleted"}
+```
+
+## Trip Context
+
+### `POST /sessions/{session_id}/context`
+
+Saves user-provided trip context. API keys are never accepted from the frontend.
+
+Request:
+
+```json
+{
+  "destination": "Kyoto",
+  "duration": "5 days",
+  "places_visited": "Gion, Arashiyama",
+  "travel_dates": "April 2026",
+  "companions": "family",
+  "highlights": "sunset by the river",
+  "mood": "warm and reflective",
+  "audience": "friends and family",
+  "language": "en",
+  "notes": "",
+  "llm_provider": "deepseek",
+  "llm_model": ""
+}
+```
+
+Returns the full public session object.
+
+## Media Upload
 
 ### `POST /sessions/{session_id}/media`
-Uploads a raw video clip to the session.
-- **Content-Type:** `multipart/form-data`
-- **Payload:** `file` (binary video file)
-- **Response:**
-  ```json
-  {
-    "clip_id": "uuid",
-    "filename": "string",
-    "status": "uploaded"
-  }
-  ```
-*(Note: Uploading triggers background intelligence extraction jobs. Clients should poll `/sessions/{session_id}` to track analysis progress).*
 
----
+Uploads one or more video files.
 
-## 3. Story Generation
+Content type: `multipart/form-data`
 
-### `POST /sessions/{session_id}/generate_story`
-Triggers the Story Planner LLM to generate the `story_plan` based on uploaded media and context.
-- **Request:**
-  ```json
-  {
-    "target_duration_seconds": 60.0,
-    "language": "en"
-  }
-  ```
-- **Response:** `202 Accepted` (Job enqueued)
+Field name: `files`
 
-### `PATCH /sessions/{session_id}/voiceover_segments`
-Allows the user to manually edit the generated script before rendering.
-- **Request:** List of modified `voiceover_segments`.
-- **Response:** `200 OK`
+Allowed suffixes:
 
----
+- `.mp4`
+- `.mov`
+- `.m4v`
+- `.webm`
 
-## 4. Render & Export
+The current MVP analyzes clips synchronously during the upload request with bounded ffmpeg/OpenCV work. It also writes `scene_memory.json` for the project. Story generation and rendering are queued separately through Redis/RQ.
 
-### `GET /eval/dashboard`
-Retrieves the evaluation dashboard statistics to measure narrative coherence and narration restraint.
-- **Response:**
-  ```json
-  {
-    "status": "ok",
-    "metrics": {
-      "total_sessions_analyzed": 15,
-      "completed_sessions": 12,
-      "completion_rate": 80.0
-    },
-    "narration_restraint": {
-      "average_density": 0.45,
-      "flagged_sessions": []
+Returns the updated public session object with `media_items`, `clip_analysis`, `scene_memories`, and `scene_memory_url`.
+
+## Creative Brief
+
+### `POST /sessions/{session_id}/creative-brief`
+
+Drafts a producer brief from uploaded media and trip context.
+
+Returns the updated public session object.
+
+### `PATCH /sessions/{session_id}/creative-brief`
+
+Updates the selected direction, question answers, or notes.
+
+Request:
+
+```json
+{
+  "selected_direction_id": "direction_1",
+  "answers": [
+    {"question_id": "audience_intent", "answer": "For close friends."}
+  ],
+  "notes": "Keep it personal."
+}
+```
+
+Returns the updated public session object.
+
+### `POST /sessions/{session_id}/creative-brief/approve`
+
+Approves the current creative brief. Story generation is blocked while a draft brief exists and is not approved.
+
+Returns the updated public session object.
+
+## Story Generation
+
+### `POST /sessions/{session_id}/generate-story`
+
+Queues story generation through Redis/RQ when `TRIPSTORY_QUEUE_BACKEND=rq`.
+
+Request body is optional. When present, it accepts the same render/regeneration options as `/render`:
+
+```json
+{
+  "aspect_ratio": "original",
+  "target_duration_seconds": 60,
+  "clip_order": ["clip_001", "clip_002"],
+  "favorite_clip_ids": ["clip_001"],
+  "excluded_clip_ids": ["clip_003"],
+  "pinned_scene_ids": ["clip_001_scene_001"],
+  "excluded_scene_ids": ["clip_003_scene_001"],
+  "burn_captions": false,
+  "include_title_card": true,
+  "include_music_bed": false
+}
+```
+
+Story generation uses `scene_memories` as the primary planning evidence, filters out excluded clips/scenes before calling the planner, and passes pinned/excluded IDs as explicit constraints.
+
+Returns the updated public session object with `phase="planning"` and an `active_job`.
+
+## Voiceover Review
+
+### `PATCH /sessions/{session_id}/voiceover-segments`
+
+Edits generated voiceover text and captions by `segment_id`.
+
+Request:
+
+```json
+{
+  "segments": [
+    {
+      "segment_id": "seg_001",
+      "voiceover": "Kyoto starts with lanterns glowing over the narrow street.",
+      "caption": "Lantern street"
     }
-  }
-  ```
+  ]
+}
+```
+
+If an existing render is present, editing voiceover clears stale render artifact URLs and returns the session to `ready_to_render`.
+
+## Timeline Review
+
+### `PATCH /sessions/{session_id}/timeline`
+
+Edits the generated timeline by `segment_id`. This supports source-window nudging, per-segment duration changes, and generated segment reordering after story planning.
+
+Request:
+
+```json
+{
+  "segment_order": ["seg_002", "seg_001"],
+  "segments": [
+    {
+      "segment_id": "seg_001",
+      "start_time": 1.5,
+      "duration": 3
+    },
+    {
+      "segment_id": "seg_002",
+      "start_time": 4,
+      "duration": 2.5
+    }
+  ]
+}
+```
+
+Rules:
+
+- `segment_order`, when supplied, must include every generated timeline segment exactly once.
+- `duration` must be between 1 and 10 seconds.
+- Editing while story planning or rendering is in progress returns HTTP 409.
+- If an existing render is present, timeline editing clears stale render artifact URLs and returns the session to `ready_to_render`.
+
+## Render
 
 ### `POST /sessions/{session_id}/render`
-Triggers the final assembly (FFmpeg cutting, TTS generation, audio mixing).
-- **Request:** Empty body (uses the saved `story_plan`).
-- **Response:** `202 Accepted` (Job enqueued)
 
-### `GET /sessions/{session_id}/export`
-Returns the URL to download the final rendered `.mp4` rough cut.
-- **Response:**
-  ```json
-  {
-    "download_url": "/static/sessions/{session_id}/holiday_recap.mp4"
-  }
-  ```
+Queues final video rendering through Redis/RQ when `TRIPSTORY_QUEUE_BACKEND=rq`.
+
+Request body is optional. When present, it accepts:
+
+```json
+{
+  "aspect_ratio": "original",
+  "target_duration_seconds": 30,
+  "clip_order": [],
+  "favorite_clip_ids": [],
+  "excluded_clip_ids": [],
+  "pinned_scene_ids": [],
+  "excluded_scene_ids": [],
+  "burn_captions": false,
+  "include_title_card": true,
+  "include_music_bed": false
+}
+```
+
+Returns the updated public session object with `phase="rendering"` and an `active_job`.
+
+## Jobs
+
+### `GET /sessions/{session_id}/jobs/{job_id}`
+
+Returns a job row for the session.
+
+Job states include:
+
+- `queued`
+- `analyzing`
+- `planning`
+- `preparing`
+- `rendering_segments`
+- `writing_captions`
+- `synthesizing_narration`
+- `mixing_audio`
+- `complete`
+- `failed`
+
+## Sharing
+
+### `POST /sessions/{session_id}/share`
+
+Creates or reuses a share token.
+
+Returns:
+
+```json
+{
+  "share_token": "token",
+  "share_url": "https://api.example.com/share/token",
+  "session": {}
+}
+```
+
+### `GET /share/{share_token}`
+
+Returns the shared public session.

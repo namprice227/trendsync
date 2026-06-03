@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from llm_provider import LLMProvider
+from scene_memory import build_scene_memories, compact_scene_manifest
 from tripstory_logging import get_logger, log_event
 
 
@@ -189,6 +190,9 @@ def _normalize_edit_decisions(value: Any, fallback: list[dict[str, Any]]) -> lis
         normalized.append(
             {
                 "segment_id": _as_text(item.get("segment_id"), _segment_id(index)),
+                "beat_id": _as_text(item.get("beat_id"), f"beat_{index + 1:02d}"),
+                "scene_id": _as_text(item.get("scene_id") or item.get("selected_scene_id")),
+                "scene_ids": [_as_text(scene_id) for scene_id in _as_list(item.get("scene_ids"), []) if _as_text(scene_id)],
                 "clip_id": _as_text(item.get("clip_id")),
                 "clip": _as_text(item.get("clip"), f"clip_{index + 1}"),
                 "window_id": _as_text(item.get("window_id")),
@@ -219,6 +223,9 @@ def _normalize_voiceover_segments(
             normalized.append(
                 {
                     "segment_id": _as_text(item.get("segment_id"), _as_text(decision.get("segment_id"), _segment_id(index))),
+                    "line_id": _as_text(item.get("line_id"), f"line_{index + 1:02d}"),
+                    "beat_id": _as_text(item.get("beat_id"), _as_text(decision.get("beat_id"), f"beat_{index + 1:02d}")),
+                    "scene_id": _as_text(item.get("scene_id") or item.get("selected_scene_id"), _as_text(decision.get("scene_id"))),
                     "clip_id": _as_text(item.get("clip_id"), _as_text(decision.get("clip_id"))),
                     "clip": _as_text(item.get("clip"), _as_text(decision.get("clip"), f"clip_{index + 1}")),
                     "window_id": _as_text(item.get("window_id"), _as_text(decision.get("window_id"))),
@@ -233,6 +240,9 @@ def _normalize_voiceover_segments(
             normalized.append(
                 {
                     "segment_id": _as_text(decision.get("segment_id"), _segment_id(index)),
+                    "line_id": f"line_{index + 1:02d}",
+                    "beat_id": _as_text(decision.get("beat_id"), f"beat_{index + 1:02d}"),
+                    "scene_id": _as_text(decision.get("scene_id")),
                     "clip_id": _as_text(decision.get("clip_id")),
                     "clip": _as_text(decision.get("clip"), f"clip_{index + 1}"),
                     "window_id": _as_text(decision.get("window_id")),
@@ -271,6 +281,9 @@ def _normalize_voiceover_segments(
         aligned.append(
             {
                 "segment_id": segment_id,
+                "line_id": _as_text(segment.get("line_id"), f"line_{index + 1:02d}"),
+                "beat_id": _as_text(segment.get("beat_id"), _as_text(decision.get("beat_id"), f"beat_{index + 1:02d}")),
+                "scene_id": _as_text(segment.get("scene_id"), _as_text(decision.get("scene_id"))),
                 "clip_id": _as_text(segment.get("clip_id"), _as_text(decision.get("clip_id"))),
                 "clip": _as_text(segment.get("clip"), _as_text(decision.get("clip"), f"clip_{index + 1}")),
                 "window_id": _as_text(segment.get("window_id"), _as_text(decision.get("window_id"))),
@@ -294,10 +307,18 @@ def _normalize_story_plan(plan: dict[str, Any], fallback: dict[str, Any]) -> dic
     normalized["edit_notes"] = [_as_text(item) for item in _as_list(plan.get("edit_notes"), fallback["edit_notes"]) if _as_text(item)]
     normalized["clip_plan"] = _normalize_clip_plan(plan.get("clip_plan"), fallback["clip_plan"])
     normalized["edit_decisions"] = _normalize_edit_decisions(plan.get("edit_decisions"), fallback["edit_decisions"])
+    story_beats_value = plan.get("story_beats") if plan.get("story_beats") is not None else []
+    normalized["story_beats"] = _normalize_story_beats(story_beats_value, fallback.get("story_beats", []), normalized["edit_decisions"])
     normalized["voiceover_segments"] = _normalize_voiceover_segments(
         plan.get("voiceover_segments"),
         fallback.get("voiceover_segments", []),
         normalized["edit_decisions"],
+    )
+    narration_lines_value = plan.get("narration_lines") if plan.get("narration_lines") is not None else []
+    normalized["narration_lines"] = _normalize_narration_lines(
+        narration_lines_value,
+        fallback.get("narration_lines", []),
+        normalized["voiceover_segments"],
     )
     if not normalized["narrative_arc"]:
         normalized["narrative_arc"] = fallback["narrative_arc"]
@@ -306,6 +327,75 @@ def _normalize_story_plan(plan: dict[str, Any], fallback: dict[str, Any]) -> dic
     segment_script = " ".join(item["voiceover"] for item in normalized["voiceover_segments"] if item.get("voiceover")).strip()
     normalized["voiceover_script"] = segment_script or normalized["voiceover_script"] or fallback["voiceover_script"]
     return normalized
+
+
+def _normalize_story_beats(value: Any, fallback: list[dict[str, Any]], edit_decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    source = _as_list(value, fallback)
+    for index, item in enumerate(source):
+        if not isinstance(item, dict):
+            item = {"purpose": _as_text(item)}
+        decision = edit_decisions[index] if index < len(edit_decisions) else {}
+        scene_ids = _as_list(item.get("scene_ids") or item.get("grounded_scene_ids"), [])
+        normalized.append(
+            {
+                "beat_id": _as_text(item.get("beat_id"), f"beat_{index + 1:02d}"),
+                "purpose": _as_text(item.get("purpose"), _as_text(decision.get("role"), "story beat")),
+                "scene_ids": [_as_text(scene_id) for scene_id in scene_ids if _as_text(scene_id)],
+                "reason": _as_text(item.get("reason"), _as_text(decision.get("reason"), "Selected by the story planner.")),
+                "estimated_duration_sec": max(1.0, min(12.0, _as_float(item.get("estimated_duration_sec"), _as_float(decision.get("duration"), 5.5)))),
+                "transition_in": _as_text(item.get("transition_in"), "continue"),
+                "transition_out": _as_text(item.get("transition_out"), _as_text(decision.get("transition"), "cut")),
+            }
+        )
+    if normalized:
+        return normalized
+    return [
+        {
+            "beat_id": f"beat_{index + 1:02d}",
+            "purpose": _as_text(decision.get("role"), "story beat"),
+            "scene_ids": [_as_text(scene_id) for scene_id in (_as_list(decision.get("scene_ids"), []) or [decision.get("scene_id")]) if _as_text(scene_id)],
+            "reason": _as_text(decision.get("reason"), "Selected by the story planner."),
+            "estimated_duration_sec": max(1.0, min(12.0, _as_float(decision.get("duration"), 5.5))),
+            "transition_in": "continue",
+            "transition_out": _as_text(decision.get("transition"), "cut"),
+        }
+        for index, decision in enumerate(edit_decisions)
+    ]
+
+
+def _normalize_narration_lines(value: Any, fallback: list[dict[str, Any]], segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    source = _as_list(value, fallback)
+    for index, item in enumerate(source):
+        if not isinstance(item, dict):
+            item = {"text": _as_text(item)}
+        segment = segments[index] if index < len(segments) else {}
+        scene_ids = _as_list(item.get("grounded_scene_ids") or item.get("scene_ids"), [])
+        normalized.append(
+            {
+                "line_id": _as_text(item.get("line_id"), f"line_{index + 1:02d}"),
+                "beat_id": _as_text(item.get("beat_id"), f"beat_{index + 1:02d}"),
+                "text": _as_text(item.get("text") or item.get("voiceover"), _as_text(segment.get("voiceover"))),
+                "duration_estimate_sec": max(1.0, min(10.0, _as_float(item.get("duration_estimate_sec"), _as_float(segment.get("duration"), 4.0)))),
+                "grounded_scene_ids": [_as_text(scene_id) for scene_id in scene_ids if _as_text(scene_id)],
+                "confidence": max(0.0, min(1.0, _as_float(item.get("confidence"), 0.75))),
+            }
+        )
+    if normalized:
+        return [item for item in normalized if item["text"]]
+    return [
+        {
+            "line_id": f"line_{index + 1:02d}",
+            "beat_id": f"beat_{index + 1:02d}",
+            "text": _as_text(segment.get("voiceover")),
+            "duration_estimate_sec": max(1.0, min(10.0, _as_float(segment.get("duration"), 4.0))),
+            "grounded_scene_ids": [_as_text(segment.get("scene_id"))] if _as_text(segment.get("scene_id")) else [],
+            "confidence": 0.75,
+        }
+        for index, segment in enumerate(segments)
+        if _as_text(segment.get("voiceover"))
+    ]
 
 
 def _brief_evidence(item: dict[str, Any], window: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -750,6 +840,48 @@ def _smart_window_manifest(media_items: list[dict[str, Any]]) -> list[dict[str, 
     return manifest
 
 
+def _option_id_set(render_options: dict[str, Any] | None, key: str) -> set[str]:
+    if not render_options:
+        return set()
+    return {_as_text(value) for value in render_options.get(key) or [] if _as_text(value)}
+
+
+def _filter_media_items_for_planning(media_items: list[dict[str, Any]], render_options: dict[str, Any] | None) -> list[dict[str, Any]]:
+    excluded_clip_ids = _option_id_set(render_options, "excluded_clip_ids")
+    filtered = [
+        item
+        for item in media_items
+        if _as_text(item.get("id")) not in excluded_clip_ids and _as_text(item.get("filename")) not in excluded_clip_ids
+    ] if excluded_clip_ids else list(media_items)
+    clip_order = [_as_text(value) for value in (render_options or {}).get("clip_order") or [] if _as_text(value)]
+    if clip_order:
+        by_id = {_as_text(item.get("id")): item for item in filtered}
+        by_name = {_as_text(item.get("filename")): item for item in filtered}
+        ordered = []
+        for clip_id in clip_order:
+            item = by_id.get(clip_id) or by_name.get(clip_id)
+            if item and item not in ordered:
+                ordered.append(item)
+        ordered.extend(item for item in filtered if item not in ordered)
+        filtered = ordered
+    return filtered or media_items
+
+
+def _filter_scene_memories_for_planning(scene_memories: list[dict[str, Any]], render_options: dict[str, Any] | None) -> list[dict[str, Any]]:
+    excluded_clip_ids = _option_id_set(render_options, "excluded_clip_ids")
+    excluded_scene_ids = _option_id_set(render_options, "excluded_scene_ids")
+    if not excluded_clip_ids and not excluded_scene_ids:
+        return scene_memories
+    filtered = [
+        scene
+        for scene in scene_memories
+        if _as_text(scene.get("scene_id")) not in excluded_scene_ids
+        and _as_text(scene.get("clip_id")) not in excluded_clip_ids
+        and _as_text(scene.get("clip_filename")) not in excluded_clip_ids
+    ]
+    return filtered or scene_memories
+
+
 def _destination_name(context: dict[str, Any]) -> str:
     return _as_text(context.get("destination"), "the trip")
 
@@ -914,6 +1046,7 @@ def _repair_voiceover_for_audience(plan: dict[str, Any], context: dict[str, Any]
     if repaired:
         plan["voiceover_segments"] = repaired
         plan["voiceover_script"] = " ".join(segment["voiceover"] for segment in repaired if segment.get("voiceover")).strip()
+        plan["narration_lines"] = _normalize_narration_lines(plan.get("narration_lines"), [], repaired)
     return plan
 
 
@@ -972,6 +1105,7 @@ def _fallback_story(
         edit_decisions.append(
             {
                 "segment_id": segment_id,
+                "beat_id": f"beat_{idx + 1:02d}",
                 "clip_id": clip_id,
                 "clip": clip_name,
                 "window_id": window_id,
@@ -986,6 +1120,8 @@ def _fallback_story(
         )
         voiceover_segments.append(
             {
+                "line_id": f"line_{idx + 1:02d}",
+                "beat_id": f"beat_{idx + 1:02d}",
                 "segment_id": segment_id,
                 "clip_id": clip_id,
                 "clip": clip_name,
@@ -1015,6 +1151,29 @@ def _fallback_story(
             "Close on the feeling you want to remember after the trip.",
         ],
         "voiceover_script": voiceover,
+        "story_beats": [
+            {
+                "beat_id": f"beat_{idx + 1:02d}",
+                "purpose": decision["role"],
+                "scene_ids": [],
+                "reason": decision["reason"],
+                "estimated_duration_sec": decision["duration"],
+                "transition_in": "continue" if idx else "cold_open",
+                "transition_out": decision["transition"],
+            }
+            for idx, decision in enumerate(edit_decisions)
+        ],
+        "narration_lines": [
+            {
+                "line_id": f"line_{idx + 1:02d}",
+                "beat_id": f"beat_{idx + 1:02d}",
+                "text": segment["voiceover"],
+                "duration_estimate_sec": segment["duration"],
+                "grounded_scene_ids": [],
+                "confidence": 0.72,
+            }
+            for idx, segment in enumerate(voiceover_segments)
+        ],
         "voiceover_segments": voiceover_segments,
         "edit_notes": [
             f"Use {clip_count} uploaded clip{'s' if clip_count != 1 else ''} in chronological order unless the user marks favorites.",
@@ -1107,10 +1266,14 @@ def generate_trip_story(
     provider: LLMProvider | None = None,
     render_options: dict[str, Any] | None = None,
     creative_brief: dict[str, Any] | None = None,
+    scene_memories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     provider = provider or LLMProvider()
     language = _language_name(context.get("language"))
-    fallback = _fallback_story(context, media_items, render_options)
+    planning_media_items = _filter_media_items_for_planning(media_items, render_options)
+    scene_memories = scene_memories or build_scene_memories(media_items)
+    planning_scene_memories = _filter_scene_memories_for_planning(scene_memories, render_options)
+    fallback = _fallback_story(context, planning_media_items, render_options)
     target_seconds = _target_duration_seconds(render_options, context)
     voiceover_seconds, target_segment_count = _voiceover_budget(render_options, context)
     fallback["generation"] = {
@@ -1123,8 +1286,9 @@ def generate_trip_story(
         "planned_voiceover_seconds": voiceover_seconds,
     }
 
-    media_manifest = _clip_manifest(media_items)
-    smart_windows = _smart_window_manifest(media_items)
+    media_manifest = _clip_manifest(planning_media_items)
+    smart_windows = _smart_window_manifest(planning_media_items)
+    scene_manifest = compact_scene_manifest(planning_scene_memories)
 
     system = (
         "You are a senior travel film editor and story producer. Build a concise, emotionally coherent "
@@ -1132,28 +1296,31 @@ def generate_trip_story(
         "You must make concrete edit decisions, not generic advice. Ground every story beat in observed "
         "clip evidence such as semantic_summary, best_moment_descriptions, transcript, named_landmarks, "
         "visible_subjects, locations_or_scenes, quality, and timestamps. Never invent visuals that are not "
-        "in the uploaded_media evidence. Return strict JSON only, with keys: title, language, tone, "
-        "narrative_arc, voiceover_script, voiceover_segments, edit_notes, clip_plan, edit_decisions. "
+        "in the scene_memories evidence. Return strict JSON only, with keys: title, language, tone, "
+        "narrative_arc, story_beats, narration_lines, voiceover_script, voiceover_segments, edit_notes, clip_plan, edit_decisions. "
         "The voiceover must be in the requested language."
     )
-    # Incorporate pinned and excluded scenes (Milestone 2)
-    excluded_clip_ids = render_options.get("excluded_clip_ids", []) if render_options else []
-    pinned_clip_ids = render_options.get("favorite_clip_ids", []) if render_options else []
-
-    # Filter the manifest to remove explicitly excluded clips
-    filtered_media_manifest = [item for item in media_manifest if not any(item.startswith(exc_id) for exc_id in excluded_clip_ids)]
-    filtered_smart_windows = [win for win in smart_windows if win.get("clip_id") not in excluded_clip_ids]
+    excluded_clip_ids = sorted(_option_id_set(render_options, "excluded_clip_ids"))
+    excluded_scene_ids = sorted(_option_id_set(render_options, "excluded_scene_ids"))
+    pinned_clip_ids = sorted(_option_id_set(render_options, "favorite_clip_ids"))
+    pinned_scene_ids = sorted(_option_id_set(render_options, "pinned_scene_ids"))
 
     user = {
         "target_language": language,
         "trip_context": context,
         "approved_creative_brief": creative_brief or None,
+        "scene_memories": scene_manifest,
         "clip_manifest": media_manifest,
         "smart_windows": smart_windows,
+        "pinned_favorite_clip_ids": pinned_clip_ids,
+        "pinned_scene_ids": pinned_scene_ids,
+        "excluded_clip_ids": excluded_clip_ids,
+        "excluded_scene_ids": excluded_scene_ids,
         "manifest_rules": [
+            "scene_memories is the primary source of truth. Each scene includes evidence, time_range, transcript excerpt, visual summary, role candidates, energy, confidence, and risks.",
             "Each manifest line is compact: clip id, duration, creative visual cue, people/motion/audio hints, best timestamps, and avoid hints.",
             "Use smart_windows as the primary editing evidence. Each window has a stable window_id, start_time, duration, score, sampled frame_timestamps, and visual_evidence.",
-            "Use only clip_manifest and smart_windows for story planning. Do not ask for or invent raw detector metadata.",
+            "Use only scene_memories, clip_manifest, and smart_windows for story planning. Do not ask for or invent raw detector metadata.",
             "Best timestamps and frame_timestamps are source-clip seconds for edit choices; do not mention them in voiceover.",
         ],
         "requirements": [
@@ -1161,15 +1328,19 @@ def generate_trip_story(
             "Assume clips may be imperfect phone footage.",
             f"Write for a {int(round(target_seconds))}-second rendered video.",
             "You MUST include ALL clips listed in the pinned_favorite_clip_ids in your final edit_decisions.",
+            "You MUST include ALL scenes listed in pinned_scene_ids when they are present in scene_memories.",
+            "You MUST NOT include clips or scenes listed in excluded_clip_ids or excluded_scene_ids unless all available evidence was excluded.",
             f"The title card uses 2 seconds when enabled, so edit_decisions should total about {voiceover_seconds:.1f} seconds.",
             f"Return about {target_segment_count} voiceover_segments, using repeated clips only when needed to fill the selected duration.",
-            "Choose exact windows from smart_windows first. Prefer high score windows with concrete visual_evidence. Avoid weak/dark/shaky windows when alternatives exist.",
+            "Choose exact scenes from scene_memories first, then map each scene to its source_window_id in smart_windows. Prefer high story_energy and concrete evidence. Avoid weak/dark/shaky scenes when alternatives exist.",
             "Use semantic_summary and smart window visual_evidence first when present. Use numeric analysis only as fallback evidence.",
             "Voiceover is audience-facing TikTok narration. It must sound natural, emotional, and watchable, not like metadata.",
             "Never put timestamps, seconds, resolution, scene counts, face counts, quality labels, filenames, or phrases like audio present in voiceover_script, voiceover_segments, or captions.",
             "Keep each voiceover segment punchy: one short sentence, usually 8-18 words, with a strong hook or emotional turn.",
+            "Return story_beats as an ordered beat plan before narration. Each beat must include beat_id, purpose, scene_ids, reason, estimated_duration_sec, transition_in, and transition_out.",
+            "Return narration_lines as the writer output. Each line must include line_id, beat_id, text, duration_estimate_sec, grounded_scene_ids, and confidence.",
             "Return edit_decisions as an ordered timeline. Each item must include segment_id, clip_id, clip, window_id, start_time, duration, role, reason, transition, caption, and audio_strategy.",
-            "Each edit_decision must select an exact clip_id and window_id from smart_windows. Use the selected window's start_time and duration unless the clip is shorter.",
+            "Each edit_decision must select an exact clip_id and window_id from the selected scene/source window. Use the selected scene time_range or window start_time and duration unless the clip is shorter.",
             "Return voiceover_segments in the same order and length as edit_decisions. Each segment must include segment_id, clip_id, clip, window_id, start_time, duration, voiceover, caption, and purpose.",
             "The segment_id in each voiceover_segments item must exactly match the paired edit_decisions item.",
             "Each voiceover segment must mention the actual visible content in the selected window, such as the shore birds, traveler speaking to camera, market street, food stall, or dark/shaky avoid. Do not write a generic trip summary unless no window evidence exists.",
@@ -1193,7 +1364,8 @@ def generate_trip_story(
             provider=provider.provider,
             model=provider.model,
             configured=provider.configured,
-            clip_count=len(media_items),
+            clip_count=len(planning_media_items),
+            scene_memory_count=len(planning_scene_memories),
             manifest_chars=manifest_chars,
             language=language,
             stage="story_generation",
@@ -1217,7 +1389,7 @@ def generate_trip_story(
                 "story_generation_fallback",
                 provider=provider.provider,
                 model=provider.model,
-                clip_count=len(media_items),
+                clip_count=len(planning_media_items),
                 elapsed_seconds=round(time.monotonic() - started, 3),
                 fallback_reason="empty_llm_response",
                 outcome="local_fallback",
@@ -1225,8 +1397,13 @@ def generate_trip_story(
             )
             return fallback
         parsed = _parse_llm_story_json(content)
-        merged = _normalize_story_plan({**fallback, **parsed}, fallback)
-        merged = _repair_voiceover_for_audience(merged, context, media_items)
+        merged_input = {**fallback, **parsed}
+        if "story_beats" not in parsed:
+            merged_input.pop("story_beats", None)
+        if "narration_lines" not in parsed:
+            merged_input.pop("narration_lines", None)
+        merged = _normalize_story_plan(merged_input, fallback)
+        merged = _repair_voiceover_for_audience(merged, context, planning_media_items)
         merged["generation"] = {
             "llm_used": True,
             "llm_provider": provider.provider,
@@ -1242,10 +1419,12 @@ def generate_trip_story(
             "story_generation_complete",
             provider=provider.provider,
             model=provider.model,
-            clip_count=len(media_items),
+            clip_count=len(planning_media_items),
             voiceover_segment_count=len(merged.get("voiceover_segments") or []),
             edit_decision_count=len(merged.get("edit_decisions") or []),
+            story_beat_count=len(merged.get("story_beats") or []),
             smart_window_count=sum(len(item.get("windows") or []) for item in smart_windows),
+            scene_memory_count=len(planning_scene_memories),
             elapsed_seconds=round(time.monotonic() - started, 3),
             outcome="llm",
             stage="story_generation",
@@ -1262,7 +1441,7 @@ def generate_trip_story(
             "story_generation_fallback",
             provider=provider.provider,
             model=provider.model,
-            clip_count=len(media_items),
+            clip_count=len(planning_media_items),
             exception_type=type(exc).__name__,
             elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
             fallback_reason="invalid_json",
@@ -1279,7 +1458,7 @@ def generate_trip_story(
             "story_generation_fallback",
             provider=provider.provider,
             model=provider.model,
-            clip_count=len(media_items),
+            clip_count=len(planning_media_items),
             exception_type=type(exc).__name__,
             elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
             fallback_reason="non_object_json",
@@ -1295,7 +1474,7 @@ def generate_trip_story(
             "story_generation_fallback",
             provider=provider.provider,
             model=provider.model,
-            clip_count=len(media_items),
+            clip_count=len(planning_media_items),
             exception_type=type(exc).__name__,
             elapsed_seconds=round(time.monotonic() - started, 3) if "started" in locals() else None,
             outcome="local_fallback",

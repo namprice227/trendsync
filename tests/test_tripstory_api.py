@@ -15,8 +15,10 @@ class TripStoryApiTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.media_root = Path(self.temp_dir.name) / "media"
         self.session_store = Path(self.temp_dir.name) / "sessions.json"
+        self.session_db = Path(self.temp_dir.name) / "sessions.sqlite3"
         os.environ["TRIPSTORY_MEDIA_DIR"] = str(self.media_root)
         os.environ["TRIPSTORY_SESSION_STORE"] = str(self.session_store)
+        os.environ["TRIPSTORY_SESSION_DB"] = str(self.session_db)
         for key in (
             "TRIPSTORY_LLM_PROVIDER",
             "TRIPSTORY_LLM_URL",
@@ -42,7 +44,6 @@ class TripStoryApiTest(unittest.TestCase):
             "TRIPSTORY_TTS_MODEL",
             "TRIPSTORY_TTS_VOICE",
             "TRIPSTORY_ENABLE_TRANSCRIPTION",
-            "TRIPSTORY_SESSION_DB",
             "TRIPSTORY_SQLITE_TIMEOUT_SECONDS",
             "TRIPSTORY_QUEUE_BACKEND",
             "TRIPSTORY_REDIS_URL",
@@ -65,10 +66,23 @@ class TripStoryApiTest(unittest.TestCase):
             "TRIPSTORY_LLM_URL",
             "TRIPSTORY_LLM_API_KEY",
             "TRIPSTORY_LLM_MODEL",
+            "TRIPSTORY_OPENAI_MODEL",
+            "TRIPSTORY_GEMINI_MODEL",
+            "TRIPSTORY_DEEPSEEK_MODEL",
+            "TRIPSTORY_DEEPSEEK_THINKING",
+            "TRIPSTORY_DEEPSEEK_REASONING_EFFORT",
+            "TRIPSTORY_VISION_PROVIDER",
+            "TRIPSTORY_VISION_MODEL",
+            "TRIPSTORY_GEMINI_VISION_MODEL",
+            "TRIPSTORY_OPENAI_VISION_MODEL",
+            "TRIPSTORY_ENABLE_VISION_ANALYSIS",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
             "DEEPSEEK_API_KEY",
             "TRIPSTORY_TTS_PROVIDER",
+            "TRIPSTORY_TTS_MODEL",
+            "TRIPSTORY_TTS_VOICE",
+            "TRIPSTORY_ENABLE_TRANSCRIPTION",
             "TRIPSTORY_QUEUE_BACKEND",
         ):
             os.environ.pop(key, None)
@@ -76,6 +90,7 @@ class TripStoryApiTest(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("TRIPSTORY_MEDIA_DIR", None)
         os.environ.pop("TRIPSTORY_SESSION_STORE", None)
+        os.environ.pop("TRIPSTORY_SESSION_DB", None)
         os.environ.pop("TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS", None)
         os.environ.pop("TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL", None)
         self.temp_dir.cleanup()
@@ -285,6 +300,135 @@ class TripStoryApiTest(unittest.TestCase):
                 ),
             )
 
+    def test_patch_timeline_segments_updates_order_timing_and_clears_stale_render(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        story_plan = {
+            "title": "Market Day",
+            "language": "English",
+            "voiceover_script": "First line. Second line.",
+            "edit_decisions": [
+                {
+                    "segment_id": "seg_001",
+                    "beat_id": "beat_01",
+                    "scene_id": "clip1_scene_001",
+                    "clip_id": "clip1",
+                    "clip": "market.mp4",
+                    "window_id": "win_001",
+                    "start_time": 1,
+                    "duration": 4,
+                    "caption": "First caption",
+                    "role": "setup",
+                    "transition": "cut",
+                },
+                {
+                    "segment_id": "seg_002",
+                    "beat_id": "beat_02",
+                    "scene_id": "clip2_scene_001",
+                    "clip_id": "clip2",
+                    "clip": "food.mp4",
+                    "window_id": "win_002",
+                    "start_time": 5,
+                    "duration": 3,
+                    "caption": "Second caption",
+                    "role": "payoff",
+                    "transition": "match_cut",
+                },
+            ],
+            "voiceover_segments": [
+                {
+                    "segment_id": "seg_001",
+                    "line_id": "line_01",
+                    "beat_id": "beat_01",
+                    "scene_id": "clip1_scene_001",
+                    "clip_id": "clip1",
+                    "clip": "market.mp4",
+                    "window_id": "win_001",
+                    "start_time": 1,
+                    "duration": 4,
+                    "voiceover": "First line.",
+                    "caption": "First caption",
+                },
+                {
+                    "segment_id": "seg_002",
+                    "line_id": "line_02",
+                    "beat_id": "beat_02",
+                    "scene_id": "clip2_scene_001",
+                    "clip_id": "clip2",
+                    "clip": "food.mp4",
+                    "window_id": "win_002",
+                    "start_time": 5,
+                    "duration": 3,
+                    "voiceover": "Second line.",
+                    "caption": "Second caption",
+                },
+            ],
+            "story_beats": [
+                {"beat_id": "beat_01", "purpose": "setup", "reason": "Starts the day."},
+                {"beat_id": "beat_02", "purpose": "payoff", "reason": "Ends with food."},
+            ],
+        }
+        self.api_server._update_session(
+            session_id,
+            phase="complete",
+            story_plan=story_plan,
+            script=story_plan["voiceover_script"],
+            final_video_url="/files/session/holiday_recap.mp4",
+            voiceover_audio_url="/files/session/voiceover.mp3",
+            story_json_url="/files/session/story_plan.json",
+            edit_decisions_url="/files/session/edit_decisions.json",
+            caption_srt_url="/files/session/captions.srt",
+            caption_vtt_url="/files/session/captions.vtt",
+        )
+
+        updated = self.api_server.update_timeline_segments(
+            session_id,
+            self.api_server.TimelinePatchRequest(
+                segment_order=["seg_002", "seg_001"],
+                segments=[
+                    self.api_server.TimelineSegmentUpdate(segment_id="seg_001", start_time=1.5, duration=3.0),
+                    self.api_server.TimelineSegmentUpdate(segment_id="seg_002", start_time=4.0, duration=2.5),
+                ],
+            ),
+        )
+
+        decisions = updated["story_plan"]["edit_decisions"]
+        segments = updated["story_plan"]["voiceover_segments"]
+        narration_lines = updated["story_plan"]["narration_lines"]
+        self.assertEqual([decision["segment_id"] for decision in decisions], ["seg_002", "seg_001"])
+        self.assertEqual([segment["segment_id"] for segment in segments], ["seg_002", "seg_001"])
+        self.assertEqual(decisions[0]["start_time"], 4.0)
+        self.assertEqual(decisions[0]["duration"], 2.5)
+        self.assertEqual(decisions[1]["start_time"], 1.5)
+        self.assertEqual(decisions[1]["duration"], 3.0)
+        self.assertEqual(segments[0]["start_time"], 4.0)
+        self.assertEqual(segments[1]["duration"], 3.0)
+        self.assertEqual(narration_lines[0]["text"], "Second line.")
+        self.assertEqual(narration_lines[0]["duration_estimate_sec"], 2.5)
+        self.assertEqual(updated["script"], "Second line. First line.")
+        self.assertEqual(updated["phase"], "ready_to_render")
+        self.assertIsNone(updated["final_video_url"])
+        self.assertIsNone(updated["voiceover_audio_url"])
+        self.assertIsNone(updated["edit_decisions_url"])
+
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.update_timeline_segments(
+                session_id,
+                self.api_server.TimelinePatchRequest(
+                    segment_order=["seg_001", "seg_001"],
+                    segments=[self.api_server.TimelineSegmentUpdate(segment_id="seg_001", start_time=1, duration=2)],
+                ),
+            )
+
+        with self.assertRaises(self.api_server.HTTPException):
+            self.api_server.update_timeline_segments(
+                session_id,
+                self.api_server.TimelinePatchRequest(
+                    segment_order=["seg_001", "seg_002"],
+                    segments=[self.api_server.TimelineSegmentUpdate(segment_id="seg_999", start_time=1, duration=2)],
+                ),
+            )
+
     def test_session_poll_logs_structured_http_state(self) -> None:
         session = self.api_server._create_session()
         session_id = session["id"]
@@ -481,8 +625,9 @@ class TripStoryApiTest(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_generate(context_arg, media_items_arg, provider_arg, render_options=None, creative_brief=None):
+        def fake_generate(context_arg, media_items_arg, provider_arg, render_options=None, creative_brief=None, scene_memories=None):
             captured["creative_brief"] = creative_brief
+            captured["scene_memories"] = scene_memories
             return {
                 "title": "Plan",
                 "language": "English",
@@ -500,8 +645,67 @@ class TripStoryApiTest(unittest.TestCase):
             self.api_server._generate_story_background(session_id)
 
         self.assertEqual(captured["creative_brief"], creative_brief)
+        self.assertTrue(captured["scene_memories"])
         updated = self.api_server._public_session(session_id)
         self.assertEqual(updated["phase"], "ready_to_render")
+
+    def test_story_job_persists_scene_memory_artifact_and_planning_layers(self) -> None:
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context.update({"destination": "Bangkok", "llm_provider": "local"})
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            media_items=[
+                {
+                    "id": "clip1",
+                    "filename": "market.mp4",
+                    "kind": "video",
+                    "path": str(self.media_root / session_id / "missing.mp4"),
+                    "url": f"/files/{session_id}/media/market.mp4",
+                    "size_bytes": 10,
+                    "analysis": {
+                        "duration_seconds": 12,
+                        "quality_label": "strong",
+                        "has_audio": True,
+                        "transcript": "we finally made it to the market",
+                        "semantic_summary": "Walking into a crowded outdoor market.",
+                        "locations_or_scenes": ["outdoor market"],
+                        "visible_actions": ["walking", "looking around"],
+                        "smart_windows": [
+                            {
+                                "window_id": "win_001",
+                                "start_time": 2,
+                                "duration": 5,
+                                "score": 0.92,
+                                "frame_timestamps": [2.5, 3.5],
+                                "visual_evidence": "walking into a crowded outdoor market",
+                            }
+                        ],
+                    },
+                }
+            ],
+            phase="ready_to_plan",
+        )
+
+        self.api_server._generate_story_background(session_id)
+
+        planned = self.api_server._public_session(session_id)
+        scene_memories = planned["scene_memories"]
+        scene_memory_path = self.media_root / session_id / "scene_memory.json"
+        self.assertEqual(planned["phase"], "ready_to_render")
+        self.assertTrue(planned["scene_memory_url"].endswith("scene_memory.json"))
+        self.assertTrue(scene_memory_path.exists())
+        self.assertEqual(len(scene_memories), 1)
+        self.assertEqual(scene_memories[0]["project_id"], session_id)
+        self.assertEqual(scene_memories[0]["scene_id"], "clip1_scene_001")
+        self.assertEqual(scene_memories[0]["source_window_id"], "win_001")
+        self.assertEqual(scene_memories[0]["transcript"], "we finally made it to the market")
+        self.assertTrue(planned["story_plan"]["story_beats"])
+        self.assertTrue(planned["story_plan"]["narration_lines"])
+        persisted_memory = json.loads(scene_memory_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted_memory[0]["scene_id"], "clip1_scene_001")
 
     def test_duplicate_session_copies_metadata_context_story_and_media_files(self) -> None:
         session = self.api_server._create_session("owner-a")
@@ -556,7 +760,10 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertEqual(duplicate["phase"], "complete")
         self.assertIn(f"/files/{duplicate_id}/", duplicate["media_items"][0]["url"])
         self.assertIn(duplicate_id, duplicate["media_items"][0]["path"])
+        self.assertEqual(duplicate["scene_memories"][0]["project_id"], duplicate_id)
+        self.assertTrue(duplicate["scene_memory_url"].endswith("scene_memory.json"))
         self.assertTrue(Path(duplicate["media_items"][0]["path"]).exists())
+        self.assertTrue((self.media_root / duplicate_id / "scene_memory.json").exists())
         self.assertTrue((self.media_root / duplicate_id / "holiday_recap.mp4").exists())
         with self.assertRaises(self.api_server.HTTPException):
             self.api_server.duplicate_session(session_id, auth={"owner_id": "owner-b"})
@@ -608,6 +815,40 @@ class TripStoryApiTest(unittest.TestCase):
         job = self.api_server.get_job(session_id, queued["active_job"]["id"])
         self.assertEqual(job["session_id"], session_id)
         self.assertEqual(job["type"], "story_generation")
+        os.environ.pop("TRIPSTORY_QUEUE_BACKEND", None)
+
+    def test_generate_story_endpoint_accepts_regeneration_controls(self) -> None:
+        from unittest.mock import patch
+
+        session = self.api_server._create_session()
+        session_id = session["id"]
+        context = dict(session["trip_context"])
+        context.update({"destination": "Kyoto", "llm_provider": "local"})
+        self.api_server._update_session(
+            session_id,
+            trip_context=context,
+            media_items=[{"id": "clip1", "filename": "clip.mp4", "kind": "video", "path": "clip.mp4", "analysis": {}}],
+            recorded_clips=["clip.mp4"],
+            phase="ready_to_plan",
+        )
+        request = self.api_server.RenderRequest(
+            target_duration_seconds=60,
+            clip_order=["clip1"],
+            favorite_clip_ids=["clip1"],
+            excluded_clip_ids=["clip2"],
+            pinned_scene_ids=["clip1_scene_001"],
+            excluded_scene_ids=["clip2_scene_001"],
+        )
+        os.environ["TRIPSTORY_QUEUE_BACKEND"] = "rq"
+        with patch.object(self.api_server, "_enqueue_rq_job", return_value="rq-story-2"):
+            queued = self.api_server.generate_story(session_id, request)
+
+        self.assertEqual(queued["phase"], "planning")
+        self.assertEqual(queued["render_options"]["target_duration_seconds"], 60)
+        self.assertEqual(queued["render_options"]["favorite_clip_ids"], ["clip1"])
+        self.assertEqual(queued["render_options"]["excluded_clip_ids"], ["clip2"])
+        self.assertEqual(queued["render_options"]["pinned_scene_ids"], ["clip1_scene_001"])
+        self.assertEqual(queued["render_options"]["excluded_scene_ids"], ["clip2_scene_001"])
         os.environ.pop("TRIPSTORY_QUEUE_BACKEND", None)
 
     def test_render_endpoint_enqueues_rq_job(self) -> None:
@@ -943,7 +1184,7 @@ class TripStoryApiTest(unittest.TestCase):
                     }
                 )
 
-        generate_trip_story(
+        plan = generate_trip_story(
             {"destination": "Tromso", "language": "en"},
             [
                 {
@@ -992,6 +1233,140 @@ class TripStoryApiTest(unittest.TestCase):
         self.assertIn("[Clip clip1] 12s", user_payload["clip_manifest"][0])
         self.assertEqual(user_payload["smart_windows"][0]["windows"][0]["window_id"], "win_001")
         self.assertIn("snowy mountain", user_payload["smart_windows"][0]["windows"][0]["visual_evidence"])
+        self.assertEqual(len(plan["story_beats"]), len(plan["edit_decisions"]))
+        self.assertEqual(len(plan["narration_lines"]), len(plan["voiceover_segments"]))
+
+    def test_story_generation_filters_excluded_scene_memory_and_sends_controls(self) -> None:
+        from trip_story import generate_trip_story
+
+        captured = {}
+
+        class CapturingProvider:
+            provider = "deepseek"
+            model = "deepseek-v4-pro"
+            configured = True
+
+            def chat(self, messages, max_tokens=900):
+                captured["messages"] = messages
+                return json.dumps(
+                    {
+                        "title": "Filtered Story",
+                        "language": "English",
+                        "story_beats": [
+                            {
+                                "beat_id": "beat_01",
+                                "purpose": "hook",
+                                "scene_ids": ["clip1_scene_001"],
+                                "reason": "Pinned market scene has the clearest energy.",
+                                "estimated_duration_sec": 5,
+                                "transition_in": "cold_open",
+                                "transition_out": "move_to_setup",
+                            }
+                        ],
+                        "narration_lines": [
+                            {
+                                "line_id": "line_01",
+                                "beat_id": "beat_01",
+                                "text": "The market lights pull the night into the story.",
+                                "duration_estimate_sec": 4,
+                                "grounded_scene_ids": ["clip1_scene_001"],
+                                "confidence": 0.86,
+                            }
+                        ],
+                        "edit_decisions": [
+                            {
+                                "segment_id": "seg_001",
+                                "beat_id": "beat_01",
+                                "scene_id": "clip1_scene_001",
+                                "clip_id": "clip1",
+                                "clip": "market.mp4",
+                                "window_id": "win_001",
+                                "start_time": 1,
+                                "duration": 5,
+                                "reason": "The pinned market scene has clear lights and motion.",
+                            }
+                        ],
+                        "voiceover_segments": [
+                            {
+                                "segment_id": "seg_001",
+                                "line_id": "line_01",
+                                "beat_id": "beat_01",
+                                "scene_id": "clip1_scene_001",
+                                "clip_id": "clip1",
+                                "clip": "market.mp4",
+                                "window_id": "win_001",
+                                "voiceover": "The market lights pull the night into the story.",
+                            }
+                        ],
+                    }
+                )
+
+        media_items = [
+            {
+                "id": "clip1",
+                "filename": "market.mp4",
+                "kind": "video",
+                "size_bytes": 100,
+                "analysis": {
+                    "duration_seconds": 8,
+                    "semantic_summary": "Night market lights and people walking past stalls.",
+                    "smart_windows": [
+                        {
+                            "window_id": "win_001",
+                            "start_time": 1,
+                            "duration": 5,
+                            "score": 0.94,
+                            "visual_evidence": "night market lights and people walking past stalls",
+                        }
+                    ],
+                },
+            },
+            {
+                "id": "clip2",
+                "filename": "hotel.mp4",
+                "kind": "video",
+                "size_bytes": 100,
+                "analysis": {
+                    "duration_seconds": 8,
+                    "semantic_summary": "A dim hotel hallway.",
+                    "smart_windows": [
+                        {
+                            "window_id": "win_001",
+                            "start_time": 0,
+                            "duration": 4,
+                            "score": 0.3,
+                            "visual_evidence": "dim hotel hallway",
+                        }
+                    ],
+                },
+            },
+        ]
+
+        plan = generate_trip_story(
+            {"destination": "Bangkok", "language": "en"},
+            media_items,
+            CapturingProvider(),
+            render_options={
+                "favorite_clip_ids": ["clip1"],
+                "excluded_clip_ids": ["clip2"],
+                "pinned_scene_ids": ["clip1_scene_001"],
+                "excluded_scene_ids": ["clip2_scene_001"],
+            },
+        )
+
+        user_payload = json.loads(captured["messages"][1]["content"])
+        self.assertEqual(user_payload["pinned_favorite_clip_ids"], ["clip1"])
+        self.assertEqual(user_payload["pinned_scene_ids"], ["clip1_scene_001"])
+        self.assertEqual(user_payload["excluded_clip_ids"], ["clip2"])
+        self.assertEqual(user_payload["excluded_scene_ids"], ["clip2_scene_001"])
+        self.assertEqual([scene["scene_id"] for scene in user_payload["scene_memories"]], ["clip1_scene_001"])
+        self.assertEqual([item["clip_id"] for item in user_payload["smart_windows"]], ["clip1"])
+        self.assertIn("[Clip clip1]", user_payload["clip_manifest"][0])
+        self.assertNotIn("clip2", json.dumps(user_payload["scene_memories"]))
+        self.assertNotIn("clip2", json.dumps(user_payload["smart_windows"]))
+        self.assertFalse(any("clip2" in line for line in user_payload["clip_manifest"]))
+        self.assertEqual(plan["story_beats"][0]["scene_ids"], ["clip1_scene_001"])
+        self.assertEqual(plan["narration_lines"][0]["grounded_scene_ids"], ["clip1_scene_001"])
 
     def test_voiceover_repair_rejects_generic_narration_when_window_evidence_exists(self) -> None:
         from trip_story import generate_trip_story
