@@ -12,7 +12,8 @@ PY_ENV_DIR="${PY_ENV_DIR:-$PROD_ROOT/env}"
 PYTHON_BIN="$PY_ENV_DIR/bin/python"
 SERVICE_PREFIX="${SERVICE_PREFIX:-tripstory}"
 PUBLISH_FRONTEND="${PUBLISH_FRONTEND:-0}"
-CLOUDFLARE_PAGES_PROJECT="${CLOUDFLARE_PAGES_PROJECT:-mangasmith}"
+CLOUDFLARE_PAGES_PROJECT="${CLOUDFLARE_PAGES_PROJECT:-trendsync}"
+CLOUDFLARE_PAGES_BRANCH="${CLOUDFLARE_PAGES_BRANCH:-main}"
 LOCAL_SOURCE_DIR="${LOCAL_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STOP_LEGACY_USER_SERVICES="${STOP_LEGACY_USER_SERVICES:-0}"
 
@@ -39,12 +40,26 @@ require_env_value() {
   fi
 }
 
+load_production_env() {
+  set -a
+  # shellcheck disable=SC1090
+  . "$PROD_ENV_FILE"
+  set +a
+  export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-${CLOUDFARE_API_TOKEN:-}}"
+}
+
 require_file "$PROD_ENV_FILE"
 require_env_value "TRIPSTORY_PUBLIC_API_URL"
 require_env_value "TRIPSTORY_CORS_ORIGINS"
 require_env_value "TRIPSTORY_REQUIRE_CLOUDFLARE_ACCESS"
 require_env_value "TRIPSTORY_TRUST_CLOUDFLARE_ACCESS_EMAIL"
 require_env_value "CLOUDFLARE_API_TOKEN"
+load_production_env
+
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-${npm_config_cache:-/tmp/tripstory-npm-cache}}"
+export npm_config_cache="$NPM_CONFIG_CACHE"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/tripstory-xdg}"
+mkdir -p "$NPM_CONFIG_CACHE" "$XDG_CONFIG_HOME"
 
 legacy_active=0
 for legacy_service in trendsync-api.service trendsync-worker.service trendsync-tunnel.service trendsync-redis.service; do
@@ -120,7 +135,7 @@ fi
   cd "$PROD_APP_DIR/mobile"
   npm ci
   npm run typecheck
-  EXPO_PUBLIC_API_URL=https://api.mangasmith.com npx expo export -p web --output-dir dist
+  EXPO_PUBLIC_API_URL="${TRIPSTORY_PUBLIC_API_URL:-https://api.mangasmith.com}" npx expo export -p web --output-dir dist
 )
 
 rm -rf "$PROD_FRONTEND_DIR"
@@ -130,7 +145,7 @@ cp -a "$PROD_APP_DIR/mobile/dist/." "$PROD_FRONTEND_DIR/"
 if [[ "$PUBLISH_FRONTEND" == "1" ]]; then
   (
     cd "$PROD_APP_DIR/mobile"
-    npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT"
+    npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT" --branch "$CLOUDFLARE_PAGES_BRANCH" --commit-dirty=true
   )
 else
   echo "Frontend build ready at $PROD_FRONTEND_DIR."
