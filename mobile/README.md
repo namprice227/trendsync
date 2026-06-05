@@ -48,20 +48,35 @@ collecting_context -> uploading -> ready_to_plan -> planning
 
 Users upload trip clips, answer travel-context questions, generate a multilingual voiceover plan, and render a simple recap video.
 
+## AI Providers
+
+The story form has provider cards for:
+
+- Local fallback: no backend key.
+- OpenAI: uses `OPENAI_API_KEY` from the API server environment.
+- Gemini: uses `GEMINI_API_KEY` from the API server environment.
+- DeepSeek: uses `DEEPSEEK_API_KEY` from the API server environment.
+
+Provider keys are configured in the backend `.env` file. The frontend does not expose or submit API keys.
+
+Recommended backend split: set `TRIPSTORY_LLM_PROVIDER=deepseek` with `DEEPSEEK_API_KEY` for story generation, and set `TRIPSTORY_VISION_PROVIDER=gemini` with `GEMINI_API_KEY` for sampled video-frame analysis.
+
 ## Current Scope
 
 Implemented:
 
 - API connection and session creation.
 - Video file upload through Expo DocumentPicker.
-- Trip context form with destination, dates, companions, highlights, tone, audience, language, notes, and model override.
-- Narrative plan display with voiceover, narrative arc, and edit notes.
-- Render request and video preview through Expo Video.
+- Trip context form with destination, dates, companions, highlights, tone, audience, language, notes, AI provider, and model override.
+- Clip intelligence display with quality, scene, audio, best-moment, scenic candidate, and optional speech-transcript signals.
+- Clip intelligence display with optional backend visual summaries, visible subjects, scenes, and smart moment descriptions.
+- Narrative plan display with voiceover, narrative arc, edit notes, LLM smart edit decisions, and the voiceover line assigned to each timeline segment.
+- Render request and video preview through Expo Video, with generated narration mixed in when backend TTS is configured.
+- Project library, reopen flow, favorite clip markers, timeline up/down ordering, export aspect-ratio controls, subtitle generation toggle, share action, and render progress display.
 
 Not implemented yet:
 
-- Login, project history, or persistent mobile project library.
+- Full login, teams, billing, roles, and native account management.
 - Native camera capture inside the TripStory flow.
-- Clip reordering, favorite markers, trimming, timeline editing, or aspect-ratio/export controls.
-- TTS voice selection, generated narration playback, subtitles, music, or share/download actions.
-- Offline mode, resumable uploads, and detailed render-progress percentages.
+- Drag-and-drop gestures, full timeline trimming, native share/download sheets, and offline/resumable uploads.
+- TTS voice selection, generated narration playback controls, music selection, and dedicated landmark classification.

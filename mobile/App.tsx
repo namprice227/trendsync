@@ -1,506 +1,343 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
-import { useVideoPlayer, VideoView } from 'expo-video';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
   TextInput,
-  useWindowDimensions,
   View,
 } from 'react-native';
 
 import {
+  absoluteUrl,
+  approveCreativeBrief,
   createSession,
+  deleteSession,
+  draftCreativeBrief,
+  duplicateSession,
   generateStory,
   getSession,
-  mediaUrl,
+  listSessions,
   normalizeBaseUrl,
   renderTripVideo,
   saveTripContext,
+  shareSession,
+  updateCreativeBrief,
+  updateTimelineSegments,
+  updateProjectMetadata,
+  updateVoiceoverSegments,
   uploadMedia,
 } from './src/api';
-import { colors, radii, shadow } from './src/theme';
-import type { TripContext, TripPhase, TripScreen, TripSession } from './src/types';
+import { colors, radii, layout } from './src/theme';
+import type { ProjectSummary, RenderOptions, TimelineSegmentUpdate, TripContext, TripSession, AppView, UploadProgress } from './src/types';
+import { PrimaryButton } from './src/components/PrimaryButton';
+import { DashboardScreen } from './src/screens/DashboardScreen';
+import { EditorScreen } from './src/screens/EditorScreen';
+import { busyPhases, planningPhases, sessionTitle } from './src/utils/helpers';
 
-const DEFAULT_API_URL = Platform.OS === 'android' ? 'http://10.0.2.2:8010' : 'http://localhost:8010';
-const busyPhases: TripPhase[] = ['uploading', 'planning', 'rendering'];
+declare const process: { env?: Record<string, string | undefined> };
 
-const LANGUAGES = [
-  { code: 'en', label: 'English' },
-  { code: 'vi', label: 'Vietnamese' },
-  { code: 'fr', label: 'French' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'ja', label: 'Japanese' },
-  { code: 'ko', label: 'Korean' },
-  { code: 'zh', label: 'Chinese' },
-];
+function defaultApiUrl(): string {
+  const configuredDefaultApiUrl = typeof process !== 'undefined' ? process.env?.EXPO_PUBLIC_API_URL?.trim() : '';
+  if (configuredDefaultApiUrl) return configuredDefaultApiUrl;
 
-const tripContextFields: Array<{
-  key: keyof TripContext;
-  label: string;
-  placeholder: string;
-  multiline?: boolean;
-  wide?: boolean;
-}> = [
-  { key: 'destination', label: 'Destination', placeholder: 'Kyoto, Da Nang, Iceland...' },
-  { key: 'duration', label: 'Trip length', placeholder: '5 days, long weekend, 2 weeks...' },
-  { key: 'travel_dates', label: 'Travel dates', placeholder: 'April 2026, summer break...' },
-  { key: 'companions', label: 'People', placeholder: 'Solo, family, partner, friends...' },
-  { key: 'places_visited', label: 'Places visited', placeholder: 'Old town, beach, mountain pass, night market...', multiline: true, wide: true },
-  { key: 'highlights', label: 'Best moments', placeholder: 'Food, sunset, funny moment, surprise stop...', multiline: true, wide: true },
-  { key: 'mood', label: 'Tone', placeholder: 'Warm, funny, reflective, cinematic...' },
-  { key: 'audience', label: 'Audience', placeholder: 'Friends, family, Instagram, private archive...' },
-  { key: 'notes', label: 'Extra notes', placeholder: 'Anything to avoid, inside jokes, must-use clips...', multiline: true, wide: true },
-  { key: 'llm_model', label: 'Model override', placeholder: 'Optional model name from your provider' },
-];
+  if (Platform.OS === 'web') {
+    const loc = typeof globalThis !== 'undefined' ? (globalThis as { location?: { hostname?: string; protocol?: string } }).location : undefined;
+    const host = loc?.hostname || '';
+    const protocol = loc?.protocol || 'http:';
 
-function PrimaryButton({
-  icon,
-  label,
-  onPress,
-  disabled,
-  tone = 'primary',
-}: {
-  icon: keyof typeof Ionicons.glyphMap;
-  label: string;
-  onPress: () => void;
-  disabled?: boolean;
-  tone?: 'primary' | 'light' | 'danger';
-}) {
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      style={({ pressed }) => [
-        styles.button,
-        tone === 'light' && styles.buttonLight,
-        tone === 'danger' && styles.buttonDanger,
-        disabled && styles.buttonDisabled,
-        pressed && !disabled && styles.buttonPressed,
-      ]}
-    >
-      <Ionicons name={icon} size={18} color={tone === 'light' ? colors.ink : colors.white} />
-      <Text style={[styles.buttonText, tone === 'light' && styles.buttonTextLight]}>{label}</Text>
-    </Pressable>
-  );
+    if (host === 'mangasmith.com' || host === 'www.mangasmith.com') {
+      return 'https://api.mangasmith.com';
+    }
+    if (host.endsWith('.mangasmith.com')) {
+      return `https://api.${host.replace(/^www\./, '')}`;
+    }
+    // For any other host (localhost, IP, custom domain), point to the same host on port 8010
+    if (host) {
+      return `${protocol}//${host}:8010`;
+    }
+  }
+
+  return Platform.OS === 'android' ? 'http://10.0.2.2:8010' : 'http://localhost:8010';
 }
 
-function MetricPill({
-  icon,
-  label,
-  value,
-}: {
-  icon: keyof typeof Ionicons.glyphMap;
-  label: string;
-  value: string;
-}) {
-  return (
-    <View style={styles.metricPill}>
-      <Ionicons name={icon} size={16} color={colors.blue} />
-      <View style={styles.metricTextWrap}>
-        <Text style={styles.metricValue}>{value}</Text>
-        <Text style={styles.metricLabel}>{label}</Text>
-      </View>
-    </View>
-  );
-}
+const DEFAULT_API_URL = defaultApiUrl();
 
-function PhaseRail({ screen, phase }: { screen: TripScreen; phase: TripPhase }) {
-  const steps: { key: TripScreen; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
-    { key: 'context', label: 'Context', icon: 'chatbubble-ellipses-outline' },
-    { key: 'upload', label: 'Media', icon: 'cloud-upload-outline' },
-    { key: 'plan', label: 'Story', icon: 'sparkles-outline' },
-    { key: 'output', label: 'Video', icon: 'film-outline' },
-  ];
-  const activeIndex = steps.findIndex((step) => step.key === screen);
-
-  return (
-    <View style={styles.phaseRail}>
-      {steps.map((step, index) => {
-        const active = index === activeIndex;
-        const done = index < activeIndex || phase === 'complete';
-        return (
-          <View key={step.key} style={styles.phaseItem}>
-            <View style={[styles.phaseIcon, active && styles.phaseIconActive, done && styles.phaseIconDone]}>
-              <Ionicons name={done ? 'checkmark' : step.icon} size={15} color={active || done ? colors.white : colors.muted} />
-            </View>
-            <Text style={[styles.phaseText, active && styles.phaseTextActive]}>{step.label}</Text>
-          </View>
-        );
-      })}
-    </View>
-  );
-}
-
-function StatusStrip({ session }: { session: TripSession }) {
-  const toneStyle =
-    session.phase === 'error'
-      ? styles.statusError
-      : session.phase === 'complete'
-        ? styles.statusDone
-        : session.phase === 'ready_to_render'
-          ? styles.statusInfo
-          : styles.statusNeutral;
-
-  return (
-    <View style={[styles.statusStrip, toneStyle]}>
-      <View style={styles.statusIcon}>
-        <Ionicons
-          name={session.phase === 'complete' ? 'checkmark' : session.phase === 'error' ? 'warning-outline' : 'pulse-outline'}
-          size={16}
-          color={session.phase === 'error' ? colors.red : session.phase === 'complete' ? colors.green : colors.blue}
-        />
-      </View>
-      <View style={styles.statusCopy}>
-        <Text style={styles.statusLabel}>{session.progress_label}</Text>
-        <Text style={styles.statusAction}>{session.error || session.next_action}</Text>
-      </View>
-    </View>
-  );
-}
-
-function AppShell({
+// --- Slim top bar for the editor view ---
+function EditorTopBar({
   session,
   apiUrl,
   apiDraft,
   setApiDraft,
   onReconnect,
-  children,
+  onRestart,
+  creatingProject,
+  onBackToDashboard,
 }: {
-  session: TripSession | null;
+  session: TripSession;
   apiUrl: string;
   apiDraft: string;
   setApiDraft: (value: string) => void;
   onReconnect: () => void;
-  children: React.ReactNode;
-}) {
-  const { width } = useWindowDimensions();
-  const compact = width < 760;
-
-  return (
-    <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle="dark-content" />
-      <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <View style={[styles.header, compact && styles.headerCompact]}>
-          <View style={styles.brandLockup}>
-            <View style={styles.brandMark}>
-              <Ionicons name="film-outline" size={18} color={colors.white} />
-            </View>
-            <View>
-              <Text style={styles.brand}>TripStory</Text>
-              <Text style={styles.brandSub}>Holiday narrative studio</Text>
-            </View>
-          </View>
-          <View style={styles.serverBox}>
-            <TextInput
-              value={apiDraft}
-              onChangeText={setApiDraft}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="url"
-              style={styles.serverInput}
-              placeholder={apiUrl}
-              placeholderTextColor={colors.muted}
-            />
-            <Pressable onPress={onReconnect} style={styles.serverButton}>
-              <Ionicons name="sync" size={16} color={colors.blue} />
-            </Pressable>
-          </View>
-        </View>
-        <View style={styles.shellChrome}>
-          {session ? <PhaseRail screen={session.screen} phase={session.phase} /> : null}
-          {session ? <StatusStrip session={session} /> : null}
-        </View>
-        {children}
-      </KeyboardAvoidingView>
-    </SafeAreaView>
-  );
-}
-
-function Field({
-  label,
-  value,
-  onChangeText,
-  placeholder,
-  multiline,
-  wide,
-}: {
-  label: string;
-  value: string;
-  onChangeText: (value: string) => void;
-  placeholder: string;
-  multiline?: boolean;
-  wide?: boolean;
+  onRestart: () => void;
+  creatingProject: boolean;
+  onBackToDashboard: () => void;
 }) {
   return (
-    <View style={[styles.field, wide ? styles.fieldWide : styles.fieldHalf]}>
-      <Text style={styles.fieldLabel}>{label}</Text>
-      <TextInput
-        value={value}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor={colors.muted}
-        multiline={multiline}
-        style={[styles.input, multiline && styles.inputTall]}
-      />
+    <View style={styles.editorTopBar}>
+      {/* Left: back + brand */}
+      <View style={styles.topBarLeft}>
+        <Pressable onPress={onBackToDashboard} style={styles.backButton}>
+          <Ionicons name="chevron-back" size={16} color={colors.graphite} />
+        </Pressable>
+        <View style={styles.brandMark}>
+          <Ionicons name="film-outline" size={14} color={colors.white} />
+        </View>
+        <Text style={styles.topBarTitle} numberOfLines={1}>{sessionTitle(session)}</Text>
+      </View>
+
+      {/* Center: API URL (compact) */}
+      <View style={styles.topBarCenter}>
+        <TextInput
+          value={apiDraft}
+          onChangeText={setApiDraft}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          style={styles.serverInputCompact}
+          placeholder={apiUrl}
+          placeholderTextColor={colors.subtle}
+        />
+        <Pressable onPress={onReconnect} style={styles.serverSync}>
+          <Ionicons name="sync" size={13} color={colors.blue} />
+        </Pressable>
+      </View>
+
+      {/* Right: actions */}
+      <View style={styles.topBarRight}>
+        <Pressable onPress={onRestart} disabled={creatingProject} style={[styles.newProjectBtn, creatingProject && styles.btnDisabled]}>
+          <Ionicons name={creatingProject ? 'hourglass-outline' : 'add'} size={15} color={colors.blue} />
+        </Pressable>
+      </View>
     </View>
   );
 }
 
-function LanguagePicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+// --- Dashboard top bar ---
+function DashboardTopBar({
+  apiUrl,
+  apiDraft,
+  setApiDraft,
+  onReconnect,
+  onRestart,
+  creatingProject,
+}: {
+  apiUrl: string;
+  apiDraft: string;
+  setApiDraft: (value: string) => void;
+  onReconnect: () => void;
+  onRestart: () => void;
+  creatingProject: boolean;
+}) {
   return (
-    <View style={styles.chipRow}>
-      {LANGUAGES.map((language) => {
-        const active = value === language.code;
-        return (
-          <Pressable key={language.code} onPress={() => onChange(language.code)} style={[styles.chip, active && styles.chipActive]}>
-            <Text style={[styles.chipText, active && styles.chipTextActive]}>{language.label}</Text>
-          </Pressable>
-        );
-      })}
+    <View style={styles.dashboardTopBar}>
+      <View style={styles.brandLockup}>
+        <View style={styles.brandMarkLg}>
+          <Ionicons name="film-outline" size={18} color={colors.white} />
+        </View>
+        <View>
+          <Text style={styles.brand}>TripStory</Text>
+          <Text style={styles.brandSub}>Holiday narrative studio</Text>
+        </View>
+      </View>
+
+      <View style={styles.serverBox}>
+        <TextInput
+          value={apiDraft}
+          onChangeText={setApiDraft}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          style={styles.serverInput}
+          placeholder={apiUrl}
+          placeholderTextColor={colors.muted}
+        />
+        <Pressable onPress={onReconnect} style={styles.serverButton}>
+          <Ionicons name="sync" size={16} color={colors.blue} />
+        </Pressable>
+      </View>
+
+      <Pressable onPress={onRestart} disabled={creatingProject} style={[styles.restartButton, creatingProject && styles.btnDisabled]}>
+        <Ionicons name={creatingProject ? 'hourglass-outline' : 'add-circle-outline'} size={17} color={colors.white} />
+        <Text style={styles.restartText}>{creatingProject ? 'Creating' : 'New project'}</Text>
+      </Pressable>
     </View>
-  );
-}
-
-function ContextScreen({
-  session,
-  onSave,
-  onUpload,
-  onGenerate,
-}: {
-  session: TripSession;
-  onSave: (context: TripContext) => void;
-  onUpload: () => void;
-  onGenerate: (context: TripContext) => void;
-}) {
-  const { width } = useWindowDimensions();
-  const [context, setContext] = useState<TripContext>(session.trip_context);
-  const hasMedia = session.media_items.length > 0;
-  const canGenerate = hasMedia && context.destination.trim().length > 0 && session.phase !== 'planning';
-  const desktop = width >= 920;
-
-  useEffect(() => {
-    setContext(session.trip_context);
-  }, [session.trip_context]);
-
-  const update = (key: keyof TripContext, value: string) => {
-    setContext((current) => ({ ...current, [key]: value }));
-  };
-
-  return (
-    <ScrollView contentContainerStyle={styles.screen}>
-      <View style={[styles.contextLayout, desktop && styles.contextLayoutDesktop]}>
-        <View style={[styles.studioPanel, desktop && styles.studioPanelDesktop]}>
-          <View style={styles.heroPanel}>
-            <Text style={styles.eyebrow}>Trip brief</Text>
-            <Text style={styles.heroTitle}>Shape a recap people will actually want to watch.</Text>
-            <Text style={styles.heroCopy}>
-              Add the memory cues, upload the raw clips, then generate a story plan with voiceover and edit notes.
-            </Text>
-          </View>
-
-          <View style={styles.metricsGrid}>
-            <MetricPill icon="videocam-outline" label="Uploaded clips" value={`${session.media_items.length}`} />
-            <MetricPill icon="language-outline" label="Voiceover" value={context.language.toUpperCase()} />
-          </View>
-
-          <Pressable onPress={onUpload} style={({ pressed }) => [styles.uploadZone, pressed && styles.uploadZonePressed]}>
-            <View style={styles.uploadIcon}>
-              <Ionicons name="cloud-upload-outline" size={28} color={colors.blue} />
-            </View>
-            <Text style={styles.uploadTitle}>Add trip videos</Text>
-            <Text style={styles.uploadCopy}>Select one or more clips. The renderer stitches uploaded video in order for this MVP.</Text>
-          </Pressable>
-
-          <View style={styles.heroActions}>
-            <PrimaryButton icon="save-outline" label="Save context" onPress={() => onSave(context)} tone="light" />
-            <PrimaryButton icon="sparkles-outline" label="Generate plan" onPress={() => onGenerate(context)} disabled={!canGenerate} />
-          </View>
-          {!hasMedia ? <Text style={styles.muted}>Upload at least one video before generating the story.</Text> : null}
-        </View>
-
-        <View style={[styles.panel, styles.formPanel]}>
-          <View style={styles.panelHeading}>
-            <View>
-              <Text style={styles.title}>Story inputs</Text>
-              <Text style={styles.muted}>Keep it specific. Names, places, and tiny moments make the generated script feel personal.</Text>
-            </View>
-          </View>
-          <View style={styles.formGrid}>
-            {tripContextFields.map((field) => (
-              <Field
-                key={field.key}
-                label={field.label}
-                value={context[field.key]}
-                onChangeText={(value) => update(field.key, value)}
-                placeholder={field.placeholder}
-                multiline={field.multiline}
-                wide={field.wide}
-              />
-            ))}
-            <View style={styles.fieldWide}>
-              <Text style={styles.fieldLabel}>Voiceover language</Text>
-              <LanguagePicker value={context.language} onChange={(value) => update('language', value)} />
-            </View>
-          </View>
-        </View>
-      </View>
-    </ScrollView>
-  );
-}
-
-function PlanScreen({
-  session,
-  onGenerate,
-  onRender,
-}: {
-  session: TripSession;
-  onGenerate: () => void;
-  onRender: () => void;
-}) {
-  const plan = session.story_plan;
-  const busy = session.phase === 'planning' || session.phase === 'rendering';
-
-  return (
-    <ScrollView contentContainerStyle={styles.screen}>
-      <View style={styles.panel}>
-        <View style={styles.panelHeading}>
-          <View>
-            <Text style={styles.title}>{plan?.title || 'Narrative plan'}</Text>
-            <Text style={styles.muted}>{plan?.tone ? `${plan.tone} tone` : 'Generate a voiceover and edit structure from your trip brief.'}</Text>
-          </View>
-          {plan?.language ? <MetricPill icon="language-outline" label="Language" value={plan.language.toUpperCase()} /> : null}
-        </View>
-        {busy && session.phase === 'planning' ? (
-          <View style={styles.waitPanel}>
-            <ActivityIndicator color={colors.blue} />
-            <Text style={styles.waitText}>Writing voiceover and edit notes.</Text>
-          </View>
-        ) : null}
-        {plan?.voiceover_script ? (
-          <>
-            <Text style={styles.sectionTitle}>Voiceover</Text>
-            <Text style={styles.script}>{plan.voiceover_script}</Text>
-          </>
-        ) : (
-          <Text style={styles.muted}>Generate a narrative plan to see the voiceover script.</Text>
-        )}
-      </View>
-
-      {plan?.narrative_arc?.length ? (
-        <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Narrative arc</Text>
-          {plan.narrative_arc.map((item, index) => (
-            <View key={`${item}-${index}`} style={styles.timelineItem}>
-              <Text style={styles.timelineNumber}>{index + 1}</Text>
-              <Text style={styles.timelineText}>{item}</Text>
-            </View>
-          ))}
-        </View>
-      ) : null}
-
-      {plan?.edit_notes?.length ? (
-        <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Edit notes</Text>
-          {plan.edit_notes.map((item, index) => (
-            <Text key={`${item}-${index}`} style={styles.listItem}>• {item}</Text>
-          ))}
-        </View>
-      ) : null}
-
-      <View style={styles.actionRow}>
-        <PrimaryButton icon="refresh-outline" label="Regenerate" onPress={onGenerate} disabled={busy || session.media_items.length === 0} tone="light" />
-        <PrimaryButton icon="film-outline" label="Render video" onPress={onRender} disabled={busy || !plan || session.recorded_clips.length === 0} />
-      </View>
-    </ScrollView>
-  );
-}
-
-function OutputVideo({ source }: { source: string }) {
-  const player = useVideoPlayer(source, (instance) => {
-    instance.loop = false;
-  });
-
-  return <VideoView player={player} style={styles.video} allowsFullscreen contentFit="contain" />;
-}
-
-function OutputScreen({ apiUrl, session, onRender }: { apiUrl: string; session: TripSession; onRender: () => void }) {
-  const finalUrl = mediaUrl(apiUrl, session.final_video_url);
-  const waiting = session.phase === 'rendering';
-
-  return (
-    <ScrollView contentContainerStyle={styles.screen}>
-      <View style={styles.panel}>
-        <View style={styles.panelHeading}>
-          <View>
-            <Text style={styles.title}>Holiday recap</Text>
-            <Text style={styles.muted}>Preview the rendered stitch and reuse the script for narration.</Text>
-          </View>
-        </View>
-        {waiting ? (
-          <View style={styles.waitPanel}>
-            <ActivityIndicator color={colors.blue} />
-            <Text style={styles.waitText}>Rendering uploaded clips.</Text>
-          </View>
-        ) : null}
-        {finalUrl ? <OutputVideo source={finalUrl} /> : <Text style={styles.muted}>Render the video after generating a story plan.</Text>}
-        <PrimaryButton icon="film-outline" label="Render again" onPress={onRender} disabled={waiting || !session.story_plan} tone="light" />
-      </View>
-
-      {session.script ? (
-        <View style={styles.panel}>
-          <Text style={styles.sectionTitle}>Voiceover script</Text>
-          <Text style={styles.script}>{session.script}</Text>
-        </View>
-      ) : null}
-    </ScrollView>
   );
 }
 
 export default function App() {
   const [apiDraft, setApiDraft] = useState(DEFAULT_API_URL);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
+  const [view, setView] = useState<AppView>('dashboard');
   const [session, setSession] = useState<TripSession | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+
+  const refreshProjects = useCallback(async (baseUrl: string) => {
+    const items = await listSessions(baseUrl);
+    setProjects(items);
+    return items;
+  }, []);
 
   const connect = useCallback(async () => {
     const nextUrl = normalizeBaseUrl(apiDraft);
+    setLoadingProjects(true);
     try {
       setError(null);
       setApiUrl(nextUrl);
-      const created = await createSession(nextUrl);
-      setSession(created);
+      await refreshProjects(nextUrl);
+      setSession(null);
+      setView('dashboard');
     } catch (connectError) {
       setSession(null);
+      setProjects([]);
+      setView('dashboard');
       setError(connectError instanceof Error ? connectError.message : 'Could not reach TripStory API');
+    } finally {
+      setLoadingProjects(false);
     }
-  }, [apiDraft]);
+  }, [apiDraft, refreshProjects]);
 
   useEffect(() => {
     connect();
-  }, []);
+  }, [connect]);
 
   useEffect(() => {
-    if (!session) return;
+    if (!session || view !== 'project') return;
     const intervalMs = busyPhases.includes(session.phase) ? 1500 : 4500;
     const timer = setInterval(async () => {
       try {
         const updated = await getSession(apiUrl, session.id);
         setSession(updated);
+        if (!busyPhases.includes(updated.phase)) {
+          refreshProjects(apiUrl).catch(() => undefined);
+        }
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : 'Lost server connection');
       }
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [apiUrl, session?.id, session?.phase]);
+  }, [apiUrl, refreshProjects, session?.id, session?.phase, view]);
+
+  const onOpenProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const opened = await getSession(apiUrl, sessionId);
+        setSession(opened);
+        setView('project');
+      } catch (openError) {
+        setError(openError instanceof Error ? openError.message : 'Could not open project');
+      }
+    },
+    [apiUrl]
+  );
+
+  const onNewProject = useCallback(async () => {
+    setCreatingProject(true);
+    try {
+      setError(null);
+      const created = await createSession(apiUrl);
+      setSession(created);
+      setView('project');
+      await refreshProjects(apiUrl);
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : 'Could not create project');
+    } finally {
+      setCreatingProject(false);
+    }
+  }, [apiUrl, refreshProjects]);
+
+  const onBackToDashboard = useCallback(() => {
+    setView('dashboard');
+    refreshProjects(apiUrl).catch(() => undefined);
+  }, [apiUrl, refreshProjects]);
+
+  const onRenameProject = useCallback(
+    async (sessionId: string, title: string) => {
+      try {
+        setError(null);
+        const updated = await updateProjectMetadata(apiUrl, sessionId, { title });
+        if (session?.id === sessionId) {
+          setSession(updated);
+        }
+        await refreshProjects(apiUrl);
+      } catch (renameError) {
+        setError(renameError instanceof Error ? renameError.message : 'Could not rename project');
+        throw renameError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
+
+  const onDuplicateProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const duplicate = await duplicateSession(apiUrl, sessionId);
+        await refreshProjects(apiUrl);
+        return duplicate;
+      } catch (duplicateError) {
+        setError(duplicateError instanceof Error ? duplicateError.message : 'Could not duplicate project');
+        throw duplicateError;
+      }
+    },
+    [apiUrl, refreshProjects]
+  );
+
+  const onDeleteProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        await deleteSession(apiUrl, sessionId);
+        await refreshProjects(apiUrl);
+        if (session?.id === sessionId) {
+          setSession(null);
+          setView('dashboard');
+        }
+      } catch (deleteError) {
+        setError(deleteError instanceof Error ? deleteError.message : 'Could not delete project');
+        throw deleteError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
+
+  const onShareProject = useCallback(
+    async (sessionId: string) => {
+      try {
+        setError(null);
+        const shared = await shareSession(apiUrl, sessionId);
+        if (session?.id === sessionId) {
+          setSession(shared.session);
+        }
+        await refreshProjects(apiUrl);
+        return absoluteUrl(apiUrl, shared.share_url);
+      } catch (shareError) {
+        setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+        throw shareError;
+      }
+    },
+    [apiUrl, refreshProjects, session?.id]
+  );
 
   const onSaveContext = useCallback(
     async (context: TripContext) => {
@@ -509,105 +346,239 @@ export default function App() {
         setError(null);
         const updated = await saveTripContext(apiUrl, session.id, context);
         setSession(updated);
+        await refreshProjects(apiUrl);
       } catch (saveError) {
         setError(saveError instanceof Error ? saveError.message : 'Could not save context');
       }
     },
-    [apiUrl, session]
+    [apiUrl, refreshProjects, session]
   );
 
   const onUpload = useCallback(async () => {
-    if (!session) return;
+    if (!session || uploadProgress) return;
     const result = await DocumentPicker.getDocumentAsync({
       type: 'video/*',
       copyToCacheDirectory: true,
       multiple: true,
     });
     if (result.canceled || !result.assets?.length) return;
+    const fileCount = result.assets.length;
     try {
       setError(null);
-      const updated = await uploadMedia(apiUrl, session.id, result.assets);
+      setUploadProgress({
+        phase: 'uploading',
+        fileCount,
+        loadedBytes: 0,
+        totalBytes: null,
+        percent: 0,
+      });
+      const updated = await uploadMedia(apiUrl, session.id, result.assets, (progress) => {
+        setUploadProgress({
+          phase: progress.percent !== null && progress.percent >= 100 ? 'processing' : 'uploading',
+          fileCount,
+          loadedBytes: progress.loadedBytes,
+          totalBytes: progress.totalBytes,
+          percent: progress.percent,
+        });
+      });
       setSession(updated);
+      await refreshProjects(apiUrl);
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : 'Upload failed');
+    } finally {
+      setUploadProgress(null);
     }
-  }, [apiUrl, session]);
+  }, [apiUrl, refreshProjects, session, uploadProgress]);
 
-  const onGenerate = useCallback(async () => {
+  const onDraftCreativeBrief = useCallback(async (context: TripContext) => {
+    if (!session || planningPhases.includes(session.phase)) return;
+    try {
+      setError(null);
+      const saved = await saveTripContext(apiUrl, session.id, context);
+      setSession(saved);
+      const updated = await draftCreativeBrief(apiUrl, saved.id);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (briefError) {
+      setError(briefError instanceof Error ? briefError.message : 'Could not draft producer brief');
+      throw briefError;
+    }
+  }, [apiUrl, refreshProjects, session]);
+
+  const onUpdateCreativeBrief = useCallback(async (patch: { selected_direction_id?: string | null; answers?: Array<{ question_id: string; answer: string }>; notes?: string | null }) => {
     if (!session) return;
     try {
       setError(null);
-      const updated = await generateStory(apiUrl, session.id);
+      const updated = await updateCreativeBrief(apiUrl, session.id, patch);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (briefError) {
+      setError(briefError instanceof Error ? briefError.message : 'Could not save producer brief');
+      throw briefError;
+    }
+  }, [apiUrl, refreshProjects, session]);
+
+  const onApproveCreativeBrief = useCallback(async (patch: { selected_direction_id?: string | null; answers?: Array<{ question_id: string; answer: string }>; notes?: string | null }) => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await approveCreativeBrief(apiUrl, session.id, patch);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (briefError) {
+      setError(briefError instanceof Error ? briefError.message : 'Could not approve producer brief');
+      throw briefError;
+    }
+  }, [apiUrl, refreshProjects, session]);
+
+  const onGenerate = useCallback(async (options?: RenderOptions) => {
+    if (!session || planningPhases.includes(session.phase)) return;
+    try {
+      setError(null);
+      const updated = await generateStory(apiUrl, session.id, options);
       setSession(updated);
     } catch (generateError) {
       setError(generateError instanceof Error ? generateError.message : 'Story generation failed');
     }
   }, [apiUrl, session]);
 
-  const onGenerateFromContext = useCallback(
-    async (context: TripContext) => {
-      if (!session) return;
-      try {
-        setError(null);
-        const saved = await saveTripContext(apiUrl, session.id, context);
-        setSession(saved);
-        const updated = await generateStory(apiUrl, saved.id);
-        setSession(updated);
-      } catch (generateError) {
-        setError(generateError instanceof Error ? generateError.message : 'Story generation failed');
-      }
-    },
-    [apiUrl, session]
-  );
-
-  const onRender = useCallback(async () => {
+  const onRender = useCallback(async (options: RenderOptions) => {
     if (!session) return;
     try {
       setError(null);
-      const updated = await renderTripVideo(apiUrl, session.id);
+      const updated = await renderTripVideo(apiUrl, session.id, options);
       setSession(updated);
     } catch (renderError) {
       setError(renderError instanceof Error ? renderError.message : 'Render failed');
     }
   }, [apiUrl, session]);
 
-  const content = useMemo(() => {
-    if (!session) {
-      return (
-        <View style={styles.screen}>
-          <View style={styles.panel}>
-            <Text style={styles.title}>Connect server</Text>
-            <Text style={styles.muted}>{error || 'TripStory API is not connected.'}</Text>
-            <PrimaryButton icon="sync" label="Reconnect" onPress={connect} />
-          </View>
-        </View>
-      );
+  const onSaveVoiceoverSegments = useCallback(async (segments: Array<{ segment_id: string; voiceover: string; caption?: string }>) => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await updateVoiceoverSegments(apiUrl, session.id, segments);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save segment scripts');
+      throw saveError;
     }
-    if (session.screen === 'plan') {
-      return <PlanScreen session={session} onGenerate={onGenerate} onRender={onRender} />;
-    }
-    if (session.screen === 'output') {
-      return <OutputScreen apiUrl={apiUrl} session={session} onRender={onRender} />;
-    }
-    return <ContextScreen session={session} onSave={onSaveContext} onUpload={onUpload} onGenerate={onGenerateFromContext} />;
-  }, [apiUrl, connect, error, onGenerate, onGenerateFromContext, onRender, onSaveContext, onUpload, session]);
+  }, [apiUrl, refreshProjects, session]);
 
-  return (
-    <AppShell
-      session={session}
-      apiUrl={apiUrl}
-      apiDraft={apiDraft}
-      setApiDraft={setApiDraft}
-      onReconnect={connect}
-    >
-      {error && session?.phase !== 'error' ? (
-        <View style={styles.inlineError}>
-          <Ionicons name="warning-outline" size={16} color={colors.red} />
-          <Text style={styles.inlineErrorText}>{error}</Text>
+  const onSaveTimelineSegments = useCallback(async (segments: TimelineSegmentUpdate[], segmentOrder: string[]) => {
+    if (!session) return;
+    try {
+      setError(null);
+      const updated = await updateTimelineSegments(apiUrl, session.id, segments, segmentOrder);
+      setSession(updated);
+      await refreshProjects(apiUrl);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save timeline edits');
+      throw saveError;
+    }
+  }, [apiUrl, refreshProjects, session]);
+
+  const onShare = useCallback(async () => {
+    if (!session) return;
+    try {
+      const url = await onShareProject(session.id);
+      setError(`Share link: ${url}`);
+    } catch (shareError) {
+      setError(shareError instanceof Error ? shareError.message : 'Could not share project');
+    }
+  }, [onShareProject, session]);
+
+  // --- Render ---
+
+  // Dashboard view
+  if (view === 'dashboard') {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle="light-content" />
+        <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+          <DashboardTopBar
+            apiUrl={apiUrl}
+            apiDraft={apiDraft}
+            setApiDraft={setApiDraft}
+            onReconnect={connect}
+            onRestart={onNewProject}
+            creatingProject={creatingProject}
+          />
+          {error ? (
+            <View style={styles.inlineError}>
+              <Ionicons name="warning-outline" size={16} color={colors.red} />
+              <Text style={styles.inlineErrorText}>{error}</Text>
+            </View>
+          ) : null}
+          <DashboardScreen
+            projects={projects}
+            loading={loadingProjects}
+            creating={creatingProject}
+            onOpen={onOpenProject}
+            onNew={onNewProject}
+            onRename={onRenameProject}
+            onDuplicate={onDuplicateProject}
+            onDelete={onDeleteProject}
+            onShare={onShareProject}
+          />
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    );
+  }
+
+  // No session fallback
+  if (!session) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.connectScreen}>
+          <Text style={styles.connectTitle}>Connect server</Text>
+          <Text style={styles.connectMuted}>{error || 'TripStory API is not connected.'}</Text>
+          <PrimaryButton icon="sync" label="Reconnect" onPress={connect} />
         </View>
-      ) : null}
-      {content}
-    </AppShell>
+      </SafeAreaView>
+    );
+  }
+
+  // Editor view
+  return (
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle="light-content" />
+      <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <EditorTopBar
+          session={session}
+          apiUrl={apiUrl}
+          apiDraft={apiDraft}
+          setApiDraft={setApiDraft}
+          onReconnect={connect}
+          onRestart={onNewProject}
+          creatingProject={creatingProject}
+          onBackToDashboard={onBackToDashboard}
+        />
+        {error && session.phase !== 'error' ? (
+          <View style={styles.inlineError}>
+            <Ionicons name="warning-outline" size={16} color={colors.red} />
+            <Text style={styles.inlineErrorText}>{error}</Text>
+          </View>
+        ) : null}
+        <EditorScreen
+          apiUrl={apiUrl}
+          session={session}
+          uploadProgress={uploadProgress}
+          onSaveContext={onSaveContext}
+          onUpload={onUpload}
+          onDraftCreativeBrief={onDraftCreativeBrief}
+          onUpdateCreativeBrief={onUpdateCreativeBrief}
+          onApproveCreativeBrief={onApproveCreativeBrief}
+          onGenerate={onGenerate}
+          onRender={onRender}
+          onSaveVoiceoverSegments={onSaveVoiceoverSegments}
+          onSaveTimelineSegments={onSaveTimelineSegments}
+          onShare={onShare}
+        />
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }
 
@@ -620,31 +591,114 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.paper,
   },
-  header: {
+
+  // --- Editor top bar ---
+  editorTopBar: {
+    height: layout.topBarHeight,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    gap: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.line,
+    backgroundColor: colors.surface,
+  },
+  topBarLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    minWidth: 180,
+  },
+  backButton: {
+    width: 32,
+    height: 32,
+    borderRadius: radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.surfaceRaised,
+    ...(Platform.OS === 'web' ? ({ cursor: 'pointer' } as any) : {}),
+  },
+  brandMark: {
+    width: 28,
+    height: 28,
+    borderRadius: radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.blueDark,
+  },
+  topBarTitle: {
+    color: colors.ink,
+    fontSize: 14,
+    fontWeight: '800',
+    maxWidth: 200,
+  },
+  topBarCenter: {
+    flex: 1,
+    maxWidth: 300,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: radii.sm,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.surfaceRaised,
+    height: 32,
+  },
+  serverInputCompact: {
+    flex: 1,
+    height: 30,
+    paddingHorizontal: 10,
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  serverSync: {
+    width: 30,
+    height: 30,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  topBarRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  newProjectBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.surfaceRaised,
+    borderWidth: 1,
+    borderColor: colors.line,
+    ...(Platform.OS === 'web' ? ({ cursor: 'pointer' } as any) : {}),
+  },
+
+  // --- Dashboard top bar ---
+  dashboardTopBar: {
     paddingHorizontal: 22,
-    paddingTop: 14,
+    paddingTop: 12,
     paddingBottom: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     gap: 16,
-  },
-  headerCompact: {
-    alignItems: 'stretch',
-    flexDirection: 'column',
+    borderBottomWidth: 1,
+    borderBottomColor: colors.line,
+    backgroundColor: colors.surface,
   },
   brandLockup: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
   },
-  brandMark: {
+  brandMarkLg: {
     width: 38,
     height: 38,
     borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.ink,
+    backgroundColor: colors.blueDark,
   },
   brand: {
     color: colors.ink,
@@ -667,7 +721,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.line,
     borderRadius: radii.md,
-    backgroundColor: colors.surface,
+    backgroundColor: colors.surfaceRaised,
   },
   serverInput: {
     flex: 1,
@@ -683,433 +737,36 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  shellChrome: {
-    paddingHorizontal: 22,
-    gap: 10,
-  },
-  phaseRail: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 10,
+  restartButton: {
+    minHeight: 42,
     borderRadius: radii.md,
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.line,
-  },
-  phaseItem: {
-    flex: 1,
-    alignItems: 'center',
-    gap: 5,
-  },
-  phaseIcon: {
-    width: 28,
-    height: 28,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.white,
-  },
-  phaseIconActive: {
     backgroundColor: colors.blue,
-    borderColor: colors.blue,
-  },
-  phaseIconDone: {
-    backgroundColor: colors.green,
-    borderColor: colors.green,
-  },
-  phaseText: {
-    color: colors.muted,
-    fontSize: 11,
-    lineHeight: 14,
-    fontWeight: '700',
-  },
-  phaseTextActive: {
-    color: colors.ink,
-  },
-  statusStrip: {
-    marginBottom: 10,
-    borderRadius: radii.md,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    borderWidth: 1,
-    flexDirection: 'row',
-    gap: 10,
-    alignItems: 'center',
-  },
-  statusNeutral: {
-    backgroundColor: colors.surface,
-    borderColor: colors.line,
-  },
-  statusInfo: {
-    backgroundColor: '#edf6f7',
-    borderColor: '#c8dcdf',
-  },
-  statusDone: {
-    backgroundColor: '#edf6ef',
-    borderColor: '#c9dfce',
-  },
-  statusError: {
-    backgroundColor: '#fff2ee',
-    borderColor: '#f0c5ba',
-  },
-  statusIcon: {
-    width: 34,
-    height: 34,
-    borderRadius: radii.md,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.white,
+    flexDirection: 'row',
+    gap: 7,
+    paddingHorizontal: 12,
   },
-  statusCopy: {
-    flex: 1,
-  },
-  statusLabel: {
-    color: colors.ink,
+  restartText: {
+    color: colors.white,
     fontSize: 13,
     lineHeight: 17,
-    fontWeight: '800',
-  },
-  statusAction: {
-    marginTop: 2,
-    color: colors.graphite,
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: '600',
-  },
-  screen: {
-    width: '100%',
-    maxWidth: 1180,
-    alignSelf: 'center',
-    paddingHorizontal: 22,
-    paddingTop: 8,
-    paddingBottom: 32,
-    gap: 16,
-  },
-  contextLayout: {
-    gap: 16,
-  },
-  contextLayoutDesktop: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-  },
-  studioPanel: {
-    gap: 12,
-  },
-  studioPanelDesktop: {
-    width: 350,
-    flexShrink: 0,
-  },
-  heroPanel: {
-    minHeight: 230,
-    backgroundColor: colors.ink,
-    borderRadius: radii.md,
-    padding: 20,
-    gap: 14,
-    justifyContent: 'flex-end',
-    overflow: 'hidden',
-  },
-  eyebrow: {
-    color: '#a9d8dc',
-    fontSize: 11,
-    fontWeight: '900',
-    textTransform: 'uppercase',
-    letterSpacing: 0,
-  },
-  heroTitle: {
-    color: colors.white,
-    fontSize: 30,
-    lineHeight: 35,
     fontWeight: '900',
   },
-  heroCopy: {
-    color: '#dce8df',
-    fontSize: 14,
-    lineHeight: 21,
-    fontWeight: '600',
-  },
-  heroActions: {
-    flexDirection: 'row',
-    gap: 10,
-    flexWrap: 'wrap',
-  },
-  metricsGrid: {
-    flexDirection: 'row',
-    gap: 10,
-    flexWrap: 'wrap',
-  },
-  metricPill: {
-    minHeight: 56,
-    flexGrow: 1,
-    flexBasis: 150,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    borderWidth: 1,
-    borderColor: colors.line,
-    borderRadius: radii.md,
-    paddingHorizontal: 12,
-    backgroundColor: colors.surface,
-  },
-  metricTextWrap: {
-    flex: 1,
-  },
-  metricValue: {
-    color: colors.ink,
-    fontSize: 15,
-    lineHeight: 19,
-    fontWeight: '900',
-  },
-  metricLabel: {
-    color: colors.muted,
-    fontSize: 11,
-    lineHeight: 15,
-    fontWeight: '700',
-  },
-  uploadZone: {
-    minHeight: 178,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    backgroundColor: colors.mist,
-    padding: 18,
-    justifyContent: 'center',
-    gap: 10,
-  },
-  uploadZonePressed: {
-    transform: [{ scale: 0.995 }],
-  },
-  uploadIcon: {
-    width: 56,
-    height: 56,
-    borderRadius: radii.md,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.white,
-  },
-  uploadTitle: {
-    color: colors.ink,
-    fontSize: 19,
-    lineHeight: 24,
-    fontWeight: '900',
-  },
-  uploadCopy: {
-    color: colors.graphite,
-    fontSize: 13,
-    lineHeight: 19,
-    fontWeight: '600',
-  },
-  panel: {
-    backgroundColor: colors.surface,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    padding: 18,
-    gap: 14,
-    ...shadow,
-  },
-  formPanel: {
-    flex: 1,
-  },
-  panelHeading: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    gap: 14,
-    flexWrap: 'wrap',
-  },
-  title: {
-    color: colors.ink,
-    fontSize: 23,
-    lineHeight: 29,
-    fontWeight: '900',
-  },
-  sectionTitle: {
-    color: colors.ink,
-    fontSize: 16,
-    lineHeight: 21,
-    fontWeight: '900',
-  },
-  muted: {
-    color: colors.muted,
-    fontSize: 13,
-    lineHeight: 18,
-    fontWeight: '600',
-  },
-  formGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 12,
-  },
-  field: {
-    minWidth: 220,
-    gap: 6,
-  },
-  fieldHalf: {
-    flexGrow: 1,
-    flexBasis: 260,
-  },
-  fieldWide: {
-    width: '100%',
-    gap: 6,
-  },
-  fieldLabel: {
-    color: colors.graphite,
-    fontSize: 12,
-    lineHeight: 16,
-    fontWeight: '900',
-  },
-  input: {
-    minHeight: 48,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: colors.ink,
-    fontSize: 14,
-    fontWeight: '700',
-    backgroundColor: colors.white,
-  },
-  inputTall: {
-    minHeight: 104,
-    textAlignVertical: 'top',
-  },
-  chipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  chip: {
-    minHeight: 38,
-    justifyContent: 'center',
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    backgroundColor: colors.white,
-    paddingHorizontal: 12,
-  },
-  chipActive: {
-    backgroundColor: colors.blue,
-    borderColor: colors.blue,
-  },
-  chipText: {
-    color: colors.graphite,
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  chipTextActive: {
-    color: colors.white,
-  },
-  button: {
-    minHeight: 48,
-    borderRadius: radii.md,
-    backgroundColor: colors.blue,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'row',
-    gap: 8,
-    paddingHorizontal: 14,
-    flexGrow: 0,
-  },
-  buttonLight: {
-    backgroundColor: colors.white,
-    borderWidth: 1,
-    borderColor: colors.line,
-  },
-  buttonDanger: {
-    backgroundColor: colors.red,
-  },
-  buttonDisabled: {
+  btnDisabled: {
     opacity: 0.48,
   },
-  buttonPressed: {
-    transform: [{ scale: 0.99 }],
-  },
-  buttonText: {
-    color: colors.white,
-    fontSize: 14,
-    lineHeight: 18,
-    fontWeight: '900',
-  },
-  buttonTextLight: {
-    color: colors.ink,
-  },
-  waitPanel: {
-    backgroundColor: colors.mist,
-    borderRadius: radii.md,
-    borderWidth: 1,
-    borderColor: colors.line,
-    padding: 18,
-    alignItems: 'center',
-    gap: 10,
-  },
-  waitText: {
-    color: colors.graphite,
-    fontSize: 13,
-    lineHeight: 18,
-    fontWeight: '700',
-  },
-  script: {
-    color: colors.graphite,
-    fontSize: 15,
-    lineHeight: 23,
-    fontWeight: '600',
-  },
-  listItem: {
-    color: colors.graphite,
-    fontSize: 13,
-    lineHeight: 19,
-    fontWeight: '600',
-  },
-  actionRow: {
-    flexDirection: 'row',
-    gap: 10,
-    flexWrap: 'wrap',
-  },
-  timelineItem: {
-    flexDirection: 'row',
-    gap: 10,
-    alignItems: 'flex-start',
-  },
-  timelineNumber: {
-    width: 28,
-    height: 28,
-    borderRadius: radii.md,
-    overflow: 'hidden',
-    textAlign: 'center',
-    textAlignVertical: 'center',
-    color: colors.white,
-    backgroundColor: colors.blue,
-    fontSize: 12,
-    lineHeight: 28,
-    fontWeight: '900',
-  },
-  timelineText: {
-    flex: 1,
-    color: colors.graphite,
-    fontSize: 14,
-    lineHeight: 21,
-    fontWeight: '600',
-  },
-  video: {
-    width: '100%',
-    aspectRatio: 9 / 16,
-    borderRadius: radii.md,
-    backgroundColor: colors.camera,
-    overflow: 'hidden',
-  },
+
+  // --- Error ---
   inlineError: {
-    marginHorizontal: 22,
-    marginBottom: 10,
+    marginHorizontal: 12,
+    marginVertical: 6,
     borderRadius: radii.md,
     borderWidth: 1,
-    borderColor: '#f0c5ba',
-    backgroundColor: '#fff2ee',
+    borderColor: 'rgba(239, 68, 68, 0.25)',
+    backgroundColor: colors.redSoft,
     paddingHorizontal: 12,
-    paddingVertical: 9,
+    paddingVertical: 8,
     flexDirection: 'row',
     gap: 8,
     alignItems: 'center',
@@ -1120,5 +777,25 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     fontWeight: '700',
+  },
+
+  // --- Connect screen ---
+  connectScreen: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 14,
+    padding: 24,
+  },
+  connectTitle: {
+    color: colors.ink,
+    fontSize: 23,
+    fontWeight: '900',
+  },
+  connectMuted: {
+    color: colors.muted,
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });

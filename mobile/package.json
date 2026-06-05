@@ -7,6 +7,7 @@
     "start": "expo start",
     "android": "expo run:android",
     "web": "EXPO_NO_CACHE=1 expo start --web",
+    "web:export": "EXPO_PUBLIC_API_URL=${EXPO_PUBLIC_API_URL:-https://api.mangasmith.com} expo export -p web --output-dir dist",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
