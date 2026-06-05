@@ -77,15 +77,18 @@ sequenceDiagram
 
 | File | Purpose |
 |------|---------|
-| `api_server.py` | FastAPI app for trip sessions, media upload, story generation, and rendering |
+| `api_server.py` | FastAPI app for trip sessions, media upload, story generation, rendering, and eval |
 | `worker.py` | RQ worker entrypoint for queued story and render jobs |
-| `llm_provider.py` | Vendor-neutral OpenAI-compatible chat client |
-| `media_intelligence.py` | ffprobe/ffmpeg/OpenCV clip analysis and optional frame vision/transcription |
+| `llm_provider.py` | Vendor-neutral OpenAI-compatible chat client with rate limiting and retries |
+| `media_intelligence.py` | ffprobe/ffmpeg clip analysis and optional Gemini vision/transcription |
 | `scene_memory.py` | Evidence-linked scene memory artifact builder |
 | `trip_story.py` | Multilingual narrative and voiceover generation |
-| `trip_renderer.py` | Lightweight video assembly from uploaded clips |
+| `trip_renderer.py` | Lightweight video assembly from uploaded clips via ffmpeg |
+| `tts_provider.py` | Server-side TTS narration via Gemini or OpenAI |
 | `tripstory_logging.py` | Structured API/worker logging helpers |
-| `mobile/App.tsx` | Expo mobile UI for the TripStory workflow |
+| `mobile/App.tsx` | Expo app root and navigation orchestration |
+| `mobile/src/screens/` | Four screens: Dashboard, Context, Plan (editor), Output |
+| `mobile/src/components/` | 20+ reusable components (TimelineStrip, ProducerBriefPanel, Sidebar, etc.) |
 | `mobile/src/api.ts` | Mobile API client |
 | `mobile/src/types.ts` | Trip session, context, media, and story types |
 
@@ -134,7 +137,7 @@ Optional LLM configuration:
 cp .env.example .env
 ```
 
-Edit `.env`, set `TRIPSTORY_LLM_PROVIDER=deepseek`, fill in `DEEPSEEK_API_KEY`, and fill in `GEMINI_API_KEY` for video-frame understanding. The API loads `.env` on startup. The frontend never receives or submits provider API keys.
+Edit `.env`, set `TRIPSTORY_LLM_PROVIDER` to your preferred provider (`openai`, `gemini`, `deepseek`, or `local`), fill in the corresponding API key, and set `GEMINI_API_KEY` for video-frame understanding and TTS. Set `TRIPSTORY_TTS_PROVIDER=gemini` (or `openai`) to enable narration. The API loads `.env` on startup. The frontend never receives or submits provider API keys.
 
 Story generation uses the backend provider from `.env` by default. Generated plans include a `generation` block that records whether the plan came from the configured LLM provider or the deterministic local fallback. If the UI or logs report a fallback, check the provider/key settings or the recorded fallback reason.
 
@@ -186,7 +189,7 @@ To confirm provider calls are serialized, start one story generation and watch f
 Default models:
 
 - OpenAI: `gpt-4o-mini`
-- Gemini: `gemini-2.0-flash`
+- Gemini: `gemini-3.1-flash-lite`
 - DeepSeek: `deepseek-v4-pro`
 
 You can also export the variables directly instead of using `.env`:
@@ -204,12 +207,12 @@ Recommended DeepSeek + Gemini split:
 export TRIPSTORY_LLM_PROVIDER="deepseek"
 export DEEPSEEK_API_KEY="your-deepseek-key"
 export TRIPSTORY_DEEPSEEK_MODEL="deepseek-v4-pro"
-export TRIPSTORY_DEEPSEEK_THINKING="enabled"
-export TRIPSTORY_DEEPSEEK_REASONING_EFFORT="high"
 export GEMINI_API_KEY="your-gemini-key"
 export TRIPSTORY_VISION_PROVIDER="gemini"
 export TRIPSTORY_ENABLE_VISION_ANALYSIS=1
 ```
+
+> **Note:** Avoid setting `TRIPSTORY_DEEPSEEK_THINKING=enabled` with `TRIPSTORY_DEEPSEEK_REASONING_EFFORT=high` for story generation. The model spends its token budget on reasoning before writing the JSON response, which causes repeated timeouts and can block the worker for 5–10 minutes. Leave thinking disabled or use `reasoning_effort=low` if you need it.
 
 Narration uses server-side TTS when configured. Recommended Gemini TTS setup:
 
@@ -234,7 +237,7 @@ Sampled-frame visual understanding is enabled when `GEMINI_API_KEY` is present a
 ```bash
 TRIPSTORY_ENABLE_VISION_ANALYSIS=1
 TRIPSTORY_VISION_PROVIDER=gemini
-TRIPSTORY_VISION_MODEL=gemini-2.0-flash
+TRIPSTORY_VISION_MODEL=gemini-3.1-flash-lite
 TRIPSTORY_VISION_MAX_FRAMES=3
 TRIPSTORY_VISION_MIN_INTERVAL_SECONDS=3
 ```
@@ -323,6 +326,6 @@ For ffmpeg-specific stalls, check process state. `STAT T` or `Tl` means the proc
 3. Improve rendering and preview: add source-clip playback before render, true xfade transitions, music library selection, map cards, subtitle burn-in, and a timeline preview.
 4. Improve narration controls: add voice selection, playback, subtitles styling, and per-language narration tuning.
 5. Improve media understanding: extract thumbnails, true landmark recognition, GPS/date metadata when available, and stronger story-aware highlight selection.
-6. Build editing controls in mobile: **[Partially implemented]** mark favorites, reorder/exclude clips, pin/exclude scenes, edit generated segment scripts, adjust segment start/duration, reorder generated segments, choose tone/language, and select output aspect ratio. Still needed: source-clip playback, drag gestures, and richer timeline preview.
-7. Evaluate output: add a TripStory API evaluation endpoint or script for narration density and narrative restraint.
-8. Prepare for production: move upload analysis to a queue, add resumable uploads, add auth, add deployment docs, and add monitoring/logging.
+6. Build editing controls in mobile: **[Implemented]** mark favorites, reorder/exclude clips, pin/exclude scenes, edit generated segment scripts, adjust segment start/duration, reorder generated segments, choose tone/language, and select output aspect ratio. Still needed: source-clip playback, drag gestures, and richer timeline preview.
+7. Evaluate output: **[Implemented]** `/eval/dashboard` endpoint for TripStory narrative metrics. Still needed: automated narration density and restraint scoring.
+8. Prepare for production: **[Partially implemented]** deployment scripts and systemd service files added under `scripts/` and `deployment/`. Still needed: resumable uploads, full auth, and monitoring.
